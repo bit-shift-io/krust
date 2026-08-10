@@ -68,6 +68,70 @@
         term.open(container);
         term.focus();
 
+        // Keyboard Shortcuts Handler
+        term.attachCustomKeyEventHandler(e => {
+            if (e.type !== 'keydown') return true;
+
+            const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+            const modifier = isMac ? e.metaKey : e.ctrlKey;
+
+            // 1. Shift + Enter -> Send exact Alt+Enter sequence (\x1b\r) and block textarea newline
+            if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+                e.preventDefault();
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    socket.send(JSON.stringify({ type: "Input", data: "\x1b\r" }));
+                }
+                return false;
+            }
+
+            // 2. Ctrl + Enter -> Send CSI u sequence (\x1b[13;5u)
+            if (e.key === 'Enter' && modifier && !e.shiftKey && !e.altKey) {
+                e.preventDefault();
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    socket.send(JSON.stringify({ type: "Input", data: "\x1b[13;5u" }));
+                }
+                return false;
+            }
+
+            // 3. Smart Copy: Ctrl+C / Cmd+C
+            if (modifier && e.key.toLowerCase() === 'c' && !e.altKey) {
+                if (term.hasSelection()) {
+                    e.preventDefault();
+                    navigator.clipboard.writeText(term.getSelection());
+                    term.clearSelection();
+                    return false;
+                }
+                if (e.shiftKey) return false;
+                return true; // Let Ctrl+C pass through to shell as SIGINT (\x03)
+            }
+
+            // 4. Paste: Shift+Insert / Ctrl+Shift+V / Cmd+V
+            const isShiftInsert = e.shiftKey && e.key === 'Insert';
+            const isCtrlShiftV = modifier && e.shiftKey && e.key.toLowerCase() === 'v';
+            const isMacCmdV = isMac && e.metaKey && e.key.toLowerCase() === 'v';
+
+            if (isShiftInsert || isCtrlShiftV || isMacCmdV) {
+                e.preventDefault();
+                navigator.clipboard.readText().then(text => {
+                    if (text && socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify({ type: "Input", data: text }));
+                    }
+                }).catch(err => {
+                    console.warn("Clipboard read permission denied or unavailable", err);
+                });
+                return false;
+            }
+
+            // 5. Select All: Ctrl+Shift+A / Cmd+Shift+A
+            if (modifier && e.shiftKey && e.key.toLowerCase() === 'a') {
+                e.preventDefault();
+                term.selectAll();
+                return false;
+            }
+
+            return true;
+        });
+
         try {
             const webglAddon = new WebglAddon.WebglAddon();
             webglAddon.onContextLoss(() => webglAddon.dispose());
@@ -116,7 +180,6 @@
                 }
 
                 if (isReconnecting) {
-                    // Clear screen when re-attaching to clean up output duplicates during history playback
                     term.clear();
                     isReconnecting = false;
                 }
