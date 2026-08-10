@@ -36,13 +36,26 @@
 <body>
     <div id="terminal"></div>
     <script>
-        // Store session ID in localStorage so reconnections target the same backend shell
-        let sessionId = localStorage.getItem('term_session_id');
+        // 1. Check URL query parameters first, fallback to sessionStorage (isolated per tab)
+        const urlParams = new URLSearchParams(window.location.search);
+        let sessionId = urlParams.get('session');
+
+        if (!sessionId) {
+            sessionId = sessionStorage.getItem('term_session_id');
+        }
+
         if (!sessionId) {
             sessionId = typeof crypto.randomUUID === 'function'
                 ? crypto.randomUUID()
                 : 'sess_' + Math.random().toString(36).substring(2, 11);
-            localStorage.setItem('term_session_id', sessionId);
+            sessionStorage.setItem('term_session_id', sessionId);
+        }
+
+        // 2. Reflect session ID in URL without reloading so you can bookmark/copy standard links
+        if (urlParams.get('session') !== sessionId) {
+            const newUrl = new URL(window.location);
+            newUrl.searchParams.set('session', sessionId);
+            window.history.replaceState({}, '', newUrl);
         }
 
         const theme = {
