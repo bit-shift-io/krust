@@ -36,6 +36,15 @@
 <body>
     <div id="terminal"></div>
     <script>
+        // Store session ID in localStorage so reconnections target the same backend shell
+        let sessionId = localStorage.getItem('term_session_id');
+        if (!sessionId) {
+            sessionId = typeof crypto.randomUUID === 'function'
+                ? crypto.randomUUID()
+                : 'sess_' + Math.random().toString(36).substring(2, 11);
+            localStorage.setItem('term_session_id', sessionId);
+        }
+
         const theme = {
             background: '#2b2b2b',
             foreground: '#f0f0f0',
@@ -57,12 +66,11 @@
 
         const container = document.getElementById('terminal');
         term.open(container);
+        term.focus();
 
         try {
             const webglAddon = new WebglAddon.WebglAddon();
-            webglAddon.onContextLoss(() => {
-                webglAddon.dispose();
-            });
+            webglAddon.onContextLoss(() => webglAddon.dispose());
             term.loadAddon(webglAddon);
         } catch (e) {
             console.warn("WebGL initialization failed, falling back to standard canvas", e);
@@ -74,17 +82,14 @@
             document.title = title;
         });
 
-        const socket = new WebSocket(`ws://${location.host}/ws`);
-
-        socket.onopen = () => {
-            sendSize();
-            term.onData(data => socket.send(JSON.stringify({ type: "Input", data })));
-        };
-
-        socket.onmessage = (e) => term.write(e.data);
+        let socket = null;
+        let reconnectTimer = null;
+        let reconnectDelay = 1000;
+        let onDataDisposable = null;
+        let isReconnecting = false;
 
         function sendSize() {
-            if (socket.readyState === WebSocket.OPEN) {
+            if (socket && socket.readyState === WebSocket.OPEN) {
                 const core = term._core;
                 const cellWidth = core._renderService?.dimensions?.actualCellWidth || 9;
                 const cellHeight = core._renderService?.dimensions?.actualCellHeight || 17;
@@ -99,11 +104,80 @@
             }
         }
 
+        function connect() {
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            socket = new WebSocket(`${protocol}//${location.host}/ws?session_id=${encodeURIComponent(sessionId)}`);
+
+            socket.onopen = () => {
+                reconnectDelay = 1000;
+                if (reconnectTimer) {
+                    clearTimeout(reconnectTimer);
+                    reconnectTimer = null;
+                }
+
+                if (isReconnecting) {
+                    // Clear screen when re-attaching to clean up output duplicates during history playback
+                    term.clear();
+                    isReconnecting = false;
+                }
+
+                sendSize();
+                term.focus();
+
+                if (onDataDisposable) onDataDisposable.dispose();
+                onDataDisposable = term.onData(data => {
+                    if (socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify({ type: "Input", data }));
+                    }
+                });
+            };
+
+            socket.onmessage = (e) => term.write(e.data);
+
+            socket.onclose = () => {
+                if (onDataDisposable) {
+                    onDataDisposable.dispose();
+                    onDataDisposable = null;
+                }
+                isReconnecting = true;
+                scheduleReconnect();
+            };
+
+            socket.onerror = () => {
+                socket.close();
+            };
+        }
+
+        function scheduleReconnect() {
+            if (!reconnectTimer) {
+                reconnectTimer = setTimeout(() => {
+                    reconnectTimer = null;
+                    connect();
+                }, reconnectDelay);
+                reconnectDelay = Math.min(reconnectDelay * 1.5, 10000);
+            }
+        }
+
+        connect();
+
         const resizeObserver = new ResizeObserver(() => {
             fitAddon.fit();
             sendSize();
         });
         resizeObserver.observe(container);
+
+        window.addEventListener('focus', () => term.focus());
+
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) {
+                fitAddon.fit();
+                sendSize();
+                term.focus();
+                if (!socket || socket.readyState === WebSocket.CLOSED) {
+                    connect();
+                }
+            }
+        });
 
         window.addEventListener('wheel', (e) => {
             if (e.ctrlKey) {
@@ -112,7 +186,6 @@
 
                 let currentSize = term.options.fontSize || 14;
                 let newSize = e.deltaY < 0 ? currentSize + 1 : currentSize - 1;
-
                 newSize = Math.max(8, Math.min(32, newSize));
 
                 if (newSize !== currentSize) {
