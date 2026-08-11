@@ -38,23 +38,23 @@
     <script>
         // 1. Check URL query parameters first, fallback to sessionStorage (isolated per tab)
         const urlParams = new URLSearchParams(window.location.search);
-        let sessionId = urlParams.get('session');
+        let sessionId = urlParams.get('s') || urlParams.get('session');
 
         if (!sessionId) {
             sessionId = sessionStorage.getItem('term_session_id');
         }
 
         if (!sessionId) {
-            sessionId = typeof crypto.randomUUID === 'function'
-                ? crypto.randomUUID()
-                : 'sess_' + Math.random().toString(36).substring(2, 11);
+            sessionId = Math.random().toString(36).substring(2, 6);
             sessionStorage.setItem('term_session_id', sessionId);
         }
 
         // 2. Reflect session ID in URL without reloading so you can bookmark/copy standard links
-        if (urlParams.get('session') !== sessionId) {
+        const reflected = urlParams.get('s') || urlParams.get('session');
+        if (reflected !== sessionId) {
             const newUrl = new URL(window.location);
-            newUrl.searchParams.set('session', sessionId);
+            newUrl.searchParams.set('s', sessionId);
+            newUrl.searchParams.delete('session');
             window.history.replaceState({}, '', newUrl);
         }
 
