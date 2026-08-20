@@ -5,7 +5,7 @@ Summary:        Fast, single-binary web terminal emulator
 
 License:        MIT
 URL:            https://github.com/bit-shift-io/krust
-# GitHub release archive for the v%{version} tag
+# GitHub release archive for the tagged release
 Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz
 
 BuildRequires:  cargo
