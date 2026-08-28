@@ -65,12 +65,27 @@
             selectionBackground: 'rgba(255, 255, 255, 0.3)'
         };
 
+        // Cap animation frame rate to ~30fps to reduce GPU load / coil whine.
+        const FRAME_INTERVAL_MS = 33;
+        const nativeRaf = window.requestAnimationFrame.bind(window);
+        let lastFrameAt = 0;
+        window.requestAnimationFrame = (cb) => nativeRaf((now) => {
+            if (now - lastFrameAt >= FRAME_INTERVAL_MS) {
+                lastFrameAt = now;
+                cb(now);
+            } else {
+                window.requestAnimationFrame(cb);
+            }
+        });
+
         const term = new Terminal({
             cursorBlink: true,
             fontSize: 14,
             lineHeight: 1,
             letterSpacing: 0,
             fontFamily: 'JetBrains Mono, Fira Code, monospace',
+            customGlyphs: false,
+            minimumContrastRatio: 1,
             theme: theme
         });
 
@@ -142,15 +157,47 @@
                 return false;
             }
 
+            // 6. Toggle WebGL rendering: Ctrl+Shift+G / Cmd+Shift+G
+            if (modifier && e.shiftKey && e.key.toLowerCase() === 'g') {
+                e.preventDefault();
+                toggleWebgl();
+                return false;
+            }
+
             return true;
         });
 
+        let webglAddon = null;
+
         try {
-            const webglAddon = new WebglAddon.WebglAddon();
-            webglAddon.onContextLoss(() => webglAddon.dispose());
+            webglAddon = new WebglAddon.WebglAddon();
+            webglAddon.onContextLoss(() => webglAddon && webglAddon.dispose());
             term.loadAddon(webglAddon);
         } catch (e) {
             console.warn("WebGL initialization failed, falling back to standard canvas", e);
+        }
+
+        function toggleWebgl() {
+            if (webglAddon) {
+                try {
+                    webglAddon.dispose();
+                } catch (e) {
+                    console.warn("Failed to dispose WebGL addon", e);
+                }
+                webglAddon = null;
+                console.log("WebGL rendering disabled, using canvas renderer");
+            } else if (window.WebglAddon) {
+                try {
+                    webglAddon = new WebglAddon.WebglAddon();
+                    webglAddon.onContextLoss(() => webglAddon && webglAddon.dispose());
+                    term.loadAddon(webglAddon);
+                    console.log("WebGL rendering enabled");
+                } catch (e) {
+                    webglAddon = null;
+                    console.warn("WebGL initialization failed", e);
+                }
+            }
+            term.refresh(0, term.rows - 1);
         }
 
         fitAddon.fit();
