@@ -127,7 +127,7 @@
                 e.preventDefault();
                 navigator.clipboard.readText().then(text => {
                     if (text && socket && socket.readyState === WebSocket.OPEN) {
-                        socket.send(JSON.stringify({ type: "Input", data: text }));
+                        sendPasteInChunks(text);
                     }
                 }).catch(err => {
                     console.warn("Clipboard read permission denied or unavailable", err);
@@ -179,6 +179,25 @@
                     pixel_height: Math.floor(term.rows * cellHeight)
                 }));
             }
+        }
+
+        function sendPasteInChunks(text) {
+            const CHUNK_SIZE = 4096;
+            const DELAY_MS = 5;
+            let offset = 0;
+
+            function sendNextChunk() {
+                if (offset >= text.length) return;
+                const chunk = text.slice(offset, offset + CHUNK_SIZE);
+                offset += CHUNK_SIZE;
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    socket.send(JSON.stringify({ type: "Input", data: chunk }));
+                }
+                if (offset < text.length) {
+                    setTimeout(sendNextChunk, DELAY_MS);
+                }
+            }
+            sendNextChunk();
         }
 
         function connect() {
@@ -242,18 +261,41 @@
         });
         resizeObserver.observe(container);
 
-        window.addEventListener('focus', () => term.focus());
+        function refitTerminal() {
+            fitAddon.fit();
+            sendSize();
+            term.focus();
+            term.refresh(0, term.rows - 1);
+        }
+
+        window.addEventListener('focus', () => {
+            refitTerminal();
+            if (!socket || socket.readyState === WebSocket.CLOSED) {
+                connect();
+            }
+        });
 
         document.addEventListener('visibilitychange', () => {
             if (!document.hidden) {
-                fitAddon.fit();
-                sendSize();
-                term.focus();
+                refitTerminal();
                 if (!socket || socket.readyState === WebSocket.CLOSED) {
                     connect();
                 }
             }
         });
+
+        let refitRaf = null;
+        function scheduleRefit() {
+            if (refitRaf) return;
+            refitRaf = requestAnimationFrame(() => {
+                refitRaf = null;
+                if (!document.hidden && socket?.readyState === WebSocket.OPEN) {
+                    refitTerminal();
+                }
+            });
+        }
+
+        window.addEventListener('resize', scheduleRefit);
 
         window.addEventListener('wheel', (e) => {
             if (e.ctrlKey) {
