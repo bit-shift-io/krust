@@ -157,8 +157,8 @@
                 return false;
             }
 
-            // 6. Toggle WebGL rendering: Ctrl+Alt+G (avoids browser shortcuts)
-            if (e.altKey && modifier && e.key.toLowerCase() === 'g') {
+            // 6. Toggle WebGL rendering: Ctrl+Shift+G / Cmd+Shift+G
+            if (modifier && e.shiftKey && e.key.toLowerCase() === 'g') {
                 e.preventDefault();
                 toggleWebgl();
                 return false;
@@ -167,22 +167,14 @@
             return true;
         });
 
-        // ?webgl=0 forces the CPU canvas renderer (no WebGL).
-        const webglParam = urlParams.get('webgl');
-        const enableWebglByDefault = webglParam !== '0';
-
         let webglAddon = null;
 
-        if (enableWebglByDefault) {
-            try {
-                webglAddon = new WebglAddon.WebglAddon();
-                webglAddon.onContextLoss(() => webglAddon && webglAddon.dispose());
-                term.loadAddon(webglAddon);
-            } catch (e) {
-                console.warn("WebGL initialization failed, falling back to standard canvas", e);
-            }
-        } else {
-            console.log("WebGL disabled by ?webgl=0, using canvas renderer");
+        try {
+            webglAddon = new WebglAddon.WebglAddon();
+            webglAddon.onContextLoss(() => webglAddon && webglAddon.dispose());
+            term.loadAddon(webglAddon);
+        } catch (e) {
+            console.warn("WebGL initialization failed, falling back to standard canvas", e);
         }
 
         function toggleWebgl() {
