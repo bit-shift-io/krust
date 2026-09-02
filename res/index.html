@@ -81,6 +81,19 @@
         term.open(container);
         term.focus();
 
+        // Intercept paste events before xterm.js to prevent its paste dialog popup
+        document.addEventListener('paste', e => {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            navigator.clipboard.readText().then(text => {
+                if (text && socket && socket.readyState === WebSocket.OPEN) {
+                    sendPasteInChunks(text);
+                }
+            }).catch(err => {
+                console.warn("Clipboard read permission denied or unavailable", err);
+            });
+        });
+
         // Keyboard Shortcuts Handler
         term.attachCustomKeyEventHandler(e => {
             if (e.type !== 'keydown') return true;
@@ -106,24 +119,23 @@
                 return false;
             }
 
-            // 3. Smart Copy: Ctrl+C / Cmd+C
+            // 3. Ctrl+C / Cmd+C -> Clear selection, let SIGINT pass through
             if (modifier && e.key.toLowerCase() === 'c' && !e.altKey) {
                 if (term.hasSelection()) {
-                    e.preventDefault();
-                    navigator.clipboard.writeText(term.getSelection());
                     term.clearSelection();
                     return false;
                 }
                 if (e.shiftKey) return false;
-                return true; // Let Ctrl+C pass through to shell as SIGINT (\x03)
+                return true;
             }
 
-            // 4. Paste: Shift+Insert / Ctrl+Shift+V / Cmd+V
+            // 4. Paste: Shift+Insert / Ctrl+V / Ctrl+Shift+V / Cmd+V
             const isShiftInsert = e.shiftKey && e.key === 'Insert';
+            const isCtrlV = modifier && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'v';
             const isCtrlShiftV = modifier && e.shiftKey && e.key.toLowerCase() === 'v';
             const isMacCmdV = isMac && e.metaKey && e.key.toLowerCase() === 'v';
 
-            if (isShiftInsert || isCtrlShiftV || isMacCmdV) {
+            if (isShiftInsert || isCtrlV || isCtrlShiftV || isMacCmdV) {
                 e.preventDefault();
                 navigator.clipboard.readText().then(text => {
                     if (text && socket && socket.readyState === WebSocket.OPEN) {
@@ -143,6 +155,18 @@
             }
 
             return true;
+        });
+
+        // Auto-copy selection to clipboard
+        term.onSelectionChange(() => {
+            const selection = term.getSelection();
+            if (selection) {
+                navigator.clipboard.writeText(selection).then(() => {
+                    term.clearSelection();
+                }).catch(err => {
+                    console.warn("Clipboard write permission denied or unavailable", err);
+                });
+            }
         });
 
         try {
