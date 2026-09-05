@@ -17,6 +17,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
+use tower_http::cors::CorsLayer;
 
 // Embed static files from project-root res/ folder
 const INDEX_HTML: &str = include_str!("../res/index.html");
@@ -42,6 +43,7 @@ struct AppState {
 #[derive(Deserialize)]
 struct WsQuery {
     session_id: Option<String>,
+    dir: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -93,10 +95,15 @@ async fn main() {
                 )
             }),
         )
+        .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("Web terminal listening on http://localhost:3000");
+    let port = std::env::var("KRUST_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(3000);
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap();
+    println!("Web terminal listening on http://localhost:{port}");
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -113,11 +120,16 @@ async fn ws_handler(
         .session_id
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "default".to_string());
+    let dir = query.dir.filter(|d| !d.trim().is_empty());
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, dir))
 }
 
-async fn get_or_create_session(state: &AppState, session_id: &str) -> Arc<Session> {
+async fn get_or_create_session(
+    state: &AppState,
+    session_id: &str,
+    dir: Option<&str>,
+) -> Arc<Session> {
     // Check if session already exists
     {
         let sessions = state.sessions.read().await;
@@ -146,6 +158,9 @@ async fn get_or_create_session(state: &AppState, session_id: &str) -> Arc<Sessio
     let mut cmd = CommandBuilder::new(shell);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    if let Some(dir) = dir {
+        cmd.cwd(dir);
+    }
 
     let _child = pair
         .slave
@@ -201,8 +216,8 @@ async fn get_or_create_session(state: &AppState, session_id: &str) -> Arc<Sessio
     session
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, session_id: String) {
-    let session = get_or_create_session(&state, &session_id).await;
+async fn handle_socket(socket: WebSocket, state: AppState, session_id: String, dir: Option<String>) {
+    let session = get_or_create_session(&state, &session_id, dir.as_deref()).await;
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
     // 1. Re-sync scrollback history to the newly connected WebSocket

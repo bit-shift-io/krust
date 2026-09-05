@@ -58,6 +58,9 @@
             window.history.replaceState({}, '', newUrl);
         }
 
+        // Optional startup directory, forwarded to the server so the shell spawns there
+        const startDir = urlParams.get('dir');
+
         const theme = {
             background: '#2b2b2b',
             foreground: '#f0f0f0',
@@ -226,7 +229,11 @@
 
         function connect() {
             const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            socket = new WebSocket(`${protocol}//${location.host}/ws?session_id=${encodeURIComponent(sessionId)}`);
+            const wsParams = new URLSearchParams({ session_id: sessionId });
+            if (startDir) {
+                wsParams.set('dir', startDir);
+            }
+            socket = new WebSocket(`${protocol}//${location.host}/ws?${wsParams.toString()}`);
 
             socket.onopen = () => {
                 reconnectDelay = 1000;
