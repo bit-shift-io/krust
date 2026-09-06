@@ -61,6 +61,11 @@
         // Optional startup directory, forwarded to the server so the shell spawns there
         const startDir = urlParams.get('dir');
 
+        // Optional renderer override: `?renderer=dom` forces the DOM renderer,
+        // which avoids WebGL glyph-atlas corruption on some GPU stacks
+        // (missing parts of the screen with dense TUIs).
+        const renderer = urlParams.get('renderer');
+
         const theme = {
             background: '#2b2b2b',
             foreground: '#f0f0f0',
@@ -70,6 +75,11 @@
 
         const term = new Terminal({
             cursorBlink: true,
+            // Animate SGR-5 blink text (TUIs like opencode use this for animated
+            // status bars and the "thinking" indicator). New in xterm 6.1;
+            // defaults to 0 (disabled) which is why those stopped animating.
+            blinkIntervalDuration: 600,
+            bracketedPasteMode: true,
             fontSize: 14,
             lineHeight: 1,
             letterSpacing: 0,
@@ -172,12 +182,48 @@
             }
         });
 
-        try {
-            const webglAddon = new WebglAddon.WebglAddon();
-            webglAddon.onContextLoss(() => webglAddon.dispose());
-            term.loadAddon(webglAddon);
-        } catch (e) {
-            console.warn("WebGL initialization failed, falling back to standard canvas", e);
+        let webglAddon = null;
+
+        function initWebgl() {
+            if (webglAddon) return;
+            try {
+                webglAddon = new WebglAddon.WebglAddon();
+                webglAddon.onContextLoss(() => {
+                    console.warn("WebGL context lost; restoring renderer, will re-init WebGL when visible");
+                    try { webglAddon.dispose(); } catch (err) {}
+                    webglAddon = null;
+                });
+                term.loadAddon(webglAddon);
+            } catch (e) {
+                console.warn("WebGL initialization failed, falling back to standard canvas", e);
+                webglAddon = null;
+            }
+        }
+
+        if (webglAddon) {
+                webglAddon.dispose();
+                webglAddon = null;
+            }
+            term.refresh(0, term.rows - 1);
+            console.info('Using DOM renderer (default)');
+        } else if (renderer === 'webgl') {
+            // User explicitly requested WebGL; load the addon now
+            try {
+                webglAddon = new WebglAddon.WebglAddon();
+                webglAddon.onContextLoss(() => {
+                    console.warn("WebGL context lost; will re-init when visible");
+                    try { webglAddon.dispose(); } catch (err) {}
+                    webglAddon = null;
+                });
+                term.loadAddon(webglAddon);
+                console.info('Using WebGL renderer (requested via ?renderer=webgl)');
+            } catch (e) {
+                console.warn("WebGL initialization failed, falling back to DOM renderer", e);
+                webglAddon = null;
+                term.refresh(0, term.rows - 1);
+            }
+        } else {
+            // no param → DOM renderer, already handled above
         }
 
         fitAddon.fit();
@@ -194,9 +240,9 @@
 
         function sendSize() {
             if (socket && socket.readyState === WebSocket.OPEN) {
-                const core = term._core;
-                const cellWidth = core._renderService?.dimensions?.actualCellWidth || 9;
-                const cellHeight = core._renderService?.dimensions?.actualCellHeight || 17;
+                const dims = term._core?._renderService?.dimensions;
+                const cellWidth = dims?.css?.cell?.width || 9;
+                const cellHeight = dims?.css?.cell?.height || 17;
 
                 socket.send(JSON.stringify({
                     type: "Resize",
@@ -287,12 +333,14 @@
         connect();
 
         const resizeObserver = new ResizeObserver(() => {
+            initWebgl();
             fitAddon.fit();
             sendSize();
         });
         resizeObserver.observe(container);
 
         function refitTerminal() {
+            initWebgl();
             fitAddon.fit();
             sendSize();
             term.focus();
