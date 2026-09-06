@@ -1,0 +1,26 @@
+[package]
+name = "terminal-client"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+new-terminal = []
+
+[dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "HtmlCanvasElement",
+    "WebSocket",
+    "MessageEvent",
+    "BinaryType",
+    "Storage",
+    "Selection",
+    "Range"
+]}
+js-sys = "0.3"
+beamterm-renderer = "0.10"
+vt100 = "0.16"
+console_error_panic_hook = "0.1"
