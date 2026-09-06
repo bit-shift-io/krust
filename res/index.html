@@ -223,7 +223,8 @@
                 term.refresh(0, term.rows - 1);
             }
         } else {
-            // no param → DOM renderer, already handled above
+            term.refresh(0, term.rows - 1);
+            console.info('Using DOM renderer (default)');
         }
 
         fitAddon.fit();
