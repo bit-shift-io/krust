@@ -13,6 +13,7 @@
 
 #![allow(missing_docs)]
 
+#[allow(dead_code)]
 mod renderer;
 
 use js_sys::Function;

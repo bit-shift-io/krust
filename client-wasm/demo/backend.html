@@ -74,9 +74,42 @@
         }
 
         let lastTitle = 'krust | terminal';
+        let lastRenderTime = 0;
+        // Robust re-render: covers focus, visibility changes, and Grit iframe context
         window.addEventListener('focus', () => {
             document.title = lastTitle;
+            fit();
+            const now = performance.now();
+            if (now - lastRenderTime > 32) {
+                lastRenderTime = now;
+                try { repaint(); } catch (_) {}
+            }
         });
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) {
+                fit();
+                try { repaint(); } catch (_) {}
+            }
+        });
+        // IntersectionObserver: xterm.js uses this to detect when the terminal
+        // becomes visible again in iframe contexts (like Grit). Much more reliable
+        // than focus/visibility events for detecting show/hide cycles.
+        if ('IntersectionObserver' in window) {
+            const observer = new IntersectionObserver((entries) => {
+                const entry = entries[entries.length - 1];
+                if (entry.isIntersecting && entry.intersectionRatio > 0) {
+                    fit();
+                    try { repaint(); } catch (_) {}
+                }
+            }, { threshold: 0 });
+            observer.observe(canvas);
+        }
+        // Periodic repaint to catch cases where focus/visibility events are unreliable
+        setInterval(() => {
+            if (!document.hidden) {
+                try { repaint(); } catch (_) {}
+            }
+        }, 500);
 
         const status = document.getElementById('status');
         const canvas = document.getElementById('terminal-canvas');
@@ -386,7 +419,7 @@ const text = selected_text();
                 fit.fit();
                 canvas.style.display = 'none';
                 const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-                 const wsUrl = buildWsUrl('/ws?' + sid);
+                 const wsUrl = buildWsUrl('/ws');
                  ws = new WebSocket(wsUrl);
                 ws.binaryType = 'arraybuffer';
                 ws.onmessage = (ev) => term.write(new Uint8Array(ev.data));
@@ -450,7 +483,7 @@ const text = selected_text();
                 }
                 console.log('SELFTEST', JSON.stringify({ rows, N, maxMs: mx, avgMs: sum / N, wallMs: performance.now() - t0, bytesIn: bytesIn }));
             }
-            connectPrimary(buildWsUrl('/ws?' + sid));
+            connectPrimary(buildWsUrl('/ws'));
         }
 
         function connectPrimary(url) {
