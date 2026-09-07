@@ -307,8 +307,8 @@ impl TerminalState {
 
         let (cell_width, cell_height) = measure_cell_dimensions(&ctx);
 
-        let canvas_w = canvas.width() as f64;
-        let canvas_h = canvas.height() as f64;
+        let canvas_w = canvas.offset_width() as f64;
+        let canvas_h = canvas.offset_height() as f64;
         let cols = if canvas_w > 0.0 {
             (canvas_w / cell_width).floor() as u16
         } else {
@@ -737,8 +737,16 @@ pub fn handle_resize(width: i32, height: i32) -> Result<(), JsValue> {
         let (cw, ch) = measure_cell_dimensions(&state.ctx);
         state.cell_width = cw;
         state.cell_height = ch;
-        let cols = (width as f64 / cw).floor() as u16;
-        let rows = (height as f64 / ch).floor() as u16;
+        let dpr = web_sys::window()
+            .map(|w| w.device_pixel_ratio())
+            .unwrap_or(1.0)
+            .max(1.0);
+        let phys_w = (width as f64) * dpr;
+        let phys_h = (height as f64) * dpr;
+        let _ = state.canvas.set_width(phys_w as u32);
+        let _ = state.canvas.set_height(phys_h as u32);
+        let cols = (phys_w / cw).floor() as u16;
+        let rows = (phys_h / ch).floor() as u16;
         let cols = cols.max(2);
         let rows = rows.max(1);
         let _ = state.parser.screen_mut().set_size(rows, cols);
