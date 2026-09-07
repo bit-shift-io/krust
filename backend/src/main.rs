@@ -176,7 +176,6 @@ fn pkg_dir() -> String {
     "client-wasm/pkg".to_string()
 }
 
-#[cfg(feature = "new-terminal")]
 async fn serve_pkg_file(
     file: &'static str,
     content_type: &'static str,

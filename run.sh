@@ -1,2 +1,6 @@
 #!/usr/bin/env bash
-cargo run -p terminal-backend "$@"
+set -e
+cd "$(dirname "$0")/client-wasm"
+wasm-pack build --target web
+cd ..
+cargo run "$@"
