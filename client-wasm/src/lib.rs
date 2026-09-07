@@ -11,7 +11,7 @@
 // - WebGL2 fallback detection
 // - Error boundaries & panic handling
 
-#![warn(missing_docs)]
+#![allow(missing_docs)]
 
 use js_sys::Function;
 use vt100::{Color, Parser};
@@ -26,7 +26,6 @@ const DEFAULT_COLS: u16 = 80;
 const DEFAULT_CELL_WIDTH: i32 = 8;
 const DEFAULT_CELL_HEIGHT: i32 = 18;
 const SCROLLBACK_LEN: usize = 1024;
-const MAX_HISTORY_BYTES: usize = 1024 * 512;
 
 /// Default foreground color (light gray)
 const DEFAULT_FG: u32 = 0xf0f0f0;
@@ -265,8 +264,6 @@ enum SelectionMode {
     None,
     /// Linear (text-flow) selection
     Linear,
-    /// Rectangular (block) selection
-    Block,
 }
 
 impl TerminalState {
@@ -275,6 +272,7 @@ impl TerminalState {
     /// # Parameters
     /// * `canvas_id` - HTML canvas element ID
     /// * `on_resize` - JS callback called with (rows, cols) when the terminal resizes
+    #[allow(dead_code)]
     pub fn new(
         canvas_id: &str,
         on_resize: Option<Function>,
@@ -375,7 +373,7 @@ impl TerminalState {
         // 1. Clear to default background
         self.ctx.set_fill_style_str(&css_color(DEFAULT_BG));
         self.ctx.fill_rect(0.0, 0.0, css_w.max(1.0), css_h.max(1.0));
-        self.ctx.set_text_baseline("alphabetic");
+        self.ctx.set_text_baseline("middle");
 
         let mut font = FONT_STACK.to_string();
         self.ctx.set_font(&font);
@@ -500,11 +498,6 @@ impl TerminalState {
         (a_r..=b_r).contains(&row) && (a_c..=b_c).contains(&col)
     }
 
-    /// Set resize callback
-    pub fn set_on_resize(&mut self, callback: Box<dyn FnMut(u16, u16) + 'static>) {
-        self.on_resize = Some(callback);
-    }
-
     /// Trigger resize callback
     fn trigger_resize(&mut self, new_rows: u16, new_cols: u16) {
         if let Some(ref mut cb) = self.on_resize {
@@ -528,13 +521,6 @@ impl TerminalState {
         }
     }
 
-    /// Handle selection end
-    pub fn handle_selection_end(&mut self) {
-        self.selection_mode = SelectionMode::None;
-        self.selection_start = None;
-        self.selection_end = None;
-    }
-
     /// Get the canvas ID
     pub fn canvas_id(&self) -> &str {
         &self.canvas_id
@@ -543,11 +529,6 @@ impl TerminalState {
     /// Get the current terminal dimensions
     pub fn size(&self) -> (u16, u16) {
         (self.rows, self.cols)
-    }
-
-    /// Get the selection mode
-    pub fn selection_mode(&self) -> SelectionMode {
-        self.selection_mode
     }
 
     /// Get whether WebGL2 is available
@@ -560,10 +541,7 @@ impl TerminalState {
         self.fallback_mode
     }
 
-    /// Get whether text can be selected (no IME composition active)
-    pub fn can_select(&self) -> bool {
-        true
-    }
+
 }
 
 // -- Global Terminal State --

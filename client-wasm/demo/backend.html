@@ -62,10 +62,7 @@
             return out;
         }
 
-        let lastTitle = 'krust terminal';
-        window.addEventListener('blur', () => {
-            document.title = 'krust terminal';
-        });
+        let lastTitle = 'krust | terminal';
         window.addEventListener('focus', () => {
             document.title = lastTitle;
         });
@@ -380,20 +377,20 @@
                     ws.send(new TextEncoder().encode('seq 1 ' + b + '\r'));
                 }
             };
-            ws.onmessage = (ev) => {
-                bytesIn += ev.data.byteLength;
-                const reps = query_replies(new Uint8Array(ev.data));
-                if (reps.length) ws.send(reps);
-                const t0 = performance.now();
-                if (params.get('benchskip') !== '1') process_bytes(new Uint8Array(ev.data));
-                benchSample(performance.now() - t0);
-                const title = extractTitle(new Uint8Array(ev.data));
-                if (title) {
-                    lastTitle = title;
-                    document.title = title;
-                }
-                status.textContent = 'bytes=' + bytesIn + ' v=' + version();
-            };
+ws.onmessage = (ev) => {
+                    bytesIn += ev.data.byteLength;
+                    const reps = query_replies(new Uint8Array(ev.data));
+                    if (reps.length) ws.send(reps);
+                    const t0 = performance.now();
+                    if (params.get('benchskip') !== '1') process_bytes(new Uint8Array(ev.data));
+                    benchSample(performance.now() - t0);
+                    const title = extractTitle(new Uint8Array(ev.data));
+                    if (title) {
+                        lastTitle = title + ' | terminal';
+                        document.title = lastTitle;
+                    }
+                    status.textContent = 'bytes=' + bytesIn + ' v=' + version();
+                };
             ws.onerror = () => { status.textContent = 'ws error'; };
             ws.onclose = () => {
                 status.textContent = 'ws closed';

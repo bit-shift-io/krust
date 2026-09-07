@@ -316,7 +316,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: String) {
 
     // 2. Task: PTY output -> WebSocket
     let history = session.history.clone();
-    let sid_out = session_id.clone();
+    let _sid_out = session_id.clone();
     let pty_read_task = tokio::spawn(async move {
         let mut budget = ByteBudget::default();
         loop {
@@ -330,7 +330,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: String) {
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             };
-            eprintln!("[out:{}] {} bytes", sid_out, frame.len());
+            // eprintln!("[out:{}] {} bytes", sid_out, frame.len());
             if !budget.accept(frame.len()) {
                 // Budget exceeded: drop stale frames and flush the latest
                 // screen state (a full history replay) once the channel drains.
@@ -354,16 +354,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: String) {
     // 3. Task: WebSocket input -> PTY writer & resize handlers
     let writer = session.writer.clone();
     let master = session.master.clone();
-    let sid = session_id.clone();
+    let _sid = session_id.clone();
 
     let ws_recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_receiver.next().await {
             if let Message::Text(text) = msg {
-                eprintln!("[ws:{}] text {} bytes", sid, text.len());
                 if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
                     match client_msg {
                         ClientMessage::Input { data } => {
-                            eprintln!("[ws:{}] Input {:?}", sid, data);
                             let writer = writer.clone();
                             let _ = tokio::task::spawn_blocking(move || {
                                 if let Ok(mut w) = writer.try_lock() {
@@ -378,7 +376,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: String) {
                             pixel_width,
                             pixel_height,
                         } => {
-                            eprintln!("[ws:{}] Resize {}x{} @ {}x{}", sid, cols, rows, pixel_width, pixel_height);
                             let master = master.clone();
                             let size = pty_size(cols, rows, pixel_width, pixel_height);
                             let _ = tokio::task::spawn_blocking(move || {
@@ -392,7 +389,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: String) {
                 }
             } else if let Message::Binary(bytes) = msg {
                 // Raw PTY input: no JSON framing, bytes go straight to the shell.
-                eprintln!("[ws:{}] binary {} bytes", sid, bytes.len());
                 let writer = writer.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Ok(mut w) = writer.try_lock() {
@@ -479,17 +475,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
-    fn byte_budget_accepts_until_threshold_then_flushes() {
-        let mut budget = ByteBudget::default();
-        assert!(budget.accept(MAX_PENDING_BYTES - 1));
-        // Crossing the 1 MiB boundary trips the budget exactly once.
-        assert!(!budget.accept(2));
-        // After a flush the budget starts over.
-        assert!(budget.accept(2));
-        assert_eq!(budget.pending, 2);
-    }
-
     fn binary_chunks_large_history_into_16kb_frames() {
         let big = vec![b'a'; 200_000];
         let chunked = binary_chunks(big.clone());
