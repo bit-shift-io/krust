@@ -4,8 +4,19 @@
 <body>
 <div id="s">loading</div>
 <script type="module">
-    dump('[tm] start ' + performance.now() + '\n');
-    const iv = setInterval(() => dump('[tm] tick ' + performance.now().toFixed(0) + '\n'), 1000);
+dump('[tm] start ' + performance.now() + '\n');
+        const iv = setInterval(() => dump('[tm] tick ' + performance.now().toFixed(0) + '\n'), 1000);
+        const params = new URLSearchParams(location.search);
+        let sid = params.get('s') || params.get('session') || (Math.random().toString(36).substring(2, 6));
+
+        // Reflect session ID in URL without reloading so you can bookmark/copy standard links
+        const reflected = params.get('s') || params.get('session');
+        if (reflected !== sid) {
+            const newUrl = new URL(window.location);
+            newUrl.searchParams.set('s', sid);
+            newUrl.searchParams.delete('session');
+            window.history.replaceState({}, '', newUrl);
+        }
     const bytes = new Uint8Array(await (await fetch('../pkg/terminal_client_bg.wasm')).arrayBuffer());
     const t0 = performance.now();
     const mod = await WebAssembly.compile(bytes);

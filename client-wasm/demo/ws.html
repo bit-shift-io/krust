@@ -20,7 +20,16 @@
         import ping from './ping.js';
         const params = new URLSearchParams(location.search);
         const bport = params.get('b') || '8300';
-        const sid = params.get('s') || 'smoke';
+        const sid = params.get('s') || params.get('session') || (Math.random().toString(36).substring(2, 6));
+
+        // Reflect session ID in URL without reloading so you can bookmark/copy standard links
+        const reflected = params.get('s') || params.get('session');
+        if (reflected !== sid) {
+            const newUrl = new URL(window.location);
+            newUrl.searchParams.set('s', sid);
+            newUrl.searchParams.delete('session');
+            window.history.replaceState({}, '', newUrl);
+        }
         const status = document.getElementById('status');
         const canvas = document.getElementById('terminal-canvas');
         const gl = canvas.getContext('webgl2');
