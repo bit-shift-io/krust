@@ -7,7 +7,7 @@
     <style>
         html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
         canvas { display: block; width: 100%; height: 100%; background: #000; }
-        #status { position: fixed; bottom: 8px; left: 8px; z-index: 10; font: 12px monospace; color: #0f0; background: rgba(0,0,0,0.7); padding: 4px 8px; }
+        #status { position: fixed; top: 8px; right: 8px; z-index: 10; font: 12px monospace; color: #0f0; background: rgba(0,0,0,0.7); padding: 4px 8px; opacity: 1; transition: opacity 0.5s ease-in-out; }
         body.done { background: #0a0; }
         body.done.fail { background: #a00; }
     </style>
@@ -21,6 +21,16 @@
         import ping from './ping.js';
         const status = document.getElementById('status');
         const canvas = document.getElementById('terminal-canvas');
+        let statusTimeout = null;
+        function showStatus(message) {
+            status.textContent = message;
+            status.style.display = 'block';
+            status.style.opacity = '1';
+            if (statusTimeout) clearTimeout(statusTimeout);
+            statusTimeout = setTimeout(() => {
+                status.style.opacity = '0';
+            }, 4000);
+        }
         try {
             ping('start');
             const bytes = await (await fetch('../pkg/terminal_client_bg.wasm')).arrayBuffer();
@@ -53,10 +63,10 @@
             const ok = bright > 100;
             ping('bright=' + bright + ' colored=' + colored + ' ver=' + ver);
             document.body.className = 'done' + (ok ? '' : ' fail');
-            status.textContent = 'bright=' + bright + ' colored=' + colored + ' ' + ver + (ok ? ' PASS' : ' FAIL');
+            showStatus('bright=' + bright + ' colored=' + colored + ' ' + ver + (ok ? ' PASS' : ' FAIL'));
         } catch (e) {
             document.body.className = 'done fail';
-            status.textContent = 'ERR ' + e;
+            showStatus('ERR ' + e);
             ping('err ' + e);
         }
     </script>

@@ -7,7 +7,7 @@
     <style>
         html, body { margin: 0; height: 100%; background: #2b2b2b; user-select: none; -webkit-user-select: none; overflow: hidden; }
         canvas { display: block; width: 100%; height: 100%; background: #2b2b2b; touch-action: none; }
-        #status { position: fixed; bottom: 8px; left: 8px; z-index: 10; font: 12px monospace; color: #f0f0f0; background: rgba(0,0,0,0.7); padding: 4px 8px; }
+        #status { position: fixed; top: 8px; right: 8px; z-index: 10; font: 12px monospace; color: #f0f0f0; background: rgba(0,0,0,0.7); padding: 4px 8px; opacity: 1; transition: opacity 0.5s ease-in-out; }
         #sel-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 5; pointer-events: none; opacity: 0; touch-action: none; }
         body.selecting #sel-layer { pointer-events: auto; opacity: 0.01; }
     </style>
@@ -70,6 +70,16 @@
 
         const status = document.getElementById('status');
         const canvas = document.getElementById('terminal-canvas');
+        let statusTimeout = null;
+        function showStatus(message) {
+            status.textContent = message;
+            status.style.display = 'block';
+            status.style.opacity = '1';
+            if (statusTimeout) clearTimeout(statusTimeout);
+            statusTimeout = setTimeout(() => {
+                status.style.opacity = '0';
+            }, 4000);
+        }
 
         let ws = null;
         let cellW = 8;
@@ -218,9 +228,9 @@
             set_selection(selAnchor.row, selAnchor.col, end.row, end.col);
             repaint();
             selAnchor = null;
-            const text = selected_text();
+const text = selected_text();
             if (text) {
-                try { navigator.clipboard.writeText(text); status.textContent = 'copied ' + text.length + ' chars'; } catch (_) {}
+                try { navigator.clipboard.writeText(text); showStatus('copied ' + text.length + ' chars'); } catch (_) {}
             }
         });
 
@@ -262,7 +272,7 @@
             touchSel = null;
             const text = selected_text();
             if (text) {
-                try { navigator.clipboard.writeText(text); status.textContent = 'copied ' + text.length + ' chars'; } catch (_) {}
+                try { navigator.clipboard.writeText(text); showStatus('copied ' + text.length + ' chars'); } catch (_) {}
             }
         });
 
@@ -295,8 +305,8 @@
                 ws = new WebSocket(proto + '://' + location.host + '/ws?s=' + sid);
                 ws.binaryType = 'arraybuffer';
                 ws.onmessage = (ev) => term.write(new Uint8Array(ev.data));
-                ws.onerror = () => { status.textContent = 'ws error'; };
-                ws.onclose = () => { status.textContent = 'ws closed'; };
+                ws.onerror = () => { showStatus('ws error'); };
+                ws.onclose = () => { showStatus('ws closed'); };
                 ws.onopen = () => {
                     ws.send(JSON.stringify({
                         type: 'Resize', cols: term.cols, rows: term.rows,
@@ -309,9 +319,9 @@
                 term.onData((d) => {
                     if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode(d));
                 });
-                status.textContent = 'fallback xterm.js sid=' + sid;
+                showStatus('fallback xterm.js sid=' + sid);
             } catch (e) {
-                status.textContent = 'fallback err ' + e;
+                showStatus('fallback err ' + e);
             }
         }
 
@@ -335,7 +345,7 @@
             cellH = Math.max(1, cfg.cell_height || cellH);
             fit();
             window.addEventListener('resize', () => { fit(); sendResize(); });
-            status.textContent = 'v=' + version() + ' webgl2=' + is_webgl2_available();
+            showStatus('krust terminal');
 
             const proto = location.protocol === 'https:' ? 'wss' : 'ws';
             const st = params.get('selftest');
@@ -395,14 +405,14 @@ ws.onmessage = (ev) => {
                         lastTitle = title + ' | terminal';
                         document.title = lastTitle;
                     }
-                    status.textContent = 'bytes=' + bytesIn + ' v=' + version();
+                    
                 };
-            ws.onerror = () => { status.textContent = 'ws error'; };
+            ws.onerror = () => { showStatus('ws error'); };
             ws.onclose = () => {
-                status.textContent = 'ws closed';
+                showStatus('ws closed');
                 if (fallbackMode) return;
                 const delay = Math.min(1000 * Math.pow(2, reconnectAttempts++), 8000);
-                status.textContent = 'reconnecting in ' + delay + 'ms';
+                showStatus('reconnecting in ' + delay + 'ms');
                 setTimeout(() => connectPrimary(url), delay);
             };
         }
@@ -418,7 +428,7 @@ ws.onmessage = (ev) => {
             bootXterm(sid);
         });
         startTerminal().catch((e) => {
-            status.textContent = 'ERR ' + e;
+            showStatus('ERR ' + e);
         });
     </script>
 </body>
