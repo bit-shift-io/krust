@@ -3,7 +3,7 @@
 //
 // Provides the Rust/WASM terminal backend:
 // - VT100 parser for ANSI escape sequences
-// - beamterm-renderer for WebGL2 rendering
+// - WebGL2 glyph atlas renderer (sharp vector text via pre-rasterized atlas)
 // - WebSocket binary message pipeline from backend
 // - Selection overlay support
 // - Keyboard input pipeline
@@ -12,6 +12,8 @@
 // - Error boundaries & panic handling
 
 #![allow(missing_docs)]
+
+mod renderer;
 
 use js_sys::Function;
 use vt100::{Color, Parser};
