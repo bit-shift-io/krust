@@ -1,7 +1,7 @@
 Name:           krust
 Version:        0.1.0
 Release:        1%{?dist}
-Summary:        Fast, single-binary web terminal emulator
+Summary:        Fast, single-binary web terminal emulator built in Rust using Axum and Canvas 2D / WASM
 
 License:        MIT
 URL:            https://github.com/bit-shift-io/krust
@@ -13,9 +13,7 @@ BuildRequires:  rust-src
 BuildRequires:  gcc
 
 %description
-A fast, single-binary web terminal emulator built in Rust using Axum and
-xterm.js. Provides a browser-based terminal with WebGL acceleration and
-truecolor support.
+A fast, single-binary web terminal emulator built in Rust. Uses Axum WebSocket server with portable-pty for system shell access, and a Rust/WASM Canvas 2D client for terminal rendering with VT100 ANSI parsing and truecolor support.
 
 %prep
 %autosetup -p1
@@ -35,3 +33,5 @@ truecolor support.
 %changelog
 * Thu Aug 20 2026 Bronson Mathews <bronson@localhost> - 0.1.0-1
 - Initial RPM package build for krust
+
+---

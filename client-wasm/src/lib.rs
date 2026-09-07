@@ -230,9 +230,9 @@ fn extract_selection(screen: &vt100::Screen, start: (u16, u16), end: (u16, u16))
     let (start_row, start_col) = start;
     let (end_row, end_col) = end;
     let (a_r, a_c, b_r, b_c) = if (start_row, start_col) <= (end_row, end_col) {
-        (start_row, start_col, end_row, end_col.saturating_add(1))
+        (start_row, start_col, end_row, end_col)
     } else {
-        (end_row, end_col, start_row, start_col.saturating_add(1))
+        (end_row, end_col, start_row, start_col)
     };
     screen.contents_between(a_r, a_c, b_r, b_c)
 }
