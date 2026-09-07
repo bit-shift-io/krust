@@ -172,6 +172,74 @@
         }
 
         window.addEventListener('keydown', (e) => {
+            const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+            const modifier = isMac ? e.metaKey : e.ctrlKey;
+
+            // 1. Shift + Enter -> Send exact Alt+Enter sequence (\x1b\r)
+            if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+                e.preventDefault();
+                if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b\r'));
+                return;
+            }
+
+            // 2. Ctrl + Enter -> Send CSI u sequence (\x1b[13;5u)
+            if (e.key === 'Enter' && modifier && !e.shiftKey && !e.altKey) {
+                e.preventDefault();
+                if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b[13;5u'));
+                return;
+            }
+
+            // 3. Smart Copy: Ctrl+C / Cmd+C
+            if (modifier && e.key.toLowerCase() === 'c' && !e.altKey) {
+                if (e.shiftKey) return false;
+                if (ws && ws.readyState === 1) {
+                    const selLayer = document.getElementById('sel-layer');
+                    const selection = selLayer ? selLayer.innerText : '';
+                    if (selection.trim()) {
+                        navigator.clipboard.writeText(selection).then(() => {
+                            selLayer.innerHTML = '';
+                        });
+                        return; // Already handled - don't fall through
+                    }
+                    // No selection - fall through to standard Ctrl+C (SIGINT)
+                } else {
+                    // No WebSocket - fall through to standard Ctrl+C (SIGINT)
+                }
+                // Falls through to standard Ctrl+C behavior (SIGINT \x03)
+            }
+
+            // 4. Paste: Shift+Insert / Ctrl+Shift+V / Cmd+V
+            const isShiftInsert = e.shiftKey && e.key === 'Insert';
+            const isCtrlShiftV = modifier && e.shiftKey && e.key.toLowerCase() === 'v';
+            const isMacCmdV = isMac && e.metaKey && e.key.toLowerCase() === 'v';
+
+            if (isShiftInsert || isCtrlShiftV || isMacCmdV) {
+                e.preventDefault();
+                if (ws && ws.readyState === 1) {
+                    navigator.clipboard.readText().then(text => {
+                        if (text) {
+                            const data = new TextEncoder().encode(text);
+                            ws.send(data);
+                        }
+                    }).catch(err => {
+                        console.warn("Clipboard read permission denied or unavailable", err);
+                    });
+                }
+                return;
+            }
+
+            // 5. Select All: Ctrl+Shift+A / Cmd+Shift+A
+            if (modifier && e.shiftKey && e.key.toLowerCase() === 'a') {
+                e.preventDefault();
+                if (typeof select_all === 'function') {
+                    select_all();
+                } else {
+                    set_selection(0, 0, gridRows - 1, gridCols - 1);
+                    repaint();
+                }
+                return;
+            }
+
             if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
                 return;
             }
