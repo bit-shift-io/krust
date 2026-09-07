@@ -23,7 +23,7 @@ use web_sys::CanvasRenderingContext2d;
 
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
-const DEFAULT_CELL_WIDTH: i32 = 9;
+const DEFAULT_CELL_WIDTH: i32 = 8;
 const DEFAULT_CELL_HEIGHT: i32 = 18;
 const SCROLLBACK_LEN: usize = 1024;
 const MAX_HISTORY_BYTES: usize = 1024 * 512;
@@ -375,7 +375,7 @@ impl TerminalState {
         // 1. Clear to default background
         self.ctx.set_fill_style_str(&css_color(DEFAULT_BG));
         self.ctx.fill_rect(0.0, 0.0, css_w.max(1.0), css_h.max(1.0));
-        self.ctx.set_text_baseline("middle");
+        self.ctx.set_text_baseline("alphabetic");
 
         let mut font = FONT_STACK.to_string();
         self.ctx.set_font(&font);
@@ -427,7 +427,7 @@ impl TerminalState {
                         self.ctx.set_fill_style_str(&css_color(fg));
                         let _ = self.ctx.fill_text(
                             &s,
-                            col as f64 * cw + cw * 0.5,
+                            col as f64 * cw,
                             row as f64 * ch + ch * 0.5,
                         );
                     }
@@ -482,7 +482,7 @@ impl TerminalState {
             if let Some(c) = cell {
                 let s = c.contents();
                 if !s.is_empty() {
-                    let _ = self.ctx.fill_text(s, cc as f64 * cw + cw * 0.5, cr as f64 * ch + ch * 0.5);
+                    let _ = self.ctx.fill_text(s, cc as f64 * cw, cr as f64 * ch + ch * 0.5);
                 }
             }
         }

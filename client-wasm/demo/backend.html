@@ -2,11 +2,11 @@
 <html>
 <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%232b2b2b'/%3E%3Cpath d='M8 10L14 16L8 22' stroke='%23f0f0f0' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3Cline x1='16' y1='22' x2='24' y2='22' stroke='%23f0f0f0' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
     <title>krust terminal</title>
     <style>
-        html, body { margin: 0; height: 100%; background: #2b2b2b; user-select: none; -webkit-user-select: none; }
-        canvas { display: block; background: #2b2b2b; touch-action: none; }
+        html, body { margin: 0; height: 100%; background: #2b2b2b; user-select: none; -webkit-user-select: none; overflow: hidden; }
+        canvas { display: block; width: 100%; height: 100%; background: #2b2b2b; touch-action: none; }
         #status { position: fixed; bottom: 8px; left: 8px; z-index: 10; font: 12px monospace; color: #f0f0f0; background: rgba(0,0,0,0.7); padding: 4px 8px; }
         #sel-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 5; pointer-events: none; opacity: 0; touch-action: none; }
         body.selecting #sel-layer { pointer-events: auto; opacity: 0.01; }
@@ -35,11 +35,46 @@
 
         const params = new URLSearchParams(location.search);
         const sid = params.get('s') || ('krust-' + Math.random().toString(36).slice(2, 10));
+        function extractTitle(bytes) {
+            // Scan for OSC title sequences: ESC ] 0/2 ; title ST/ESC \ / BEL
+            let out = null;
+            let i = 0;
+            while (i < bytes.length) {
+                if (bytes[i] === 0x1b && i + 1 < bytes.length && bytes[i + 1] === 0x5d) {
+                    let k = i + 2;
+                    while (k < bytes.length && bytes[k] !== 0x07 && !(bytes[k - 1] === 0x1b && bytes[k] === 0x5c)) {
+                        k++;
+                    }
+                    const seq = bytes.subarray(i + 2, k);
+                    const str = new TextDecoder().decode(seq);
+                    const sep = str.indexOf(';');
+                    if (sep !== -1) {
+                        const param = str.slice(0, sep);
+                        if (param === '0' || param === '2') {
+                            out = str.slice(sep + 1);
+                        }
+                    }
+                    i = k + (k < bytes.length ? 1 : 0);
+                } else {
+                    i++;
+                }
+            }
+            return out;
+        }
+
+        let lastTitle = 'krust terminal';
+        window.addEventListener('blur', () => {
+            document.title = 'krust terminal';
+        });
+        window.addEventListener('focus', () => {
+            document.title = lastTitle;
+        });
+
         const status = document.getElementById('status');
         const canvas = document.getElementById('terminal-canvas');
 
         let ws = null;
-        let cellW = 9;
+        let cellW = 8;
         let cellH = 18;
         let gridCols = 80;
         let gridRows = 24;
@@ -100,6 +135,8 @@
             const dpr = Math.min(3, window.devicePixelRatio || 1);
             canvas.width = Math.round(window.innerWidth * dpr);
             canvas.height = Math.round(window.innerHeight * dpr);
+            canvas.style.width = window.innerWidth + 'px';
+            canvas.style.height = window.innerHeight + 'px';
             handle_resize(window.innerWidth, window.innerHeight);
         }
 
@@ -350,8 +387,12 @@
                 const t0 = performance.now();
                 if (params.get('benchskip') !== '1') process_bytes(new Uint8Array(ev.data));
                 benchSample(performance.now() - t0);
+                const title = extractTitle(new Uint8Array(ev.data));
+                if (title) {
+                    lastTitle = title;
+                    document.title = title;
+                }
                 status.textContent = 'bytes=' + bytesIn + ' v=' + version();
-                document.title = 'bytes=' + bytesIn;
             };
             ws.onerror = () => { status.textContent = 'ws error'; };
             ws.onclose = () => {
