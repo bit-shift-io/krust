@@ -25,7 +25,8 @@ web-sys = { version = "0.3", features = [
     "Storage",
     "Selection",
     "Range",
-    "CanvasRenderingContext2d"
+    "CanvasRenderingContext2d",
+    "TextMetrics"
 ]}
 js-sys = "0.3"
 vt100 = "0.16"

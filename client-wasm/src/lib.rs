@@ -23,8 +23,6 @@ use web_sys::CanvasRenderingContext2d;
 
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
-const DEFAULT_CELL_WIDTH: i32 = 8;
-const DEFAULT_CELL_HEIGHT: i32 = 18;
 const SCROLLBACK_LEN: usize = 1024;
 
 /// Default foreground color (light gray)
@@ -69,6 +67,15 @@ fn color_to_rgb(color: Color, default: u32) -> u32 {
         Color::Idx(i) => xterm_palette(i),
         Color::Rgb(r, g, b) => ((r as u32) << 16) | ((g as u32) << 8) | b as u32,
     }
+}
+
+/// Measure actual cell dimensions from the font metrics
+fn measure_cell_dimensions(ctx: &CanvasRenderingContext2d) -> (f64, f64) {
+    ctx.set_font(FONT_STACK);
+    let metrics = ctx.measure_text("W").unwrap();
+    let width = metrics.width();
+    let height = metrics.font_bounding_box_ascent() + metrics.font_bounding_box_descent();
+    (width, height)
 }
 
 /// Format a `0xRRGGBB` integer as an HTML/CSS `#rrggbb` string.
@@ -243,6 +250,10 @@ struct TerminalState {
     /// Terminal dimensions in cells
     rows: u16,
     cols: u16,
+    /// Measured cell width in CSS pixels
+    cell_width: f64,
+    /// Measured cell height in CSS pixels
+    cell_height: f64,
     /// Resize callback
     on_resize: Option<Box<dyn FnMut(u16, u16) + 'static>>,
     /// Selection mode
@@ -294,15 +305,17 @@ impl TerminalState {
             .dyn_into::<web_sys::CanvasRenderingContext2d>()
             .map_err(|_| "2D context cast failed".to_string())?;
 
+        let (cell_width, cell_height) = measure_cell_dimensions(&ctx);
+
         let canvas_w = canvas.width() as f64;
         let canvas_h = canvas.height() as f64;
         let cols = if canvas_w > 0.0 {
-            (canvas_w / DEFAULT_CELL_WIDTH as f64).floor() as u16
+            (canvas_w / cell_width).floor() as u16
         } else {
             DEFAULT_COLS
         };
         let rows = if canvas_h > 0.0 {
-            (canvas_h / DEFAULT_CELL_HEIGHT as f64).floor() as u16
+            (canvas_h / cell_height).floor() as u16
         } else {
             DEFAULT_ROWS
         };
@@ -324,6 +337,8 @@ impl TerminalState {
             canvas_id: canvas_id.to_string(),
             rows,
             cols,
+            cell_width,
+            cell_height,
             on_resize,
             selection_mode: SelectionMode::None,
             selection_start: None,
@@ -360,8 +375,8 @@ impl TerminalState {
         let (prows, pcols) = screen.size();
         let rows = if self.rows > 0 { self.rows } else { prows };
         let cols = if self.cols > 0 { self.cols } else { pcols };
-        let cw = DEFAULT_CELL_WIDTH as f64;
-        let ch = DEFAULT_CELL_HEIGHT as f64;
+        let cw = self.cell_width;
+        let ch = self.cell_height;
 
         let dpr = web_sys::window()
             .map(|w| w.device_pixel_ratio())
@@ -580,8 +595,8 @@ pub fn init(canvas_id: &str, on_resize: &JsValue) -> Result<String, JsValue> {
         "canvas_id": term_state.canvas_id(),
         "rows": term_state.size().0,
         "cols": term_state.size().1,
-        "cell_width": DEFAULT_CELL_WIDTH,
-        "cell_height": DEFAULT_CELL_HEIGHT,
+        "cell_width": term_state.cell_width,
+        "cell_height": term_state.cell_height,
         "webgl2_available": term_state.is_webgl2_available(),
         "fallback_mode": term_state.is_fallback_mode(),
     })
@@ -719,8 +734,11 @@ pub fn handle_resize(width: i32, height: i32) -> Result<(), JsValue> {
         let state = guard
             .as_mut()
             .ok_or_else(|| JsValue::from("init() not called"))?;
-        let cols = (width as f64 / DEFAULT_CELL_WIDTH as f64).floor() as u16;
-        let rows = (height as f64 / DEFAULT_CELL_HEIGHT as f64).floor() as u16;
+        let (cw, ch) = measure_cell_dimensions(&state.ctx);
+        state.cell_width = cw;
+        state.cell_height = ch;
+        let cols = (width as f64 / cw).floor() as u16;
+        let rows = (height as f64 / ch).floor() as u16;
         let cols = cols.max(2);
         let rows = rows.max(1);
         let _ = state.parser.screen_mut().set_size(rows, cols);
