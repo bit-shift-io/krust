@@ -24,6 +24,8 @@ use web_sys::CanvasRenderingContext2d;
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
 const SCROLLBACK_LEN: usize = 1024;
+/// Epsilon to prevent 1-pixel anti-aliasing gaps between adjacent cell rects
+const CELL_EPSILON: f64 = 0.5;
 
 /// Default foreground color (light gray)
 const DEFAULT_FG: u32 = 0xf0f0f0;
@@ -416,39 +418,7 @@ impl TerminalState {
             }
         }
 
-        // 3. Draw all text
-        for row in 0..rows {
-            for col in 0..cols {
-                let (fg, text) = if row < prows && col < pcols {
-                    match screen.cell(row, col) {
-                        Some(c) if !c.contents().is_empty() => (
-                            color_to_rgb(c.fgcolor(), DEFAULT_FG),
-                            Some((c.contents().to_string(), c.bold())),
-                        ),
-                        _ => (DEFAULT_FG, None),
-                    }
-                } else {
-                    (DEFAULT_FG, None)
-                };
-                if let Some((s, bold)) = text {
-                    if fg != DEFAULT_BG {
-                        let want = if bold { FONT_STACK_BOLD } else { FONT_STACK };
-                        if font != want {
-                            font = want.to_string();
-                            self.ctx.set_font(&font);
-                        }
-                        self.ctx.set_fill_style_str(&css_color(fg));
-                        let _ = self.ctx.fill_text(
-                            &s,
-                            col as f64 * cw,
-                            row as f64 * ch + ch * 0.5,
-                        );
-                    }
-                }
-            }
-        }
-
-        // 4. Selection background rects (swapped colors) on top of text
+        // 3. Draw selection background rects BEFORE text
         for row in 0..rows {
             for col in 0..cols {
                 if self.selected(row, col) {
@@ -467,11 +437,45 @@ impl TerminalState {
                     std::mem::swap(&mut fg, &mut bg);
                     self.ctx.set_fill_style_str(&css_color(bg));
                     self.ctx.fill_rect(
-                        col as f64 * cw,
-                        row as f64 * ch,
-                        cw,
-                        ch,
+                        col as f64 * cw - CELL_EPSILON,
+                        row as f64 * ch - CELL_EPSILON,
+                        cw + CELL_EPSILON * 2.0,
+                        ch + CELL_EPSILON * 2.0,
                     );
+                }
+            }
+        }
+
+        // 4. Draw all text on top of selection
+        const SELECTION_FG: u32 = 0x000000;
+        for row in 0..rows {
+            for col in 0..cols {
+                let (fg, text) = if row < prows && col < pcols {
+                    match screen.cell(row, col) {
+                        Some(c) if !c.contents().is_empty() => (
+                            color_to_rgb(c.fgcolor(), DEFAULT_FG),
+                            Some((c.contents().to_string(), c.bold())),
+                        ),
+                        _ => (DEFAULT_FG, None),
+                    }
+                } else {
+                    (DEFAULT_FG, None)
+                };
+                if let Some((s, bold)) = text {
+                    let draw_fg = if self.selected(row, col) { SELECTION_FG } else { fg };
+                    if draw_fg != DEFAULT_BG {
+                        let want = if bold { FONT_STACK_BOLD } else { FONT_STACK };
+                        if font != want {
+                            font = want.to_string();
+                            self.ctx.set_font(&font);
+                        }
+                        self.ctx.set_fill_style_str(&css_color(draw_fg));
+                        let _ = self.ctx.fill_text(
+                            &s,
+                            col as f64 * cw,
+                            row as f64 * ch + ch * 0.5,
+                        );
+                    }
                 }
             }
         }
@@ -534,6 +538,12 @@ impl TerminalState {
         } else if let Some(ref _start) = self.selection_start {
             self.selection_end = Some((row, col));
         }
+    }
+
+    /// Clear the active selection (reset both anchor and end to None)
+    pub fn clear_selection(&mut self) {
+        self.selection_start = None;
+        self.selection_end = None;
     }
 
     /// Get the canvas ID
@@ -807,18 +817,52 @@ pub fn selected_text() -> String {
 }
 
 /// Record a text selection between two grid coordinates.
-///
-/// `start` is the anchor (drag origin), `end` the current cursor cell.
-/// The stored selection is later retrievable via [`selected_text`].
-#[wasm_bindgen]
-pub fn set_selection(start_row: u16, start_col: u16, end_row: u16, end_col: u16) {
-    TERM_STATE.with(|cell| {
-        if let Some(state) = cell.borrow_mut().as_mut() {
-            state.handle_selection_start(start_row, start_col);
-            state.handle_selection_update(end_row, end_col);
-        }
-    });
-}
+    ///
+    /// `start` is the anchor (drag origin), `end` the current cursor cell.
+    /// The stored selection is later retrievable via [`selected_text`].
+    #[wasm_bindgen]
+    pub fn set_selection(start_row: u16, start_col: u16, end_row: u16, end_col: u16) {
+        TERM_STATE.with(|cell| {
+            if let Some(state) = cell.borrow_mut().as_mut() {
+                state.handle_selection_start(start_row, start_col);
+                state.handle_selection_update(end_row, end_col);
+            }
+        });
+    }
+
+    /// Clear the active selection (reset both anchor and end to None).
+    ///
+    /// Useful for clearing the selection when the user clicks elsewhere
+    /// or starts a new drag.
+    #[wasm_bindgen]
+    pub fn clear_selection() {
+        TERM_STATE.with(|cell| {
+            if let Some(state) = cell.borrow_mut().as_mut() {
+                state.clear_selection();
+                let _ = state.render();
+            }
+        });
+    }
+
+    /// Handle a click at the given pixel coordinates.
+    ///
+    /// Clears any existing selection and repaints. Returns JSON with clicked cell coordinates,
+    /// or empty JSON if not initialized.
+    #[wasm_bindgen]
+    pub fn handle_click(x: i32, y: i32) -> String {
+        TERM_STATE.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            if let Some(state) = guard.as_mut() {
+                state.clear_selection();
+                let _ = state.render();
+                let col = (x as f64 / state.cell_width).floor() as u16;
+                let row = (y as f64 / state.cell_height).floor() as u16;
+                serde_json::json!({ "row": row, "col": col }).to_string()
+            } else {
+                String::new()
+            }
+        })
+    }
 
 /// Map a browser keyboard event to raw PTY bytes
 ///

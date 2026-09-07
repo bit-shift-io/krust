@@ -13,11 +13,11 @@
     </style>
 </head>
 <body>
-    <canvas id="terminal-canvas" width="800" height="600"></canvas>
+    <canvas id="terminal-canvas" width="800" height="600" tabindex="0"></canvas>
     <img src="/demo/slow.png" style="display:none">
     <div id="status">loading...</div>
     <script type="module">
-        import init, { init as term_init, process_bytes, handle_resize, version } from '../pkg/terminal_client.js';
+        import init, { init as term_init, process_bytes, handle_resize, handle_click, version } from '../pkg/terminal_client.js';
         import ping from './ping.js';
         const status = document.getElementById('status');
         const canvas = document.getElementById('terminal-canvas');
@@ -30,6 +30,14 @@
             term_init('terminal-canvas', null);
             ping('init');
             handle_resize(800, 600);
+            ping('resize');
+            canvas.addEventListener('click', (e) => {
+                const rect = canvas.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const y = e.clientY - rect.top;
+                handle_click(Math.round(x), Math.round(y));
+            });
+            canvas.style.pointerEvents = 'auto';
             ping('resize');
             process_bytes(new TextEncoder().encode('Hello World\x1b[31m red\x1b[0m'));
             ping('proc');
