@@ -279,6 +279,15 @@ enum SelectionMode {
     Linear,
 }
 
+impl SelectionMode {
+    fn to_string(&self) -> String {
+        match self {
+            SelectionMode::None => "None".to_string(),
+            SelectionMode::Linear => "Linear".to_string(),
+        }
+    }
+}
+
 impl TerminalState {
     /// Create a new terminal state with a Canvas 2D rendering context
     ///
@@ -544,6 +553,7 @@ impl TerminalState {
     pub fn clear_selection(&mut self) {
         self.selection_start = None;
         self.selection_end = None;
+        self.selection_mode = SelectionMode::None;
     }
 
     /// Get the canvas ID
@@ -794,7 +804,13 @@ pub fn is_fallback_mode() -> bool {
 /// Get the selection mode
 #[wasm_bindgen]
 pub fn selection_mode() -> String {
-    "None".to_string()
+    TERM_STATE.with(|cell| {
+        let state = cell.borrow();
+        match state.as_ref() {
+            Some(s) => s.selection_mode.to_string(),
+            None => "None".to_string(),
+        }
+    })
 }
 
 /// Get the selected text

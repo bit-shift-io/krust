@@ -30,6 +30,7 @@
             key_to_bytes,
             set_selection,
             selected_text,
+            clear_selection,
             repaint
         } from '/pkg/terminal_client.js';
 
@@ -206,7 +207,12 @@
             if (fallbackMode) return;
             if (e.button !== 0 || !selDragging) return;
             selDragging = false;
-            if (!selMoved) { selAnchor = null; return; }
+            if (!selMoved) {
+                clear_selection();
+                repaint();
+                selAnchor = null;
+                return;
+            }
             selMoved = false;
             const end = cellFromPoint(e.clientX, e.clientY);
             set_selection(selAnchor.row, selAnchor.col, end.row, end.col);
