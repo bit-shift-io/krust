@@ -49,6 +49,9 @@ documents (ARCHITECTURE.md, NOTES.md) are stale and should be ignored.
   Public API exported with `#[wasm_bindgen]`.
 - **Tests:** Unit tests live alongside code in `#[cfg(test)] mod tests`.
   Backend tests use `tower::util::ServiceExt` for one-shot HTTP requests.
+- **CORS:** `tower-http::cors::CorsLayer::permissive()` is enabled on all
+  routes. The krust backend serves cross-origin requests from the Grit
+  web UI (running on `localhost:5000`).
 - **Build:** `wasm-pack build --target web` then `cargo build`/`cargo run`.
 
 ---

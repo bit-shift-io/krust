@@ -4,7 +4,6 @@ use axum::{
         Query, State,
     },
     http::header,
-    
     routing::get,
     Router,
 };
@@ -17,6 +16,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
+use tower_http::cors::CorsLayer;
 
 const INDEX_HTML: &str = include_str!("../../client-wasm/demo/backend.html");
 
@@ -135,7 +135,8 @@ async fn main() {
         .route(
             "/pkg/terminal_client_bg.wasm",
             get(|| serve_pkg_file("terminal_client_bg.wasm", "application/wasm")),
-        );
+        )
+        .layer(CorsLayer::permissive());
     let app = app.with_state(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
@@ -532,7 +533,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_response_has_no_cors_headers() {
+    async fn root_response_has_cors_headers() {
         use crate::AppState;
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -542,7 +543,8 @@ mod tests {
             .route("/", get(index))
             .with_state(AppState {
                 sessions: Arc::new(RwLock::new(HashMap::new())),
-            });
+            })
+            .layer(CorsLayer::permissive());
 
         let response = app
             .oneshot(
@@ -560,8 +562,8 @@ mod tests {
             response
                 .headers()
                 .get("access-control-allow-origin")
-                .is_none(),
-            "krust must not emit CORS headers (cross-origin iframes + WS are not CORS-gated)"
+                .is_some(),
+            "krust must emit CORS headers (cross-origin fetch from Grit web UI)"
         );
     }
 }

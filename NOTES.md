@@ -145,7 +145,7 @@
 - `portable-pty` — PTY management
 - `futures-util` — stream/sink utilities
 - `serde` + `serde_json` — JSON for resize/control messages
-- `tower-http` + `CorsLayer` — CORS for cross-origin frames
+- `tower-http` + `CorsLayer` — CORS enabled on all routes to allow cross-origin fetch from Grit web UI (`localhost:5000` → `localhost:3000`)
 
 ### WASM Client (`client-wasm/Cargo.toml`)
 - `wasm-bindgen` — JS interop
