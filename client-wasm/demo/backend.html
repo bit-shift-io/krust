@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <title>krust terminal</title>
+    <style>
+        html, body { margin: 0; height: 100%; background: #2b2b2b; user-select: none; -webkit-user-select: none; }
+        canvas { display: block; background: #2b2b2b; touch-action: none; }
+        #status { position: fixed; bottom: 8px; left: 8px; z-index: 10; font: 12px monospace; color: #f0f0f0; background: rgba(0,0,0,0.7); padding: 4px 8px; }
+        #sel-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 5; pointer-events: none; opacity: 0; touch-action: none; }
+        body.selecting #sel-layer { pointer-events: auto; opacity: 0.01; }
+    </style>
+</head>
+<body>
+    <canvas id="terminal-canvas"></canvas>
+    <div id="sel-layer" contenteditable="false"></div>
+    <div id="status">connecting...</div>
+    <script type="module">
+        import init, {
+            init as term_init,
+            process_bytes,
+            query_replies,
+            handle_resize,
+            version,
+            is_webgl2_available,
+            check_fallback,
+            show_fallback_ui,
+            hide_fallback_ui,
+            key_to_bytes,
+            set_selection,
+            selected_text,
+            repaint
+        } from '/pkg/terminal_client.js';
+
+        const params = new URLSearchParams(location.search);
+        const sid = params.get('s') || ('krust-' + Math.random().toString(36).slice(2, 10));
+        const status = document.getElementById('status');
+        const canvas = document.getElementById('terminal-canvas');
+
+        let ws = null;
+        let cellW = 9;
+        let cellH = 18;
+        let gridCols = 80;
+        let gridRows = 24;
+        let selAnchor = null;
+        let selDragging = false;
+        let selMoved = false;
+        let bytesIn = 0;
+        let benchGoal = parseInt(params.get('bench') || '0', 10);
+        let benchMax = 0;
+        let benchSum = 0;
+        let benchN = 0;
+        let benchT0 = 0;
+        let benchAt = 0;
+        let benchHex = 0;
+        let fpsFrames = 0;
+        let fpsAt = 0;
+        let quietTimer = null;
+
+        function benchReset() {
+            benchN = 0;
+            benchMax = 0;
+            benchSum = 0;
+            benchAt = performance.now();
+            quietTimer = null;
+        }
+
+        function benchSample(dt) {
+            if (benchGoal <= 0) return;
+            benchN += 1;
+            if (dt > benchMax) benchMax = dt;
+            benchSum += dt;
+            fpsFrames += 1;
+            const now = performance.now();
+            if (fpsFrames >= 60) {
+                const dt60 = now - fpsAt;
+                if (dt60 > 0) {
+                    console.log('FPS', Math.floor(60000 / dt60));
+                    fpsFrames = 0;
+                    fpsAt = now;
+                }
+            }
+            if (quietTimer) clearTimeout(quietTimer);
+            quietTimer = setTimeout(() => {
+                benchGoal = 0;
+                console.log('BENCH_DONE', JSON.stringify({
+                    n: benchN,
+                    maxMs: benchMax,
+                    avgMs: benchN > 0 ? benchSum / benchN : 0,
+                    bytesIn: bytesIn,
+                    wallMs: performance.now() - benchAt
+                }));
+            }, 600);
+        }
+        let fallbackMode = false;
+        let reconnectAttempts = 0;
+
+        function fit() {
+            const dpr = Math.min(3, window.devicePixelRatio || 1);
+            canvas.width = Math.round(window.innerWidth * dpr);
+            canvas.height = Math.round(window.innerHeight * dpr);
+            handle_resize(window.innerWidth, window.innerHeight);
+        }
+
+        function sendResize() {
+            const cols = Math.max(2, Math.floor(window.innerWidth / cellW));
+            const rows = Math.max(1, Math.floor(window.innerHeight / cellH));
+            const msg = { type: 'Resize', cols, rows, pixel_width: window.innerWidth, pixel_height: window.innerHeight };
+            if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
+        }
+
+        function cellFromPoint(px, py) {
+            const col = Math.max(0, Math.min(gridCols - 1, Math.floor(px / cellW)));
+            const row = Math.max(0, Math.min(gridRows - 1, Math.floor(py / cellH)));
+            return { row, col };
+        }
+
+        window.addEventListener('keydown', (e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
+                return;
+            }
+            if (fallbackMode) return;
+            const bytes = key_to_bytes(e.key, e.ctrlKey, e.altKey, e.shiftKey, e.metaKey);
+            if (bytes.length > 0) {
+                e.preventDefault();
+                if (ws && ws.readyState === 1) ws.send(bytes);
+            }
+        });
+
+        const PASTE_CHUNK = 4096;
+        const PASTE_INTERVAL_MS = 16;
+        function sendPaste(text, force) {
+            const data = new TextEncoder().encode(text);
+            if (data.length === 0) return;
+            let i = 0;
+            const push = () => {
+                if (!ws || ws.readyState !== 1) return;
+                ws.send(data.slice(i, i + PASTE_CHUNK));
+                i += PASTE_CHUNK;
+                if (i < data.length && !force) setTimeout(push, PASTE_INTERVAL_MS);
+                else if (i < data.length) push();
+            };
+            push();
+        }
+
+        window.addEventListener('paste', (e) => {
+            if (fallbackMode) return;
+            const text = e.clipboardData ? e.clipboardData.getData('text') : '';
+            e.preventDefault();
+            document.getElementById('sel-layer').innerHTML = '';
+            sendPaste(text);
+        });
+
+        window.addEventListener('mousedown', (e) => {
+            if (fallbackMode) return;
+            if (e.button !== 0) return;
+            selDragging = true;
+            selMoved = false;
+            selAnchor = cellFromPoint(e.clientX, e.clientY);
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (fallbackMode) return;
+            if (!selDragging || !selAnchor) return;
+            const cur = cellFromPoint(e.clientX, e.clientY);
+            if (cur.row !== selAnchor.row || cur.col !== selAnchor.col) selMoved = true;
+            if (selMoved) { set_selection(selAnchor.row, selAnchor.col, cur.row, cur.col); repaint(); }
+        });
+
+        window.addEventListener('mouseup', (e) => {
+            if (fallbackMode) return;
+            if (e.button !== 0 || !selDragging) return;
+            selDragging = false;
+            if (!selMoved) { selAnchor = null; return; }
+            selMoved = false;
+            const end = cellFromPoint(e.clientX, e.clientY);
+            set_selection(selAnchor.row, selAnchor.col, end.row, end.col);
+            repaint();
+            selAnchor = null;
+            const text = selected_text();
+            if (text) {
+                try { navigator.clipboard.writeText(text); status.textContent = 'copied ' + text.length + ' chars'; } catch (_) {}
+            }
+        });
+
+        window.addEventListener('auxclick', (e) => {
+            if (e.button !== 1) return;
+            e.preventDefault();
+            navigator.clipboard.readText().then((t) => {
+                if (t) sendPaste(t);
+            }).catch(() => {});
+        });
+
+        let touchSel = null;
+        let touchTimer = null;
+        window.addEventListener('touchstart', (e) => {
+            if (fallbackMode) return;
+            if (e.touches.length !== 1) return;
+            const t = e.touches[0];
+            touchTimer = setTimeout(() => {
+                touchTimer = null;
+                touchSel = cellFromPoint(t.clientX, t.clientY);
+                if (navigator.vibrate) navigator.vibrate(20);
+            }, 450);
+        }, { passive: true });
+
+        window.addEventListener('touchmove', (e) => {
+            if (fallbackMode) return;
+            if (!touchSel || e.touches.length !== 1) return;
+            e.preventDefault();
+            const t = e.touches[0];
+            const cur = cellFromPoint(t.clientX, t.clientY);
+            set_selection(touchSel.row, touchSel.col, cur.row, cur.col);
+            repaint();
+        }, { passive: false });
+
+        window.addEventListener('touchend', (e) => {
+            if (fallbackMode) return;
+            if (touchTimer) { clearTimeout(touchTimer); touchTimer = null; }
+            if (!touchSel) return;
+            touchSel = null;
+            const text = selected_text();
+            if (text) {
+                try { navigator.clipboard.writeText(text); status.textContent = 'copied ' + text.length + ' chars'; } catch (_) {}
+            }
+        });
+
+        function loadScript(src) {
+            return new Promise((resolve, reject) => {
+                const s = document.createElement('script');
+                s.src = src;
+                s.onload = resolve;
+                s.onerror = () => reject(new Error('failed to load ' + src));
+                document.head.appendChild(s);
+            });
+        }
+
+        async function bootXterm(sid) {
+            try {
+                fallbackMode = true;
+                await loadScript('/res/xterm.js');
+                await loadScript('/res/xterm-addon-fit.js');
+                const el = document.createElement('div');
+                el.id = 'xterm-fallback';
+                el.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;padding:6px;';
+                document.body.appendChild(el);
+                const term = new window.Terminal({ cols: 80, rows: 24, convertEol: true });
+                const fit = new window.FitAddon.FitAddon();
+                term.loadAddon(fit);
+                term.open(el);
+                fit.fit();
+                canvas.style.display = 'none';
+                const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+                ws = new WebSocket(proto + '://' + location.host + '/ws?s=' + sid);
+                ws.binaryType = 'arraybuffer';
+                ws.onmessage = (ev) => term.write(new Uint8Array(ev.data));
+                ws.onerror = () => { status.textContent = 'ws error'; };
+                ws.onclose = () => { status.textContent = 'ws closed'; };
+                ws.onopen = () => {
+                    ws.send(JSON.stringify({
+                        type: 'Resize', cols: term.cols, rows: term.rows,
+                        pixel_width: el.clientWidth, pixel_height: el.clientHeight
+                    }));
+                    if (params.get('echo') === '1') {
+                        ws.send(new TextEncoder().encode('echo K_RUST_WIRED\r'));
+                    }
+                };
+                term.onData((d) => {
+                    if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode(d));
+                });
+                status.textContent = 'fallback xterm.js sid=' + sid;
+            } catch (e) {
+                status.textContent = 'fallback err ' + e;
+            }
+        }
+
+        async function startTerminal() {
+            if (params.get('nogl') === '1') {
+                await bootXterm(sid);
+                return;
+            }
+            const bytes = await (await fetch('/pkg/terminal_client_bg.wasm')).arrayBuffer();
+            await init(bytes);
+            const cfg = JSON.parse(term_init('terminal-canvas', null));
+            if (cfg.fallback_mode) {
+                show_fallback_ui('WebGL2 not available, using xterm.js fallback');
+                await bootXterm(sid);
+                return;
+            }
+            hide_fallback_ui();
+            gridCols = cfg.cols;
+            gridRows = cfg.rows;
+            cellW = Math.max(1, cfg.cell_width || cellW);
+            cellH = Math.max(1, cfg.cell_height || cellH);
+            fit();
+            window.addEventListener('resize', () => { fit(); sendResize(); });
+            status.textContent = 'v=' + version() + ' webgl2=' + is_webgl2_available();
+
+            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+            const st = params.get('selftest');
+            if (st) {
+                const rows = parseInt(st, 10);
+                const line = new TextEncoder().encode('X'.repeat(80) + '\n');
+                const chunk = new Uint8Array(line.length * rows);
+                for (let i = 0; i < rows; i++) chunk.set(line, i * line.length);
+                const t0 = performance.now();
+                let mx = 0, sum = 0, N = 0;
+                for (let off = 0; off < chunk.length; off += 1024) {
+                    const t = performance.now();
+                    process_bytes(chunk.subarray(off, Math.min(off + 1024, chunk.length)));
+                    const dt = performance.now() - t;
+                    if (dt > mx) mx = dt;
+                    sum += dt; N++;
+                }
+                console.log('SELFTEST', JSON.stringify({ rows, N, maxMs: mx, avgMs: sum / N, wallMs: performance.now() - t0, bytesIn: bytesIn }));
+            }
+            connectPrimary(proto + '://' + location.host + '/ws?s=' + sid);
+        }
+
+        function connectPrimary(url) {
+            ws = new WebSocket(url);
+            ws.binaryType = 'arraybuffer';
+            ws.onopen = () => {
+                reconnectAttempts = 0;
+                if (params.get('echo') === '1') {
+                    ws.send(new TextEncoder().encode('echo K_RUST_WIRED\r'));
+                }
+                sendResize();
+                const p = params.get('paste');
+                if (p) {
+                    const unit = 'X'.repeat(1024) + '\n';
+                    sendPaste(unit.repeat(parseInt(p, 10)), params.get('via') === 'fast');
+                }
+                if (params.get('cl') === '1') {
+                    setTimeout(() => canvas.dispatchEvent(new Event('webglcontextlost')), 1500);
+                }
+                const b = params.get('bench');
+                if (b) {
+                    benchGoal = parseInt(b, 10);
+                    benchReset();
+                    fpsAt = performance.now();
+                    ws.send(new TextEncoder().encode('seq 1 ' + b + '\r'));
+                }
+            };
+            ws.onmessage = (ev) => {
+                bytesIn += ev.data.byteLength;
+                const reps = query_replies(new Uint8Array(ev.data));
+                if (reps.length) ws.send(reps);
+                const t0 = performance.now();
+                if (params.get('benchskip') !== '1') process_bytes(new Uint8Array(ev.data));
+                benchSample(performance.now() - t0);
+                status.textContent = 'bytes=' + bytesIn + ' v=' + version();
+                document.title = 'bytes=' + bytesIn;
+            };
+            ws.onerror = () => { status.textContent = 'ws error'; };
+            ws.onclose = () => {
+                status.textContent = 'ws closed';
+                if (fallbackMode) return;
+                const delay = Math.min(1000 * Math.pow(2, reconnectAttempts++), 8000);
+                status.textContent = 'reconnecting in ' + delay + 'ms';
+                setTimeout(() => connectPrimary(url), delay);
+            };
+        }
+
+        canvas.addEventListener('webglcontextlost', (e) => {
+            e.preventDefault();
+            show_fallback_ui('WebGL context lost, using xterm.js fallback');
+            fallbackMode = true;
+            if (ws) {
+                ws.onclose = null;
+                try { ws.close(); } catch (_) {}
+            }
+            bootXterm(sid);
+        });
+        startTerminal().catch((e) => {
+            status.textContent = 'ERR ' + e;
+        });
+    </script>
+</body>
+</html>

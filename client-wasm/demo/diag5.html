@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>diag5</title>
+<style>html,body{margin:0;background:#111}canvas{display:block}
+#status{position:fixed;bottom:8px;left:8px;z-index:10;font:12px monospace;color:#111;background:#888;padding:4px 8px}
+#status.ok{background:#0a0;color:#fff}#status.fail{background:#a00;color:#fff}
+body.done{background:#0a0}body.done.fail{background:#a00}</style>
+</head>
+<body>
+<canvas id="terminal-canvas" width="800" height="600"></canvas>
+<div id="status">loading...</div>
+<img src="slow.png" width="1" height="1" alt="">
+<script type="module">
+    function log(m) {
+        try { console.log(m); } catch (e) {}
+        if (typeof window.dump === 'function') { try { window.dump(m + '\n'); } catch (e) {} }
+    }
+    window.addEventListener('unhandledrejection', (e) => log('UNHANDLED: ' + (e.reason && (e.reason.stack || e.reason.message || JSON.stringify(e.reason)))));
+    window.addEventListener('error', (e) => log('PAGEERR: ' + e.message + ' @ ' + e.filename + ':' + e.lineno));
+    const t0 = performance.now();
+    const then = (m) => log('[' + Math.round(performance.now() - t0) + 'ms] ' + m);
+    const status = document.getElementById('status');
+    const canvas = document.getElementById('terminal-canvas');
+    try {
+        const m = await import('../pkg/terminal_client.js');
+        then('glue imported');
+        const bytes = await (await fetch('../pkg/terminal_client_bg.wasm')).arrayBuffer();
+        then('fetched ' + bytes.byteLength);
+        const mod = await WebAssembly.compile(bytes);
+        then('compiled async');
+        const wasm = m.initSync(mod);
+        then('initSync done');
+        const cfg = wasm.init('terminal-canvas', null);
+        then('init ok ' + cfg);
+        const pb = wasm.process_bytes(new TextEncoder().encode('Hello World\x1b[31m red\x1b[0m'));
+        then('process_bytes ok ' + pb);
+        const gl = canvas.getContext('webgl2');
+        then('webgl2 ctx ' + !!gl);
+        const px = new Uint8Array(canvas.width * canvas.height * 4);
+        gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        let bright = 0;
+        for (let i = 0; i < px.length; i += 4) {
+            if (px[i] > 120 || px[i + 1] > 120 || px[i + 2] > 120) bright++;
+        }
+        then('bright=' + bright);
+        const ok = bright > 50;
+        document.body.className = 'done' + (ok ? '' : ' fail');
+        status.className = ok ? 'ok' : 'fail';
+        status.textContent = 'glyphs=' + bright + ' res=' + pb;
+        then('END ok=' + ok);
+    } catch (e) {
+        log('CAUGHT: ' + (e && (e.stack || e.message || JSON.stringify(e))));
+        document.body.className = 'done fail';
+        status.className = 'fail';
+        status.textContent = 'ERR ' + e;
+    }
+</script>
+</body>
+</html>

@@ -15,7 +15,6 @@
   },
   "plugin": [
     "opencode-auto-continue@https://github.com/developing-today/opencode-auto-continue/archive/refs/tags/latest.tar.gz",
-    "./plugins/xml-guard.js",
     "./plugins/network-watchdog.js"
   ],
   "permission": {

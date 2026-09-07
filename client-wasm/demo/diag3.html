@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>diag3</title>
+<style>body{background:#111;color:#eee;font:12px monospace;padding:8px;}</style>
+</head>
+<body>
+<pre id="out"></pre>
+<script type="module">
+    function log(m) {
+        try { console.log(m); } catch (e) {}
+        if (typeof window.dump === 'function') { try { window.dump(m + '\n'); } catch (e) {} }
+    }
+    const t0 = performance.now();
+    const then = (m) => log('[' + Math.round(performance.now() - t0) + 'ms] ' + m);
+    setInterval(() => then('tick ' + Math.round(performance.now() - t0)), 1000);
+
+    const res = await fetch('../pkg/terminal_client_bg.wasm');
+    const bytes = await res.arrayBuffer();
+    then('fetched bytes=' + bytes.byteLength);
+
+    then('STARTING WebAssembly.compile');
+    try {
+        const started = performance.now();
+        const mod = await WebAssembly.compile(bytes);
+        then('compile DONE in ' + Math.round(performance.now() - started) + 'ms moduleOk=' + (mod instanceof WebAssembly.Module));
+    } catch (e) {
+        then('compile FAILED: ' + e);
+    }
+    then('page end');
+</script>
+</body>
+</html>

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>diag2</title>
+<style>body{background:#111;color:#eee;font:12px monospace;padding:8px;}</style>
+</head>
+<body>
+<pre id="out"></pre>
+<script type="module">
+    const out = document.getElementById('out');
+    function log(m) { out.textContent += m + '\n'; try { console.log(m); } catch (e) {} if (typeof window.dump === 'function') try { window.dump(m + '\n'); } catch (e) {} }
+    const t0 = performance.now();
+    const then = (m) => log('[' + Math.round(performance.now() - t0) + 'ms] ' + m);
+    let ticks = 0;
+    setInterval(() => { ticks++; then('tick ' + ticks); }, 500);
+
+    const res = await fetch('../pkg/terminal_client_bg.wasm');
+    then('fetch status=' + res.status + ' len=' + res.headers.get('content-length'));
+    const bytes = await res.arrayBuffer();
+    then('arrayBuffer bytes=' + bytes.byteLength);
+
+    let modT;
+    try {
+        modT = performance.now();
+        const mod = new WebAssembly.Module(bytes);
+        then('WebAssembly.Module compiled in ' + Math.round(performance.now() - modT) + 'ms');
+    } catch (e) {
+        then('Module compile FAILED: ' + e);
+    }
+
+    const m = await import('../pkg/terminal_client.js');
+    then('glue imported');
+
+    let instT;
+    try {
+        instT = performance.now();
+        const wasm = m.initSync(new WebAssembly.Module(bytes));
+        then('initSync done in ' + Math.round(performance.now() - instT) + 'ms');
+        try {
+            then('version() = ' + wasm.version());
+        } catch (e) { then('version() threw: ' + e); }
+    } catch (e) {
+        then('initSync FAILED: ' + e);
+    }
+    then('page reached end');
+</script>
+</body>
+</html>

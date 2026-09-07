@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>html, body { margin: 0; height: 100%; background: #000; }</style>
+</head>
+<body>
+    <canvas id="terminal-canvas" width="800" height="600"></canvas>
+    <script>
+        var t0 = Date.now();
+        var at = function (s) { try { dump('[' + (Date.now() - t0) + 'ms] ' + s + '\n'); } catch (e) {} };
+        (async function () {
+            try {
+                at('start');
+                var m = await import('../pkg/terminal_client.js');
+                at('glue');
+                var bytes = await (await fetch('../pkg/terminal_client_bg.wasm')).arrayBuffer();
+                at('fetched');
+                var wasm = await m.default(bytes);
+                at('default DONE');
+                var v = wasm.version();
+                at('version ' + v);
+            } catch (e) { at('ERR ' + e); }
+        })();
+    </script>
+</body>
+</html>

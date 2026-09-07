@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>krust WS binary pipeline</title>
+    <style>
+        html, body { margin: 0; height: 100%; background: #111; }
+        canvas { display: block; background: #000; }
+        #status { position: fixed; bottom: 8px; left: 8px; z-index: 10; font: 12px monospace; color: #0f0; background: rgba(0,0,0,0.7); padding: 4px 8px; }
+        body.done { background: #0a0; }
+        body.done.fail { background: #a00; }
+    </style>
+</head>
+<body>
+    <canvas id="terminal-canvas" width="800" height="600"></canvas>
+    <img src="/demo/slow.png" style="display:none">
+    <div id="status">connecting...</div>
+    <script type="module">
+        import init, { init as term_init, process_bytes, version } from '../pkg/terminal_client.js';
+        import ping from './ping.js';
+        const params = new URLSearchParams(location.search);
+        const bport = params.get('b') || '8300';
+        const sid = params.get('s') || 'smoke';
+        const status = document.getElementById('status');
+        const canvas = document.getElementById('terminal-canvas');
+        const gl = canvas.getContext('webgl2');
+
+        function countBright() {
+            const px = new Uint8Array(canvas.width * canvas.height * 4);
+            gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, px);
+            let bright = 0;
+            for (let i = 0; i < px.length; i += 4) {
+                if (px[i] > 120 || px[i + 1] > 120 || px[i + 2] > 120) bright++;
+            }
+            return bright;
+        }
+
+        let finished = false;
+        function finish(ok, why) {
+            if (finished) return;
+            finished = true;
+            document.body.className = 'done' + (ok ? '' : ' fail');
+            status.textContent = (ok ? 'PASS' : 'FAIL') + ' ' + why + ' v=' + version();
+            ping('end ok=' + ok + ' ' + why);
+        }
+
+        try {
+            ping('start');
+            const bytes = await (await fetch('../pkg/terminal_client_bg.wasm')).arrayBuffer();
+            await init(bytes);
+            ping('glue');
+            term_init('terminal-canvas', null);
+            ping('init');
+
+            const ws = new WebSocket('ws://127.0.0.1:' + bport + '/ws?s=' + sid);
+            ws.binaryType = 'arraybuffer';
+            let got = 0, best = 0;
+            ws.onopen = () => {
+                ping('wsopen');
+                ws.send(JSON.stringify({ type: 'Input', data: 'echo K_R_U_S_T_RENDER_OK\r' }));
+            };
+            ws.onmessage = (ev) => {
+                const bytes = new Uint8Array(ev.data);
+                process_bytes(bytes);
+                got += bytes.length;
+                best = Math.max(best, countBright());
+                ping('msg got=' + got + ' best=' + best);
+                if (best > 100) finish(true, 'got=' + got + ' best=' + best);
+            };
+            ws.onerror = () => finish(false, 'wserr');
+            ws.onclose = () => setTimeout(() => finish(best > 100, 'closed got=' + got + ' best=' + best), 1000);
+            setTimeout(() => finish(best > 100, 'timeout got=' + got + ' best=' + best), 10000);
+        } catch (e) {
+            finish(false, 'catch ' + e);
+            ping('err ' + e);
+        }
+    </script>
+</body>
+</html>

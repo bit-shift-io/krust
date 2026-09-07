@@ -1,2 +1,2 @@
 #!/usr/bin/env bash
-cargo run "$@"
+cargo run -p terminal-backend "$@"

@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>krust WASM renderer</title>
+    <style>
+        html, body { margin: 0; height: 100%; background: #111; }
+        canvas { display: block; width: 800px; height: 600px; background: #000; }
+        #status { position: fixed; bottom: 8px; left: 8px; z-index: 10; font: 12px monospace; color: #0f0; background: rgba(0,0,0,0.7); padding: 4px 8px; }
+        body.done { background: #0a0; }
+        body.done.fail { background: #a00; }
+    </style>
+</head>
+<body>
+    <canvas id="terminal-canvas" width="800" height="600"></canvas>
+    <img src="/demo/slow.png" style="display:none">
+    <div id="status">loading...</div>
+    <script type="module">
+        import init, { init as term_init, process_bytes, handle_resize, version } from '../pkg/terminal_client.js';
+        import ping from './ping.js';
+        const status = document.getElementById('status');
+        const canvas = document.getElementById('terminal-canvas');
+        try {
+            ping('start');
+            const bytes = await (await fetch('../pkg/terminal_client_bg.wasm')).arrayBuffer();
+            await init(bytes);
+            ping('glue');
+            const ver = version();
+            term_init('terminal-canvas', null);
+            ping('init');
+            handle_resize(800, 600);
+            ping('resize');
+            process_bytes(new TextEncoder().encode('Hello World\x1b[31m red\x1b[0m'));
+            ping('proc');
+            const gl = canvas.getContext('webgl2');
+            const px = new Uint8Array(canvas.width * canvas.height * 4);
+            gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, px);
+            let bright = 0, colored = 0;
+            for (let i = 0; i < px.length; i += 4) {
+                const r = px[i], g = px[i + 1], b = px[i + 2];
+                if (r > 120 || g > 120 || b > 120) bright++;
+                if (r !== g || g !== b) colored++;
+            }
+            const ok = bright > 100;
+            ping('bright=' + bright + ' colored=' + colored + ' ver=' + ver);
+            document.body.className = 'done' + (ok ? '' : ' fail');
+            status.textContent = 'bright=' + bright + ' colored=' + colored + ' ' + ver + (ok ? ' PASS' : ' FAIL');
+        } catch (e) {
+            document.body.className = 'done fail';
+            status.textContent = 'ERR ' + e;
+            ping('err ' + e);
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>html, body { margin: 0; background: #000; }</style>
+</head>
+<body>
+    <canvas id="c" width="400" height="300"></canvas>
+    <script>
+        var gl = document.getElementById('c').getContext('webgl2');
+        dump('ctx=' + (gl ? 'yes' : 'no') + '\n');
+        gl.clearColor(0, 1, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        var px = new Uint8Array(400 * 300 * 4);
+        gl.readPixels(0, 0, 400, 300, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        var c = 0;
+        for (var i = 0; i < px.length; i += 4) { if (px[i + 1] > 200) c++; }
+        dump('greenpx=' + c + '\n');
+    </script>
+</body>
+</html>
