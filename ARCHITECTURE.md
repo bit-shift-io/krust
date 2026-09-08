@@ -1,31 +1,40 @@
-# ARCHITECTURE.md — System Architecture & Codebase Map (Grit)
+# ARCHITECTURE.md — Krust System Architecture
 
-> **Purpose:** This document provides a structural map, architectural guidelines, and module breakdown for both human developers and AI assistants. Keep this file updated as key modules, traits, or data flows evolve.
+> **Purpose:** Structural map, data flow, and module breakdown for human
+> developers and AI assistants working on krust. Keep this file updated as
+> modules, protocols, or data flows evolve.
+
+> **Note:** Krust is a terminal emulator, **not** a Git client. Older
+> documents described a "Grit" Git client — those references are stale and
+> should be ignored (see `NOTES.md`).
 
 ---
 
 ## 1. Executive Overview
 
-**Project Goal:** A fast, native, single-binary Git client written in Rust that bridges desktop UI performance and embedded local web convenience. It operates simultaneously as a native desktop application (`Iced` GUI) and an embedded web server daemon (`Axum` over WebSockets).
+**Project Goal:** A fast, self-contained web terminal. A Rust server spawns a
+system shell inside a `portable-pty` PTY and streams raw bytes to browser
+clients over WebSocket; a WASM client parses VT100 ANSI bytes and renders the
+cell grid onto a `<canvas>` — Canvas 2D by default, WebGL2 as fallback.
 
 ### Key Technology Stack
-* **Language & Runtime:** Rust (latest stable), Tokio async runtime (`full` features)
-* **Desktop UI:** `Iced` (v0.14) with native rendering (`wgpu` / `winit`)
-* **Web Server Daemon:** `Axum` (with `ws`, `tokio`, `http1` features)
-* **Static Asset Embedding:** `rust-embed` (embeds static frontend assets into single compiled binary)
-* **FileSystem Watching:** `notify` (v8) monitoring `.git/` directory changes
-* **CLI Engine:** `clap` (v4+ with `derive` macro support)
-* **Serialization:** `serde` & `serde_json`
-* **Logging/Tracing:** `tracing` & `tracing-subscriber`
+* **Server:** Rust, Tokio (`full`), Axum (`ws`), `portable-pty`, `tower-http`
+  (permissive CORS), `futures-util`, `serde`/`serde_json`
+* **Client:** Rust compiled to WASM via `wasm-bindgen` (`--target web`),
+  `vt100` parser crate, `web-sys`/`js-sys`, `ab_glyph` (WebGL2 glyph atlas)
+* **Rendering:** Canvas 2D primary (WebGL2 two-pass instanced quads behind a
+  fallback, currently unused because its text pass doesn't render glyphs yet)
+  (text fill + geometry-drawn box/block glyphs)
+* **Build:** `server/build.rs` runs `wasm-pack build --target web` when stale,
+  so a plain `cargo build` / `cargo run` is sufficient
+  (`KRUST_SKIP_WASM_BUILD=1` disables it; `KRUST_PKG_DIR` overrides the pkg dir)
 
-### Core Design Principle: Single Writer
+### Core Design Principle: Raw Bytes In, Cell Grid Out
 
-The **`TabRegistry`** (`src/server/registry.rs`) is the *only* mutation point for the tab list.
-The desktop GUI and every web browser are **pure clients**: they render `WebState`
-snapshots pushed through the registry's watch channel and request mutations through
-the same shared operations (`open_repo_tab`, `close_tab_by_id`). Neither client ever
-writes a full tab list back. This makes duplicate/ghost tabs structurally impossible:
-ids come from one monotonic allocator and are never reused within a session.
+The **server is a thin router**: PTY master → raw ANSI bytes → WebSocket binary
+frames. The **client owns all terminal state**: it feeds raw bytes into a
+stateful VT100 parser and derives the screen grid from pre-rendered glyphs.
+No grid state ever crosses the wire — the parser is the frame delimiter.
 
 ---
 
@@ -33,378 +42,200 @@ ids come from one monotonic allocator and are never reused within a session.
 
 ```text
 .
-├── Cargo.toml               # Project manifest and workspace settings
-├── ARCHITECTURE.md          # System architecture, guidelines, and module breakdown
-├── TASKS.md                 # Step-by-step roadmap for AI implementation
-├── NOTES.md                 # Design notes and comparative stack evaluations
-├── web/                     # Web UI source files (embedded at build time)
-│   └── dist/                # Pre-built HTML/CSS/JS frontend assets
-└── src/
-    ├── main.rs              # Entrypoint parsing CLI args and routing execution mode
-    ├── krust.rs             # Best-effort auto-launch of the krust terminal daemon
-    ├── shared_config.rs     # Shared persistence: config.json load/save/restore/prune
-    ├── git/                 # Git Engine subsystem
-    │   ├── mod.rs           # Git CLI command execution logic and status queries
-    │   ├── types.rs         # Core data models (RepoState, GitStatus, FileChange, GitAction)
-    │   └── watcher.rs       # Debounced recursive repo-root FS monitoring
-    ├── server/              # Embedded Axum Web Server subsystem
-    │   ├── mod.rs           # Axum router setup, AppState, boot/sync loops, /browse /files /commit
-    │   ├── registry.rs      # TabRegistry: single-writer tab list + watch channel + id allocator
-    │   ├── websocket.rs     # WS protocol dispatch, shared open_repo_tab/close_tab_by_id ops
-    │   └── static_files.rs  # Embedded asset server using rust-embed
-    └── ui/                  # Native Desktop GUI subsystem (Iced)
-        ├── mod.rs           # Module declarations only; run() lives in state.rs
-        ├── remote.rs        # WS client for connect-mode: run_client + send_op
-        ├── state.rs         # GritApp: pure-client state fed by WebTabsSync deliveries
-        └── components/      # UI Layout components
-            ├── header.rs    # Branch selector, Push, Pull, and Fetch controls
-            ├── staging.rs   # Split-view un-staged/staged file tree list
-            ├── diff.rs      # Diff text viewer panel
-            ├── commit.rs    # Commit summary/description input form
-            └── history.rs   # Scrollable commit log and revision list
+├── Cargo.toml               # Workspace manifest (server + client)
+├── server/
+│   ├── build.rs             # wasm-pack build trigger (unless skipped)
+│   └── src/main.rs          # Axum router, PTY sessions, WebSocket handler, tests
+└── client/
+    ├── Cargo.toml           # wasm-bindgen/vt100/web-sys/ab_glyph deps
+    ├── fonts/
+    │   └── Hack-Regular.ttf # Embedded monospace font (include_bytes!)
+    ├── src/
+    │   ├── lib.rs           # WASM terminal: parse, render, selection, input, tests
+    │   └── renderer.rs      # WebGL2 glyph-atlas renderer (render dispatched from lib.rs)
+    ├── pkg/                 # wasm-pack build output (served at /pkg/...)
+    └── res/
+        ├── server.html      # Production HTML served at "/" (include_str!)
+        ├── index.html       # Minimal smoke-test HTML
+        └── render-check.sh  # Headless-Chromium pixel verification (also render-test.html)
 ```
 
 ---
 
-## 3. Core Subsystems & Module Breakdown
+## 3. Core Subsystems
 
-### 3.1 CLI Entrypoint & Bootstrapping (`src/main.rs`)
-* Parses `--headless`, `--port` (default **5000**), `--path` (optional).
-* **Headless Mode**: boots Tokio runtime and runs only the Axum daemon.
-* **GUI Mode (Default)**: probes `GET /health` on `127.0.0.1:<port>` first.
-  * **No daemon found → Embedded**: spawns the Axum server on a background
-    Tokio task, then launches the native `Iced` window; both share one cloned
-    `TabRegistry`.
-  * **Daemon found → Remote (`GuiMode::Remote`)**: the GUI attaches as a plain
-    WebSocket client of the running daemon (`src/ui/remote.rs`). Tab state
-    arrives via `WebTabsSync` deliveries, and open/close/git operations are
-    sent as `{"tab":…,"action":…}` JSON built by `encode_client_message` —
-    the exact wire format browsers use. No second server, no parallel writer.
-  * In both modes the desktop remains a pure client of the single-writer
-    registry; `config.json` is owned exclusively by whichever process runs
-    the daemon. `--port` must match the daemon's port when connecting.
-* Without an explicit `--path` and with an empty config, startup lands on the
-  Add Repository form instead of seeding a fallback `"."` tab — a cleared
-  workspace stays cleared across restarts.
-* **Headless display fallback**: when GUI mode is requested but no display
-  server is detected (`WAYLAND_DISPLAY`/`WAYLAND_SOCKET`/`DISPLAY` all unset
-  or empty), `display_available()` (`main.rs`) downgrades the request to
-  headless daemon mode — safe under systemd units and SSH sessions.
+### 3.1 Server (`server/src/main.rs`)
 
-### 3.2 Core Git Engine & Data Types (`src/git/`)
-* **`types.rs`**: strictly typed models — `GitStatus`, `FileChange`, `FilePair`,
-  `CommitInfo`, `CommitSummary`, `RepoState`, and the `GitAction` enum
-  (`Stage`, `Unstage`, `Commit`, `Push`, `Pull`, `CheckoutBranch`, `Revert`,
-  `Reclone`, ...).
-* **`mod.rs`**: invokes the local `git` CLI via `std::process::Command`
-  (`get_repository_status`, `get_file_diff`, `get_file_pair`, `get_commit_summary`,
-  `execute_action`), wrapping stderr into structured `GitError`s.
-* **`watcher.rs`**: one recursive watch per repository covering the working tree
-  and `.git` (the root watch subsumes `.git`; a separate `.git` watch would
-  duplicate every event) with a 200 ms debouncer. Events are filtered before
-  debouncing: pure reads (`Access`) never arm a refresh, nor do events living
-  exclusively inside churn directories (`target`, `node_modules`,
-  `__pycache__`, `.venv`, `venv`) — so builds and package installs cannot spin
-  the refresh loop. Watching itself is server-owned only: a single persistent
-  `watch_reconciler` task (`src/server/mod.rs`) keeps exactly one recursive
-  root watcher alive per unique canonical repository path among the open
-   tabs, spawning and retiring them as tabs are opened or closed through any
-   client (each new watch is followed by a refresh kick). A successful Reclone
-   sends its repo path over a reset channel so the reconciler drops the stale
-   watch (the delete/re-clone cycle invalidated it) and respawns one on the
-   fresh directory. The desktop GUI subscribes to sync broadcasts instead of
-   the filesystem.
+* **Routes:** `/` (serves `server.html`), `/ws` (WebSocket upgrade),
+  `/pkg/terminal_client.js` and `/pkg/terminal_client_bg.wasm` (served from
+  `client/pkg/` at runtime, `no-store`), plus `CorsLayer::permissive()` on all.
+* **Sessions (`Session`):** write end (`Arc<Mutex<Box<dyn Write>>`), PTY master
+  (`Box<dyn MasterPty>`), a `broadcast::Sender<Vec<u8>>` (512-capacity ring),
+  a shared scrollback `history` buffer, and an `AtomicUsize` connection count.
+* **Session lookup (`get_or_create_session`):** keyed by `?s=<session_id>` from
+  the `WsQuery` (`s`, `dir`). Sessions are created on demand; `?dir=` sets the
+  shell start directory. The last connection dropping marks the session for
+  cleanup.
+* **Scrollback replay:** up to `MAX_HISTORY_BYTES` (512 KB) replayed to a fresh
+  client as a sequence of `BINARY_FRAME_MAX` (16 KB) binary chunks.
+* **Backpressure (`ByteBudget`):** 1 MB pending per client
+  (`MAX_PENDING_BYTES`). When exceeded, stale frames are dropped and the newest
+  history is replayed — the client never falls arbitrarily far behind.
 
-### 3.3 Tab Registry & Shared Persistence (`src/server/registry.rs`, `src/shared_config.rs`)
-* **`TabRegistry`** holds `WebState { active, tabs: Vec<WebTab> }` behind a
-  `tokio::sync::watch` channel plus an `AtomicUsize` id allocator
-  (`alloc_id()` never repeats; `raise_next_id_floor()` protects ids adopted from
-  disk). Cloning copies the counters but shares the channel. Mutations run
-  through `modify()` behind a short-held `write_lock: std::sync::Mutex<()>`
-  (poison-tolerant: a panicked writer cannot wedge later mutations).
-  Two `AtomicU64` counters complete the picture:
-  * `revision` — bumped on every mutation; `sync_loop` compares it before and
-    after each refresh and skips the broadcast when nothing changed.
-  * `next_log_seq` — monotonic sequencer giving every log entry a stable
-    order across clients (`append_log`/`finish_log_entry`).
-  * Live streaming: actions run with piped output; `update_log_output`
-    revises the in-flight `running` entry in place (throttled snapshots,
-    150 ms floor) so clients watch slow commands execute, and the final
-    transcript still replaces the placeholder via `finish_log_entry`.
-    Delivery stays live because each WebSocket connection dispatches
-    inbound actions on a dedicated sequential worker — the connection
-    loop never blocks on a running git command and keeps forwarding
-    broadcast frames (including to the client that issued the action).
-* **`WebTab`** = `{ id, name, repo_path, state: RepoState, log: Vec<LogEntry> }`
-  — the wire format for both WS broadcasts and desktop sync messages.
-* **`WebState.active` is daemon-side truth**: the web client reconciles its
-  selection from it (deep-link `?t=N`), while the desktop `apply_sync`
-  deliberately ignores it and keeps selection local.
-* **`shared_config.rs`** owns `$XDG_CONFIG_HOME/bitshift/grit/config.json`
-  (`SavedTab { id, name, path }`): `save_tabs`, `load_tabs(_from)`,
-  `persist_web_state`, `restore_web_state` (with `prune_dead_tabs` filtering
-  paths whose `.git` no longer exists). The server is the sole writer of this file.
+### 3.2 WebSocket Protocol
 
-### 3.4 Axum Web Server (`src/server/mod.rs`, `websocket.rs`, `static_files.rs`)
-* **Routes**: `/health`, `/ws` (WebSocket), `/files?tab=&path=` (file diff/pair),
-  `/commit?tab=&hash=` (commit summary), `/browse` (server-side folder listing for
-  the add-repo form), `/filetree?tab=&path=` (file browser listing), `/filecontent?tab=&path=&raw=`
-  (lazy preview content; `raw` serves literal file bytes), `/filesearch?tab=&q=` (case-insensitive
-  file name search), `/apps?path=` (external editor apps for a file), `/*` embedded static assets.
-* **`boot(registry)`**: restores tabs from config **only if the registry is empty**
-  (then re-persists the healed state), spawns the `watch_reconciler`, and starts
-  the persist task (writes config on every registry change). It then kicks off a
-  **background initial refresh**: clients may connect while git scans are still
-  running; each finished tab's `update_state` publish flows through the sync
-  loop, so tabs appear one by one. `boot` returns `(AppState, refresh_rx)` and
-  does NOT run the sync loop itself — `run_server(listener, app, refresh_rx)`
-  spawns `sync_loop` (broadcasting snapshots to every WS client on
-  registry/watcher events), and `run()` wires boot → `create_listener` →
-  run_server. `refresh_tab` re-validates that the path still contains `.git`
-  before shelling out.
-* **`create_listener(port)`** binds with `SO_REUSEADDR` so an immediate
-  close-and-restart can rebind the port even with lingering TIME_WAIT sockets.
-* **`websocket.rs`**: parses `ClientMessage { tab: Option<usize>, action }`.
-  Git actions execute against the target tab's repo then trigger a refresh;
-  tab mutations go through the extracted shared ops:
-  * `open_repo_tab(&registry, name, path) -> Result<usize, String>` — validates
-    tilde expansion, directory existence, and `.git` presence; allocates a fresh id;
-    appends; sets `active` to it.
-  * `close_tab_by_id(&registry, id) -> bool` — removes any tab (repo files on disk
-    are untouched); closing the last tab yields an empty registry, which renders as
-    the new-tab page everywhere.
-* **`static_files.rs`**: serves the embedded `web/dist` bundle from memory.
+**Client → Server** (JSON, `ClientMessage` tagged by `"type"`), plus raw binary
+input frames accepted as an alternative input path:
 
-### 3.5 Native Desktop GUI (`src/ui/state.rs`, `components/`)
-* **`GritApp`** is a pure registry client. Its tab list is derived exclusively from
-  `Message::WebTabsSync(Vec<WebTab>)` deliveries (fed by a subscription watching the
-  registry): unknown non-empty-path ids are adopted as local `RepoTab`s (and
-  auto-selected, hiding any open add-form); missing ids are dropped; known ids merge
-  server identity while preserving local UI fields (`commit_message`, `diff`,
-  `reclone_armed`, `error`).
-* Opening/closing repos calls the same shared ops as the web via `iced::Task`;
-  errors surface in the form. Git actions stay local (disk operations).
-* Zero tabs ⇒ the Add Repository form is the active view ("+" button toggles it
-  locally). No config is written by the GUI itself.
-* **`components/`**: `header.rs` (branch switcher, push/pull/fetch, reclone),
-  `staging.rs`, `diff.rs`, `commit.rs`, `history.rs`, `actions.rs`.
+| Message | Format | Purpose |
+|---|---|---|
+| `Input` | `{"type":"Input","data":"..."}` | Keyboard input (UTF-8 string) |
+| `Resize` | `{"type":"Resize","cols":N,"rows":M,"pixel_width":W,"pixel_height":H}` | Terminal resize → `master.resize(PtySize)` → SIGWINCH |
 
-### 3.6 Project Actions (`src/actions.rs`)
-* **Self-contained subsystem** for discovering and launching repository
-  executables; removable by deleting the file plus its few `actions::` call
-  sites. Security comes from the containment checks in `launch`, not a
-  kill-switch.
-* **Discovery** (`discover`): non-recursive scan of only the repo root,
-  `scripts/`, and `tools/`; unix exec-bit detection (`#[cfg(windows)]`
-  extension fallback: `.bat/.cmd/.ps1/.exe`); hidden files skipped; results
-  sorted and capped at 32. Runs inside `get_repository_status`, so discovered
-  scripts ride `RepoState.scripts` through the existing watcher → refresh →
-  broadcast plumbing — new/deleted executables appear automatically.
-* **Launch** (`launch`): runs scripts inside a **terminal window** so
-  interactive menu/TUI scripts get a real TTY. Selection order (unix):
-  `$TERMINAL`, then well-known emulators (`x-terminal-emulator`, `gnome-terminal`,
-  `konsole`, `xfce4-terminal`, `alacritty`, `kitty`, `tilix`, `xterm`, each with
-  its exec-flag convention); macOS drives Terminal.app via osascript; Windows
-  opens a console with `cmd /K`. The shell payload reports the exit status and
-  keeps the window open until Enter. If no terminal can be spawned — or
-  `GRIT_NO_TERMINAL=1` (test hook) — it falls back to a direct detached spawn
-  with inherited stdio and a `/bin/sh` fallback for shebang-less scripts.
-  Fire-and-forget: detached process group, stdin nulled, a detached thread
-  reaps the spawner child; Grit never tracks the launched script. Guards:
-  reject absolute/`..` paths, canonicalize containment (symlink escapes fail),
-  require an executable file.
-* **Wire format**: `GitAction::RunScript(rel_path)` executes via the normal
-  action dispatch in both Embedded and Remote modes; picking a script in the
-  dropdown launches it immediately (no confirmation step). The section is
-hidden when no scripts exist. The web UI exposes the same launcher inside
-    its Actions section action row (`#script-select` + `#run-script-btn`,
-    inline with the other buttons), fed by
-    the identical `RepoState.scripts` payload.
+**Server → Client:** binary frames (`ArrayBuffer`) of raw PTY output.
 
-### 3.7 Krust Terminal Dock (`src/krust.rs`, `web/dist`)
-* **What it is**: the web UI renders an embedded `krust` web-terminal daemon as
-  two dock views (`term-1` / `term-2`), each a full-height `<iframe>` at
-  `http://localhost:3000/?s=<session>&dir=<repo>` backed by an xterm.js client.
-  The krust server lives OUTSIDE this repo (`~/Projects/krust`); Grit only
-  auto-launches it and shells cross-origin against it.
-* **Auto-launch** (`src/krust.rs`, `ensure_krust()`): spawned from
-  `server::run` on a background Tokio task, best-effort and never fatal.
-  `krust_is_up()` TCP-probes `127.0.0.1:3000` (400 ms timeout); only when the
-  daemon is down does it resolve a binary — `$KRUST_BIN` wins over a `$PATH`
-  scan for `krust`/`krust.exe` — and `Command::spawn()` it detached. Tests
-  exercise the pure `finding_krust_binary(krust_bin, path_var)` helper (env
-  reads are injected) so they never touch the environment. Because tests call
-  `run_server` (never `server::run`), no test ever triggers a spawn.
-* **Per-repo sessions**: the frame src is built lazily on first view with a
-  session id computed from the ACTIVE repo path —
-  `grit-{repoScope(repoPath)}-term-{n}` where `repoScope` is
-  `<basename>-<hash36>` (or `root` when no repo). Repo switches rebind the
-  iframe to the new repo's session and fire-and-forget
-  `GET /reset?session_id=<old>` to kill the abandoned PTY. The `dir=` query
-  param makes each session start-shell inside that repo.
-* **Reset button**: each terminal view has a hover `Reset` overlay that calls
-  krust's `GET /reset?session_id=<sid>` (kills the PTY child + removes the
-  session) and reloads the iframe with a `&r=<ts>` cache-buster.
-* **Probing & availability**: `probeKrust()` (`KRUST_PROBE_MS=5000` cadence)
-  fetches krust's `/` with `mode:"cors"`; when down, the `T` dock buttons hide
-  and an active terminal view is force-switched back to the Dashboard.
-* **krust requirements**: built from `~/Projects/krust` HEAD — `/reset` and
-  `?dir=` are recent additions absent from older installs — and served with
-  `CorsLayer::permissive()` so all fetch probes, `/reset` calls, and WebSocket
-  upgrades work cross-origin from `localhost:5000`. `KRUST_PORT` (default
-  3000) overrides krust's bind port.
+### 3.3 WASM Client (`client/src/lib.rs`)
 
-### 3.8 WASM Terminal Rendering — Cell Grid & Glyph Seams (`client/`)
+* **State model:** single-threaded `thread_local!` `RefCell<Option<TerminalState>>`;
+  public API exported with `#[wasm_bindgen]`.
+* **`TerminalState`:** holds the `vt100::Parser`, the canvas element + active
+  renderer, cached cell dimensions, and the selection range.
+* **Renderer selection:** `TerminalState::new()` measures cell dimensions on a
+  **scratch canvas** (never touching the real canvas — a canvas only supports
+  one context type, so the WebGL2 attempt can never be poisoned by an earlier
+  2D context). Canvas 2D is currently the **default**; WebGL2 is only used as a
+  fallback when a 2D context cannot be obtained. Exactly one renderer is active.
+* **Rendering:** `render()` dispatches to the active renderer. The WebGL2 path
+  builds a per-frame selection cell list from the stored selection rectangle
+  and passes (screen, default fg/bg, selection, cursor position) to
+  `WebGL2Renderer::render()`. The Canvas 2D path is a five-pass draw
+  (clear bg → bg rects → selection rects → text → cursor).
+* **Cell geometry:** `measure_cell_dimensions` sizes cells from the actual
+  font — advance width from `"W"`, height from the tallest painted glyph across
+  `MEASURE_PROBES` rasterized on scratch canvases — then **rounds to whole
+  device pixels** so adjacent glyphs share exact pixel boundaries (xterm-style),
+  eliminating anti-aliased hairline seams in box-drawing UIs.
+* **Graphic glyphs:** block elements (U+2580–2593) and box-drawing (U+2500–257F)
+  are painted as vector geometry (`draw_graphic_cell`, `block_geometry`,
+  `box_geometry`) with a `GRAPHIC_EPS = 0.7` overflow so grids/borders tile
+  seamlessly; anything else falls back to the font path.
+* **Selection & input:** shift-drag selection extracted natively
+  (`set_selection`/`selected_text`/`clear_selection`); `key_to_bytes` maps
+  keyboard events to PTY byte sequences (arrows, modifiers, home/end, etc.).
 
-The WASM client (`client/src/lib.rs`) renders the VT100 grid onto a
-Canvas 2D surface. Two changes eliminate the hairline gaps that appeared
-between adjacent glyphs (visible as seams in `█`-drawn bars, box-drawing
-borders, htop, etc.):
+### 3.4 WebGL2 Renderer (`client/src/renderer.rs`)
 
-* **Whole-pixel cell grid (xterm-style).** `measure_cell_dimensions` sizes
-  the cell by rasterizing probe glyphs onto a scratch canvas and measuring the
-  painted ink height (`rasterized_glyph_height_max`), then **rounds both
-  dimensions to whole pixels** (8.4 → 8, 18.0 → 18). Columns/rows are
-  `floor(canvas / cell)`, so every cell starts on an integer device
-  coordinate; leftover pixels become background padding around the terminal.
-  Fractional advances would otherwise place each glyph at a sub-pixel offset
-  and leave anti-aliased hairline seams on every cell boundary.
-* **Geometry-drawn block & box glyphs.** The font glyphs for U+2580–2593
-  (blocks/shades) and U+2500–257F (box drawing) paint slightly shorter than
-  their advance width/height, so even on an integer grid they leave slivers.
-  `draw_graphic_cell` renders these as vector fills instead: `block_geometry`
-  yields full/half/quarter coverage rects (dark/light/medium shades become
-  translucent fills at 0.25/0.5/0.75 alpha), `box_geometry` maps each
-  codepoint to horizontal/vertical bar arms with light/heavy/double weights,
-  and `draw_box_lines` strokes them with a `GRAPHIC_EPS = 0.7` device-pixel
-  bleed so strokes overdraw into neighboring cells. `render()` falls back to
-  the font path for anything else (braille, weighted diagonal halves, etc.).
-
-**Pixel-truth testing.** Seam detection with a `>40` ink threshold is
-unreliable: the `#2b2b2b` background has brightness 43, so every pixel counts
-as ink. `client/res/render-test.html` instead paints a 10×10 `█` grid
-(plus `─`/`│` runs and a bold-blue "boldblue" check) and reports rows/columns
-whose max brightness stays under 200 ("dim"). `client/res/render-check.sh`
-runs it headless and asserts **zero** dim rows/cols on the block grid.
-Run locally: `wasm-pack build --target web && ./client/res/render-check.sh`.
-
+* **Font atlas (`GlyphAtlas`):** the 95 printable ASCII glyphs are rasterized
+  at init from `EMBEDDED_FONT` (`client/fonts/Hack-Regular.ttf`, shipped via
+  `include_bytes!`). `ab_glyph` handles layout; glyphs land in a WebGL2 texture.
+* **Two-pass instanced drawing (`GlyphBrush`):**
+  * Pass 0 (mode 0) — per-cell background rects using a solid 1×1 atlas pixel;
+  * Pass 1 (mode 1) — text glyphs sampling atlas alpha.
+  Both passes draw all cells in a single `draw_arrays_instanced` call driven by
+  per-instance attributes: offset, size, UV, fg, bg, selection flag, cursor flag.
+* **Selection & cursor:** text color goes black on selected cells (bg swaps to
+  the cell's fg, matching the Canvas 2D behavior); the cursor is a block that
+  swaps fg/bg and takes priority over selection.
+* **Resize:** `rebuild_atlas()` re-rasterizes at the new cell pitch.
 
 ---
 
-## 4. Primary Data & Event Flow
+## 4. Data & Event Flow
 
 ### Startup
 ```
-main.rs
-  ├── Parse CLI (clap: --headless, --port=5000 default, --path optional)
-  └── IF --headless (or GUI requested but no display server detected):
-        └── Spawn Tokio runtime → server::run(registry)
-              ├── boot(): restore-from-config-if-empty → watch_reconciler +
-              │     persist task + background initial refresh (→ refresh_rx)
-              ├── run_server(): spawns sync_loop, then Axum routes
-              │     (/health /ws /files /commit /browse /filetree
-              │      /filecontent /filesearch /apps /*)
-              └── background task: krust::ensure_krust() (best-effort)
-      ELSE (GUI):
-        ├── Probe GET /health on 127.0.0.1:<port>
-        ├── Daemon found (Remote): Iced GUI as WS client of that daemon
-        │     ├── remote.rs run_client(port) → WebTabsSync deliveries
-        │     └── ops sent via send_op(encode_client_message(...))
-        └── No daemon (Embedded): spawn server::run(new registry), then
-              └── Iced GUI seeded by apply_sync(snapshot)
+cargo run
+  └─ server::main()
+       ├─ AppState { sessions: Arc<RwLock<HashMap>> }
+       ├─ Axum Router: "/" | "/ws" | "/pkg/*" (+ CorsLayer::permissive)
+       └─ bind 0.0.0.0:${PORT:-3000} → axum::serve
 ```
 
-### Tab List Mutation (single writer)
+### One PTY Session
 ```
-User opens/closes a repo (desktop button OR web WS message)
-  └─> shared op: open_repo_tab() / close_tab_by_id()
-        └─> registry.set(new WebState)            [the ONLY list mutation]
-              ├─> watch channel fires
-              │     ├─> persist task writes config.json
-              │     └─> sync loop broadcasts snapshot to every WS client
-              ├─> web clients reconcile selection + URL (?t=N) and render
-              └─> desktop registry_subscription delivers WebTabsSync
-                    └─> apply_sync: adopt/drop/merge → render
+GET /ws?s=<id>[&dir=<path>]
+  └─ ws_handler → get_or_create_session(id, dir)
+       ├─ first connection: spawn $SHELL in portable-pty (TERM=xterm-256color,
+       │    COLORTERM=truecolor), start history capture
+       ├─ replay scrollback history as ≤16 KB binary chunks
+       └─ read loop: PTY stdout → tx broadcast → each client (ByteBudget-gated)
+
+Client:
+  ├─ process_bytes(bytes) → vt100::Parser → render()
+  ├─ key_to_bytes()/WS Input → PTY master write
+  └─ handle_resize(w,h) → {"type":"Resize",...} → master.resize() → SIGWINCH
 ```
 
-### Refresh Loop (state content, not list membership)
+### Cleanup
 ```
-.git change → debounced notify event → refresh_tab(id)
-  → get_repository_status → registry.update_state(id, state) [re-snapshots]
-  → broadcast (same pipeline as above)
-The desktop does NOT watch the filesystem; it mirrors these updates purely
-through sync broadcasts (`WebTabsSync` / registry subscription).
-```
-
-### Git Action Dispatch
-```
-UI interaction (desktop OR web) → GitAction → std::process::Command("git" ...)
-  → success/failure (GitError carries stderr) → refresh → broadcast
+last connection drops
+  └─ drop_connection() → when count hits 0, session marked for removal
+       └─ PTY master killed; session removed from the map
 ```
 
 ---
 
 ## 5. Architectural Invariants & Key Rules
 
-1. **Single-Binary Portability**: no external static files, node runtimes, or sidecar daemons in release mode; all web assets embed via `rust-embed`. The JS stays tooling-free (no bundler).
-2. **Unified Data Structures**: desktop UI, WS payloads, and persisted config all derive from the models in `src/git/types.rs` + `registry::{WebState, WebTab}`.
-3. **Single Writer**: only registry operations mutate the tab list; clients are renderers + operation requesters. Ids are allocated once and never reused.
-4. **Non-Blocking UI Thread**: all `git` execution and filesystem work runs on Tokio tasks / background threads; the Iced thread only renders.
-5. **Git CLI Delegation**: shell out to local `git`; no `git2-rs`/libgit2 — preserves SSH keys, GPG signing, and `.gitconfig`.
-6. **Async Mutexes**: lock state across Axum/Tokio tasks with `tokio::sync::Mutex`, never `std::sync::Mutex`.
+1. **Raw bytes, not grid state**: the wire only carries ANSI bytes; the client
+   owns parsing and rendering. This keeps payloads tiny and the server stateless
+   w.r.t. screen content.
+2. **One context type per canvas**: cell measurement must happen on a scratch
+   canvas so the real terminal canvas stays free for `get_context("webgl2")`.
+3. **Whole-pixel cell grid**: cells are rounded to integer device pixels so
+   glyphs align exactly; fractional advances would reintroduce seams.
+4. **Geometry over fonts for graphic glyphs**: box-drawing and block elements
+   are vector fills so adjacent cells tile seamlessly without glyph gaps.
+5. **Bounded everything**: history capped (512 KB), per-client budget (1 MB),
+   broadcast ring (512) — no unbounded buffers.
+6. **CORS is permissive**: the terminal is embedded cross-origin from the host
+   app (e.g. `localhost:5000`); every route must remain CORS-open.
 
 ---
 
 ## 6. How to Extend
 
-### Adding a New Git Operation
-1. Add a variant to `GitAction` in `src/git/types.rs`.
-2. Implement it in `execute_action` (`src/git/mod.rs`).
-3. Handle the JSON action string in `src/server/websocket.rs` dispatch.
-4. Add triggers in `web/dist/app.js` and/or `src/ui/components/` + `Message` in `src/ui/state.rs`.
+### Adding a Control Message
+1. Add a variant to `ClientMessage` in `server/src/main.rs` (serde tag = type).
+2. Dispatch it in `handle_socket`.
+3. Add the corresponding `#[wasm_bindgen]` export in `client/src/lib.rs`.
 
-### Adding a New Web / Desktop UI Component
-1. Widget layout in `src/ui/components/<name>.rs`; hook into `GritApp::view`.
-2. Mirror the view in `web/dist/app.js` (rendered inside `render()`'s branches).
-3. Any new cross-client data must flow through `RepoState`/`WebTab` so both sides receive it via the existing sync pipelines.
+### Changing Rendering
+1. Canvas 2D geometry lives in `client/src/lib.rs`
+   (`draw_graphic_cell`, `render_canvas2d`).
+2. WebGL2 atlas/instancing lives in `client/src/renderer.rs`
+   (`GlyphAtlas`, `GlyphBrush`, `build_instances`).
+3. Keep both paths behind the `TerminalState { webgl, ctx }` dispatch so the
+   Canvas 2D fallback never silently regresses.
 
 ---
 
 ## 7. Validation & Testing
 
 ```bash
-cargo check                              # quick compiler check (zero warnings expected)
-cargo test                               # unit + integration suites
-cargo run -- --headless --port 8080 --path /repo   # headless daemon
-cargo run -- --path .                    # dual-mode GUI + web (http://localhost:5000)
-cargo build --release                    # single-binary packaging
+cargo test                    # all workspace tests (28 client + 11 server)
+cargo test -p krust           # server only
+cargo test -p terminal-client # WASM client only (wgpu-free, runs native)
+wasm-pack test client         # WASM-target tests (wasm-bindgen-test)
+cargo check -p terminal-client --target wasm32-unknown-unknown
+cargo build                   # triggers wasm-pack via build.rs unless skipped
 ```
 
-Integration tests boot real daemons on ephemeral ports with isolated
-`XDG_CONFIG_HOME` tempdirs, drive them over real WebSocket connections
-(`tokio-tungstenite`), and assert on broadcast sequences.
+Server tests use `tower::util::ServiceExt` one-shot HTTP requests; client tests
+live in `#[cfg(test)] mod tests` alongside the code.
 
 ---
 
 ## 8. Key Files Quick Reference
 
 | File | Purpose |
-|------|---------|
-| `src/main.rs` | CLI parsing, mode routing, registry construction |
-| `src/shared_config.rs` | Shared `config.json` persistence (load/save/restore/prune) |
-| `src/git/types.rs` | Core data models (`RepoState`, `FileChange`, `GitAction`, ...) |
-| `src/git/mod.rs` | Git CLI invocation + structured `GitError` |
-| `src/git/watcher.rs` | Debounced recursive repo-root watcher |
-| `src/server/registry.rs` | `TabRegistry`: watch channel, monotonic ids, `WebState`/`WebTab` |
-| `src/server/mod.rs` | Router, `boot()`, sync loop, persist task, `/browse` `/files` `/commit` handlers |
-| `src/server/websocket.rs` | WS protocol, shared `open_repo_tab`/`close_tab_by_id` ops |
-| `src/server/static_files.rs` | rust-embed asset serving |
-| `src/krust.rs` | Best-effort krust terminal-daemon auto-launch (`ensure_krust`, `find_krust_binary`) |
-| `src/ui/state.rs` | `GritApp` pure-client state, `run()`, subscriptions, tests |
-| `src/ui/remote.rs` | Connect-mode WebSocket client (`run_client`/`send_op`) |
-| `src/ui/components/` | Desktop widget panels (header/staging/diff/commit/history/actions) |
-| `web/dist/app.js` | Web client: selection invariant, "+" form mode, deep-links (`?t=`, `?view=`), view dock routing, krust terminal integration |
-| `client/src/lib.rs` | WASM terminal: cell measurement/raster scan, `draw_graphic_cell` block & box geometry, render loop (see 3.8) |
-| `client/res/render-test.html` / `render-check.sh` | Pixel-truth regression harness: 10×10 `█` grid seam check (zero dim rows/cols required) |
-| `TASKS.md` | Original build roadmap (historical) |
-| `NOTES.md` | Design rationale |
+|---|---|
+| `server/src/main.rs` | Axum router, PTY session management, WS handler, tests |
+| `client/src/lib.rs` | WASM terminal: VT100 parse, Canvas 2D render, selection, input, tests |
+| `client/src/renderer.rs` | WebGL2 glyph-atlas instanced renderer |
+| `client/fonts/Hack-Regular.ttf` | Embedded font for the WebGL2 atlas |
+| `client/res/server.html` | Production HTML page (served at `/`) |
+| `client/res/index.html` | Minimal smoke-test page |
+| `AGENTS.md` | Shared agent context and conventions |
+| `TASKS.md` | Implementation roadmap |
+| `NOTES.md` | Design rationale and decisions |

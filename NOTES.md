@@ -1,10 +1,10 @@
-# Notes: Krust Terminal Refactor — Replace xterm.js with Rust/WASM WebGL2 Pipeline
+# Notes: Krust Terminal Refactor — Replace xterm.js with a Rust/WASM Renderer
 
 ## Decision: Replace xterm.js with Home-Grown Rust/WASM Terminal
 
 **Why:** xterm.js has structural DOM bugs that are hard to work around (mouse tracking in TUIs, IME composition failures, scrollback corruption, tab-throttling freezes, selection overlay race conditions). The Rust/WASM Canvas 2D pipeline eliminates DOM reflow, gives sub-millisecond frame rendering, and provides native copy/paste via a transparent overlay.
 
-**When this is worth it:** Your team has WebGL2 + VT100 parsing + PTY experience, you're hitting xterm.js bugs without clean workarounds, and you need long-term maintainability without JS dependency upgrades.
+**When this is worth it:** Your team has rendering + VT100 parsing + PTY experience, you're hitting xterm.js bugs without clean workarounds, and you need long-term maintainability without JS dependency upgrades.
 
 **When this is NOT worth it:** Curiosity project, tight deadlines, no WebGL/PTY expertise, or xterm.js bugs have valid plugin/workaround paths.
 
@@ -54,7 +54,7 @@
   - Server streams raw PTY bytes over WS as un-framed `Message::Binary(ArrayBuffer)` chunks
   - Frontend feeds every incoming chunk byte-by-byte into a **stateful VT100 parser** (e.g., `vt100` crate compiled to WASM)
   - Parser updates internal cell matrix continuously
-  - `requestAnimationFrame` loop flushes the grid to the WebGL canvas at a locked 60 FPS, independent of network chunk boundaries
+  - `requestAnimationFrame` loop flushes the grid to the renderer at a locked 60 FPS, independent of network chunk boundaries
   - **No explicit "frames" needed** — the parser is the frame delimiter; it consumes ANSI sequences byte-by-byte
 
 - **Alternative: Length-prefixed headers** (if you need explicit message boundaries)
@@ -65,8 +65,7 @@
 
 - **Server remains a thin router**: `portable-pty` → raw ANSI bytes → WebSocket
 - **No grid state serialization** over WS — keeps network payloads tiny
-- **WASM client** compiles a VT100 parser (e.g., `vt100` crate or custom state machine) that consumes raw bytes and maintains the cell matrix
-- `beamterm-renderer` receives the populated cell matrix and renders a single instanced WebGL draw call
+- **WASM client** compiles a VT100 parser (the `vt100` crate, compiled to WASM) that consumes raw bytes and maintains the cell matrix, then hands that matrix to the active renderer (Canvas 2D by default, WebGL2 glyph atlas fallback)
 
 ### 2.4 Terminal Resizing
 
@@ -107,9 +106,20 @@
 
 ### 2.8 Fallbacks & Graceful Degradation
 
-- **WebGL2 unavailable** (legacy browsers, constrained mobile, disabled hardware acceleration): The system **fails hard** — the WASM renderer has no 2D Canvas fallback built in.
-- **Fallback strategy**: For environments lacking WebGL2, fall back to a standard DOM/Canvas 2D renderer (or an optimized `xterm.js` configuration with its DOM renderer enabled). True headless/non-WebGL environments cannot sustain sub-millisecond cell rendering via the DOM without severe lag during heavy TUI workloads.
-- **Feature-flag the new renderer**: Keep xterm.js as a fallback while the new path is proven. Don't remove xterm.js until the Rust/WASM approach is validated in production.
+- **WebGL2 unavailable** (legacy browsers, constrained mobile, disabled hardware
+  acceleration): the client falls back to a **Canvas 2D renderer** — the same
+  parser state, geometry-drawn graphic glyphs, and selection logic, drawn via
+  `fill_text`/`fillRect` instead of instanced GPU quads.
+- **Fallback strategy (current)**: **Canvas 2D is the default**; WebGL2 is only
+  tried if a 2D context cannot be obtained, because the WebGL2 text pass does
+  not render glyphs correctly in the real browser yet. Cell dimensions are
+  measured on a scratch canvas so the real terminal canvas is never bound to a
+  context before the renderer is chosen (a canvas only supports one context
+  type).
+- **xterm.js is fully removed** — it is neither a fallback nor a feature flag.
+  Earlier notes that said "keep xterm.js while the new path is proven" are
+  obsolete; the WASM pipeline (Canvas 2D primary, WebGL2 fallback) is the only
+  rendering path.
 
 ---
 
@@ -120,7 +130,7 @@
 - xterm.js resources removed from `src/main.rs`
 - WASM client (`client/`) is the primary terminal rendering path
 - Server uses PTY + binary WebSocket pipeline (not JSON-based xterm.js messages)
-- xterm.js fallback removed entirely (WASM/Canvas 2D is the only rendering path)
+- xterm.js fallback removed entirely (Canvas 2D primary, WebGL2 fallback)
 
 **Migration steps (already completed):**
 
@@ -150,10 +160,12 @@
 ### WASM Client (`client/Cargo.toml`)
 - `wasm-bindgen` — JS interop
 - `wasm-bindgen-futures` — async WASM utilities
-- `web-sys` — Web APIs (WebSocket, Canvas, etc.)
+- `web-sys` — Web APIs (Canvas 2D, WebGL2, WebSocket, Selection, ...)
 - `js-sys` — JS system types
 - `vt100` — ANSI state machine (parsing layer)
-- `console-error-panic-hook` — panic handling in WASM
+- `ab_glyph` — glyph rasterization for the WebGL2 atlas
+- `serde_json` — JSON for control messages / config payloads
+- `console_error_panic_hook` — panic handling in WASM
 
 ### Selection Overlay (HTML/CSS)
 - Invisible `div` with `position: absolute`, `user-select: text`, `pointer-events: auto/none` (toggled via Shift modifier)
@@ -167,9 +179,9 @@
 | Question | Decision/Status |
 |---|---|
 | VT100 parser crate | Using `vt100` crate compiled to WASM |
-| beamterm-renderer vs custom WebGL2 | Using Canvas 2D with `vt100` parser (beamterm-renderer kept as optional future upgrade) |
+| UTF-8 / box-drawing glyphs | `vt100` parser + geometry-drawn block/box glyphs; `Hack-Regular.ttf` embedded for the WebGL2 atlas |
 | Backpressure mechanism | Bounded ring buffer + coalescing (not unlimited broadcast) |
-| Fallback strategy | Feature-flag xterm.js fallback; degrade to DOM renderer if WebGL2 absent |
+| Fallback strategy | Canvas 2D primary (default), WebGL2 fallback until its text pass is fixed; xterm.js fully removed |
 | Shift-modifier selection | Implementing — default `pointer-events: none`, toggle on Shift-drag |
 | Initial buffer on connect | Fresh shell on new connection; server replay for persistent/tmux sessions |
 | Large paste throttling | Pacing intervals or XON/XOFF flow control |

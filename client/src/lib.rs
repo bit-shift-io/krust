@@ -12,7 +12,6 @@
 
 #![allow(missing_docs)]
 
-#[allow(dead_code)]
 mod renderer;
 
 use js_sys::Function;
@@ -68,7 +67,7 @@ fn xterm_palette(idx: u8) -> u32 {
 }
 
 /// Convert a vt100 color to its RGB value, using `default` for the default color.
-fn color_to_rgb(color: Color, default: u32) -> u32 {
+pub(crate) fn color_to_rgb(color: Color, default: u32) -> u32 {
     match color {
         Color::Default => default,
         Color::Idx(i) => xterm_palette(i),
@@ -80,7 +79,7 @@ fn color_to_rgb(color: Color, default: u32) -> u32 {
 /// `drawBoldTextInBrightColors` (default on): bold text whose color is one of
 /// the 8 base ANSI colors renders as the matching bright variant. This is what
 /// makes `ls` directories pop as bright blue instead of dark navy.
-fn cell_fg_rgb(cell: &vt100::Cell, default: u32) -> u32 {
+pub(crate) fn cell_fg_rgb(cell: &vt100::Cell, default: u32) -> u32 {
     if cell.bold() {
         if let Color::Idx(i) = cell.fgcolor() {
             if i < 8 {
@@ -150,6 +149,28 @@ fn rasterized_glyph_height_max(
     Some(max_h)
 }
 
+/// Measure a `"W"` advance and text-metric fallback height on an existing 2D
+/// context. Returns `(width, height)`, where `height` is `None` when no ink
+/// fallback could be computed (caller should then use the painted-glyph path).
+fn measure_text_advance(ctx: &CanvasRenderingContext2d) -> (f64, Option<f64>) {
+    ctx.set_font(FONT_STACK);
+    let width = ctx
+        .measure_text("W")
+        .map(|m| m.width())
+        .ok()
+        .unwrap_or(14.0);
+    let mut h = 0.0f64;
+    for ch in MEASURE_PROBES {
+        if let Ok(m) = ctx.measure_text(ch) {
+            let bh = m.actual_bounding_box_ascent() + m.actual_bounding_box_descent();
+            if bh > h {
+                h = bh;
+            }
+        }
+    }
+    (width, (h > 0.0).then_some(h))
+}
+
 /// Measure actual cell dimensions from the font.
 ///
 /// Width comes from `"W"` (the monospace advance). Height is the tallest
@@ -160,35 +181,42 @@ fn rasterized_glyph_height_max(
 /// `htop`, `vim` splits, ...). Measuring ink directly makes the cell pitch match
 /// the painted glyphs for whatever font the system resolves the stack to.
 fn measure_cell_dimensions(ctx: &CanvasRenderingContext2d) -> (f64, f64) {
-    ctx.set_font(FONT_STACK);
-    let width = ctx
-        .measure_text("W")
-        .map(|m| m.width())
-        .ok()
-        .unwrap_or(14.0);
-    let fallback = || {
-        let mut h = 0.0f64;
-        for ch in MEASURE_PROBES {
-            if let Ok(m) = ctx.measure_text(ch) {
-                let bh = m.actual_bounding_box_ascent() + m.actual_bounding_box_descent();
-                if bh > h {
-                    h = bh;
-                }
-            }
-        }
-        (h > 0.0).then_some(h)
+    let (width, fallback) = measure_text_advance(ctx);
+    finish_cell_dims(width, rasterized_glyph_height_max(MEASURE_PROBES, ctx).or(fallback))
+}
+
+/// Measure cell dimensions using a throwaway scratch canvas, so the real
+/// terminal canvas is never given a 2D context. This keeps the canvas free for
+/// a later `get_context("webgl2")` (a canvas may only have one context type).
+fn measure_cell_dimensions_scratch() -> Option<(f64, f64)> {
+    let doc = web_sys::window()?.document()?;
+    let Ok(scratch) = doc.create_element("canvas") else { return None };
+    let Ok(scratch) = scratch.dyn_into::<web_sys::HtmlCanvasElement>() else {
+        return None;
     };
-    let height = rasterized_glyph_height_max(MEASURE_PROBES, ctx)
-        .filter(|&h| h > 0.0)
-        .or_else(fallback)
-        .unwrap_or(20.0);
-    // Snap to whole device pixels (xterm-style): every cell starts on an
-    // integer coordinate, so adjacent glyphs share exact pixel boundaries
-    // instead of leaving anti-aliased hairline seams at fractional advances.
-    // Columns/rows are then `floor(canvas / cell)` and any leftover pixels
-    // become background padding around the terminal.
+    let Some(ctx) = scratch.get_context("2d").ok().flatten() else {
+        return None;
+    };
+    let Ok(ctx) = ctx.dyn_into::<CanvasRenderingContext2d>() else {
+        return None;
+    };
+    let (width, fallback) = measure_text_advance(&ctx);
+    Some(finish_cell_dims(
+        width,
+        rasterized_glyph_height_max(MEASURE_PROBES, &ctx).or(fallback),
+    ))
+}
+
+/// Round the measured width/height to whole device pixels and sanity-guard them.
+///
+/// Snap to whole device pixels (xterm-style): every cell starts on an integer
+/// coordinate, so adjacent glyphs share exact pixel boundaries instead of
+/// leaving anti-aliased hairline seams at fractional advances. Columns/rows are
+/// then `floor(canvas / cell)` and any leftover pixels become background
+/// padding around the terminal.
+fn finish_cell_dims(width: f64, height: Option<f64>) -> (f64, f64) {
     let width = width.round().max(1.0);
-    let height = height.round().max(1.0);
+    let height = height.unwrap_or(20.0).round().max(1.0);
     (width, height)
 }
 
@@ -206,11 +234,11 @@ fn css_color(rgb: u32) -> String {
 // exactly (plus a small epsilon bleed) so grids and borders tile seamlessly.
 
 /// Overdraw amount (device px) for graphic cells, hiding anti-aliasing seams.
-const GRAPHIC_EPS: f64 = 0.7;
+pub(crate) const GRAPHIC_EPS: f64 = 0.7;
 
 /// Horizontal half of a box-drawing glyph.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum BarSide {
+pub(crate) enum BarSide {
     None,
     Left,
     Right,
@@ -219,7 +247,7 @@ enum BarSide {
 
 /// Vertical half of a box-drawing glyph.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum StemSide {
+pub(crate) enum StemSide {
     None,
     Up,
     Down,
@@ -227,14 +255,14 @@ enum StemSide {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum LineWeight {
+pub(crate) enum LineWeight {
     Light,
     Heavy,
     Double,
 }
 
 /// Fractional rect + alpha for a block element, in cell units.
-fn block_geometry(c: char) -> Option<(f64, f64, f64, f64, f64)> {
+pub(crate) fn block_geometry(c: char) -> Option<(f64, f64, f64, f64, f64)> {
     let g = match c {
         '\u{2580}' => (0.0, 0.0, 1.0, 0.5, 1.0),   // ▀ upper half
         '\u{2584}' => (0.0, 0.5, 1.0, 1.0, 1.0),   // ▄ lower half
@@ -249,7 +277,7 @@ fn block_geometry(c: char) -> Option<(f64, f64, f64, f64, f64)> {
     Some(g)
 }
 
-fn box_geometry(c: char) -> Option<(BarSide, StemSide, LineWeight)> {
+pub(crate) fn box_geometry(c: char) -> Option<(BarSide, StemSide, LineWeight)> {
     use BarSide as B;
     use LineWeight as W;
     use StemSide as S;
@@ -383,7 +411,7 @@ fn draw_graphic_cell(
     true
 }
 
-fn box_line_width(weight: LineWeight) -> (f64, f64) {
+pub(crate) fn box_line_width(weight: LineWeight) -> (f64, f64) {
     match weight {
         LineWeight::Light => (2.0, 0.0),
         LineWeight::Heavy => (3.0, 0.0),
@@ -584,12 +612,15 @@ fn extract_selection(screen: &vt100::Screen, start: (u16, u16), end: (u16, u16))
 
 // -- Terminal State --
 
-/// Terminal state parsed from ANSI byte streams, drawn with native Canvas 2D text.
+/// Terminal state parsed from ANSI byte streams, drawn to the canvas via the
+/// active renderer (Canvas 2D by default, WebGL2 fallback).
 struct TerminalState {
     /// vt100 parser
     parser: Parser,
-    /// 2D rendering context
-    ctx: CanvasRenderingContext2d,
+    /// 2D rendering context (Canvas 2D default path)
+    ctx: Option<CanvasRenderingContext2d>,
+    /// WebGL2 renderer (fallback; text pass not yet rendering glyphs)
+    webgl: Option<renderer::WebGL2Renderer>,
     /// Canvas element (source of pixel dimensions)
     canvas: web_sys::HtmlCanvasElement,
     /// Canvas element ID
@@ -635,7 +666,6 @@ impl TerminalState {
     /// # Parameters
     /// * `canvas_id` - HTML canvas element ID
     /// * `on_resize` - JS callback called with (rows, cols) when the terminal resizes
-    #[allow(dead_code)]
     pub fn new(
         canvas_id: &str,
         on_resize: Option<Function>,
@@ -647,14 +677,53 @@ impl TerminalState {
             .and_then(|d| d.get_element_by_id(canvas_id))
             .and_then(|el| el.dyn_into::<web_sys::HtmlCanvasElement>().ok())
             .ok_or_else(|| format!("canvas '#{}' not found", canvas_id))?;
-        let ctx = canvas
-            .get_context("2d")
-            .map_err(|e| format!("get_context(2d): {:?}", e))?
-            .ok_or_else(|| "2D context unavailable".to_string())?
-            .dyn_into::<web_sys::CanvasRenderingContext2d>()
-            .map_err(|_| "2D context cast failed".to_string())?;
 
-        let (cell_width, cell_height) = measure_cell_dimensions(&ctx);
+        // Try Canvas 2D first; fall back to WebGL2
+        let dpr = web_sys::window()
+            .map(|w| w.device_pixel_ratio())
+            .unwrap_or(1.0)
+            .max(1.0);
+
+        // Measure cell dims via a scratch canvas so the real terminal canvas is
+        // never given a context before the primary renderer is chosen (a canvas
+        // only supports one context type).
+        let (cell_width, cell_height) = measure_cell_dimensions_scratch()
+            .unwrap_or((14.0, 20.0));
+
+        // Canvas 2D primary path. Text rendering is currently unreliable under
+        // WebGL2 (glyphs missing in practice), so Canvas 2D is the default until
+        // the WebGL2 text path is fixed.
+        let mut ctx = None;
+        let mut try_webgl = true;
+        if let Ok(c) = canvas
+            .get_context("2d")
+            .map_err(|_| ())
+            .and_then(|c| c.ok_or(()))
+            .and_then(|c| c.dyn_into::<CanvasRenderingContext2d>().map_err(|_| ()))
+        {
+            ctx = Some(c);
+            try_webgl = false;
+        }
+
+        // WebGL2 fallback: only when a 2D context could not be obtained.
+        let mut webgl = None;
+        if try_webgl {
+            if let Ok(w) = renderer::WebGL2Renderer::new(
+                canvas_id,
+                cell_width,
+                cell_height,
+                DEFAULT_ROWS,
+                DEFAULT_COLS,
+                dpr,
+                renderer::EMBEDDED_FONT,
+            ) {
+                webgl = Some(w);
+            }
+        }
+
+        if ctx.is_none() && webgl.is_none() {
+            return Err("no rendering context available (2D failed and WebGL2 unavailable)".to_string());
+        }
 
         let canvas_w = canvas.offset_width() as f64;
         let canvas_h = canvas.offset_height() as f64;
@@ -682,6 +751,7 @@ impl TerminalState {
         Ok(TerminalState {
             parser,
             ctx,
+            webgl,
             canvas,
             canvas_id: canvas_id.to_string(),
             rows,
@@ -700,6 +770,42 @@ impl TerminalState {
         self.parser.process(bytes);
     }
 
+    /// Render the current parser screen.
+    ///
+    /// Dispatches to the active renderer: Canvas 2D by default, WebGL2
+    /// when it was selected as the fallback.
+    pub fn render(&mut self) -> Result<(), String> {
+        if let Some(w) = self.webgl.as_ref() {
+            let screen = self.parser.screen();
+            let (cr, cc) = screen.cursor_position();
+            let selection = self.selection_cells();
+            return w.render(
+                screen,
+                DEFAULT_FG,
+                DEFAULT_BG,
+                &selection,
+                (cr, cc),
+            );
+        }
+        self.render_canvas2d()
+    }
+
+    /// Build the list of selected cells in the active selection rectangle.
+    fn selection_cells(&self) -> Vec<(u16, u16)> {
+        let (Some(a), Some(b)) = (self.selection_start, self.selection_end) else {
+            return Vec::new();
+        };
+        let (a_r, a_c) = (a.0.min(b.0), a.1.min(b.1));
+        let (b_r, b_c) = (a.0.max(b.0), a.1.max(b.1));
+        let mut cells = Vec::new();
+        for row in a_r..=b_r {
+            for col in a_c..=b_c {
+                cells.push((row, col));
+            }
+        }
+        cells
+    }
+
     /// Draw the current parser screen with native Canvas 2D text.
     ///
     /// Each visible cell is painted in CSS pixels on the DPR-scaled canvas:
@@ -709,7 +815,8 @@ impl TerminalState {
     /// 3. Draw all glyph text (foreground color)
     /// 4. Fill selection background rects (swapped colors) on top of text
     /// 5. Draw cursor background and text on top
-    pub fn render(&mut self) -> Result<(), String> {
+    fn render_canvas2d(&mut self) -> Result<(), String> {
+        let ctx = self.ctx.as_ref().ok_or("no renderer")?;
         let screen = self.parser.screen();
         let (prows, pcols) = screen.size();
         let rows = if self.rows > 0 { self.rows } else { prows };
@@ -722,15 +829,15 @@ impl TerminalState {
             .unwrap_or(1.0);
         let css_w = self.canvas.width() as f64 / dpr;
         let css_h = self.canvas.height() as f64 / dpr;
-        let _ = self.ctx.set_transform(dpr.max(1.0), 0.0, 0.0, dpr.max(1.0), 0.0, 0.0);
+        let _ = ctx.set_transform(dpr.max(1.0), 0.0, 0.0, dpr.max(1.0), 0.0, 0.0);
 
         // 1. Clear to default background
-        self.ctx.set_fill_style_str(&css_color(DEFAULT_BG));
-        self.ctx.fill_rect(0.0, 0.0, css_w.max(1.0), css_h.max(1.0));
-        self.ctx.set_text_baseline("middle");
+        ctx.set_fill_style_str(&css_color(DEFAULT_BG));
+        ctx.fill_rect(0.0, 0.0, css_w.max(1.0), css_h.max(1.0));
+        ctx.set_text_baseline("middle");
 
         let mut font = FONT_STACK.to_string();
-        self.ctx.set_font(&font);
+        ctx.set_font(&font);
 
         // 2. Background rects for cells with non-default background
         for row in 0..rows {
@@ -744,8 +851,8 @@ impl TerminalState {
                     DEFAULT_BG
                 };
                 if bg != DEFAULT_BG && !self.selected(row, col) {
-                    self.ctx.set_fill_style_str(&css_color(bg));
-                    self.ctx.fill_rect(
+                    ctx.set_fill_style_str(&css_color(bg));
+                    ctx.fill_rect(
                         col as f64 * cw,
                         row as f64 * ch,
                         cw,
@@ -772,8 +879,8 @@ impl TerminalState {
                     };
                     let (mut fg, mut bg) = (fg0, bg0);
                     std::mem::swap(&mut fg, &mut bg);
-                    self.ctx.set_fill_style_str(&css_color(bg));
-                    self.ctx.fill_rect(
+                    ctx.set_fill_style_str(&css_color(bg));
+                    ctx.fill_rect(
                         col as f64 * cw - CELL_EPSILON,
                         row as f64 * ch - CELL_EPSILON,
                         cw + CELL_EPSILON * 2.0,
@@ -801,16 +908,16 @@ impl TerminalState {
                 if let Some((s, bold)) = text {
                     let draw_fg = if self.selected(row, col) { SELECTION_FG } else { fg };
                     if draw_fg != DEFAULT_BG {
-                        if draw_graphic_cell(&self.ctx, col, row, cw, ch, &s, draw_fg) {
+                        if draw_graphic_cell(ctx, col, row, cw, ch, &s, draw_fg) {
                             continue;
                         }
                         let want = if bold { FONT_STACK_BOLD } else { FONT_STACK };
                         if font != want {
                             font = want.to_string();
-                            self.ctx.set_font(&font);
+                            ctx.set_font(&font);
                         }
-                        self.ctx.set_fill_style_str(&css_color(draw_fg));
-                        let _ = self.ctx.fill_text(
+                        ctx.set_fill_style_str(&css_color(draw_fg));
+                        let _ = ctx.fill_text(
                             &s,
                             col as f64 * cw,
                             row as f64 * ch + ch * 0.5,
@@ -833,14 +940,14 @@ impl TerminalState {
                 (DEFAULT_FG, DEFAULT_BG)
             };
             std::mem::swap(&mut fg, &mut bg);
-            self.ctx.set_fill_style_str(&css_color(bg));
-            self.ctx.fill_rect(cc as f64 * cw, cr as f64 * ch, cw, ch);
-            self.ctx.set_fill_style_str(&css_color(fg));
+            ctx.set_fill_style_str(&css_color(bg));
+            ctx.fill_rect(cc as f64 * cw, cr as f64 * ch, cw, ch);
+            ctx.set_fill_style_str(&css_color(fg));
             if let Some(c) = cell {
                 let s = c.contents();
                 if !s.is_empty() {
-                    if !draw_graphic_cell(&self.ctx, cc as u16, cr as u16, cw, ch, &s, fg) {
-                        let _ = self.ctx.fill_text(s, cc as f64 * cw, cr as f64 * ch + ch * 0.5);
+                    if !draw_graphic_cell(ctx, cc as u16, cr as u16, cw, ch, &s, fg) {
+                        let _ = ctx.fill_text(s, cc as f64 * cw, cr as f64 * ch + ch * 0.5);
                     }
                 }
             }
@@ -1073,7 +1180,11 @@ pub fn handle_resize(width: i32, height: i32) -> Result<(), JsValue> {
         let state = guard
             .as_mut()
             .ok_or_else(|| JsValue::from("init() not called"))?;
-        let (cw, ch) = measure_cell_dimensions(&state.ctx);
+        let (cw, ch) = if let Some(ref ctx) = state.ctx {
+            measure_cell_dimensions(ctx)
+        } else {
+            (state.cell_width, state.cell_height)
+        };
         state.cell_width = cw;
         state.cell_height = ch;
         let dpr = web_sys::window()
@@ -1091,6 +1202,13 @@ pub fn handle_resize(width: i32, height: i32) -> Result<(), JsValue> {
         let _ = state.parser.screen_mut().set_size(rows, cols);
         state.rows = rows;
         state.cols = cols;
+        if let Some(w) = state.webgl.as_mut() {
+            w.cell_w = (cw * dpr).ceil() as u32;
+            w.cell_h = (ch * dpr).ceil() as u32;
+            w.rows = rows;
+            w.cols = cols;
+            let _ = w.rebuild_atlas();
+        }
         state.trigger_resize(rows, cols);
         Ok(())
     })

@@ -322,7 +322,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: String, s
 
     // 2. Task: PTY output -> WebSocket
     let history = session.history.clone();
-    let _sid_out = session_id.clone();
     let pty_read_task = tokio::spawn(async move {
         let mut budget = ByteBudget::default();
         loop {
@@ -336,7 +335,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: String, s
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             };
-            // eprintln!("[out:{}] {} bytes", sid_out, frame.len());
             if !budget.accept(frame.len()) {
                 // Budget exceeded: drop stale frames and flush the latest
                 // screen state (a full history replay) once the channel drains.

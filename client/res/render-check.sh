@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Render regression test for the WASM terminal. Loads demo/render-test.html in
+# Render regression test for the WASM terminal. Loads res/render-test.html in
 # headless Chrome, which feeds known content through the parser and analyzes
 # the resulting canvas pixels:
 #   1. bold blue renders as bright blue (#5C5CFF) — xterm drawBoldTextInBrightColors
@@ -21,7 +21,7 @@ if [ -z "$CR" ]; then
     exit 0
 fi
 
-setsid nohup python3 demo/server.py "$PORT" "$(pwd)" \
+setsid nohup python3 res/server.py "$PORT" "$(pwd)" \
   >"$SRV_LOG" 2>&1 < /dev/null &
 SRV=$!
 trap 'kill $SRV 2>/dev/null || true' EXIT

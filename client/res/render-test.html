@@ -46,7 +46,7 @@
         // Seam analysis: every line in a region should be uniformly bright.
         // A "dim" row/column = its max channel brightness in the region never
         // reaches FG level, i.e. an AA/background gap between glyph cells.
-        function analyzeArea(ctx, W, H, img, x0, y0, x1, y1, pane) {
+        function analyzeArea(W, H, img, x0, y0, x1, y1, pane) {
             const scale = 200;
             const dimRows = [], dimCols = [], sample = [];
             for (let y = y0; y < y1; y++) {
@@ -83,10 +83,39 @@
             feedContent();
             repaint();
 
-            const ctx = canvas.getContext('2d');
             const W = canvas.width, H = canvas.height;
             const cw = config.cell_width, ch = config.cell_height;
-            const img = ctx.getImageData(0, 0, W, H).data;
+
+            // Read the rendered frame. Under the WebGL2 renderer the canvas has
+            // no 2D context (only one context type per canvas), so read back
+            // via readPixels (bottom-up, flipped here to top-down). Under the
+            // Canvas 2D path use getImageData as before.
+            const rows = Math.floor(H / ch);
+            let img = null;
+            let yoff = 0;
+            const gl = canvas.getContext('webgl2');
+            if (gl) {
+                // The WebGL2 renderer draws a grid of rows*cell_h pixels,
+                // bottom-aligned in the GL framebuffer. When the canvas is
+                // taller than the grid (800x600 canvas vs 33*18=594), the grid
+                // lands at img y in [yoff, H) after the flip below.
+                yoff = H - rows * ch;
+                const px = new Uint8Array(W * H * 4);
+                gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
+                img = new Uint8Array(W * H * 4);
+                for (let y = 0; y < H; y++) {
+                    const src = (H - 1 - y) * W * 4;
+                    img.set(px.subarray(src, src + W * 4), y * W * 4);
+                }
+            } else {
+                // Canvas 2D draws top-down from pixel 0, so yoff stays 0.
+                const ctx2d = canvas.getContext('2d');
+                img = ctx2d ? ctx2d.getImageData(0, 0, W, H).data : null;
+            }
+            if (!img) {
+                setResult({ pass: false, error: 'no canvas context available for pixel readback' });
+                return;
+            }
 
             function isBright(x, y) {
                 if (x < 0 || y < 0 || x >= W || y >= H) return false;
@@ -95,8 +124,9 @@
                 return img[i] > 100 || img[i + 1] > 100 || img[i + 2] > 100;
             }
 
+            // boldblue sits on row 0, so scan only the first cell row.
             let brightBlue = 0, darkBlue = 0;
-            for (let y = ch; y < 2 * ch; y++) {
+            for (let y = yoff; y < yoff + ch; y++) {
                 for (let x = 0; x < 120; x += 2) {
                     if (!isBright(x, y)) continue;
                     const i = 4 * (y * W + x);
@@ -106,21 +136,27 @@
             }
 
             const R = Math.round;
-            const dash = analyzeArea(ctx, W, H, img, 0, R(ch), R(80 * cw), R(2 * ch), 'dash');
-            const pipe = analyzeArea(ctx, W, H, img, 0, R(2 * ch), R(2 * cw), R(8 * ch), 'pipe');
-            const blk = analyzeArea(ctx, W, H, img, 0, R(9 * ch), R(10 * cw), R(17 * ch), 'block');
+            const dash = analyzeArea(W, H, img, 0, yoff + ch, R(80 * cw), yoff + 2 * ch, 'dash');
+            const pipe = analyzeArea(W, H, img, 0, yoff + 2 * ch, R(40 * cw), yoff + 8 * ch, 'pipe');
+            const blk = analyzeArea(W, H, img, 0, yoff + 9 * ch, R(10 * cw), yoff + 17 * ch, 'block');
 
             const res = {
-                metrics: { cell_width: cw, cell_height: ch },
+                metrics: { cell_width: cw, cell_height: ch, yoff, grid_rows: rows },
                 colors: { bright_blue_pixels: brightBlue, dark_blue_pixels: darkBlue },
                 dash: seamSummary(dash),
                 pipe: seamSummary(pipe),
                 block: seamSummary(blk),
-                block_vdim_rows: blk.dimRows.slice(0, 8),
-                block_hdim_cols: blk.dimCols.slice(0, 12),
                 version: version(),
             };
+            // dash/pipe/block: a dim *column* in the dash row means a vertical
+            // seam between two horizontally-adjacent ─ cells; a dim *row* in the
+            // pipe column means a horizontal seam between two │ cells. Thin bars
+            // legitimately leave whole lines empty, so only the cross-axis
+            // (the one the glyph spans) is asserted. █ covers the whole cell,
+            // so both axes are asserted there.
             res.pass = brightBlue > 0 && darkBlue === 0
+                && dash.dimCols.length === 0
+                && pipe.dimRows.length === 0
                 && blk.dimRows.length === 0 && blk.dimCols.length === 0;
             setResult(res);
         }
