@@ -254,9 +254,9 @@ hidden when no scripts exist. The web UI exposes the same launcher inside
   upgrades work cross-origin from `localhost:5000`. `KRUST_PORT` (default
   3000) overrides krust's bind port.
 
-### 3.8 WASM Terminal Rendering — Cell Grid & Glyph Seams (`client-wasm/`)
+### 3.8 WASM Terminal Rendering — Cell Grid & Glyph Seams (`client/`)
 
-The WASM client (`client-wasm/src/lib.rs`) renders the VT100 grid onto a
+The WASM client (`client/src/lib.rs`) renders the VT100 grid onto a
 Canvas 2D surface. Two changes eliminate the hairline gaps that appeared
 between adjacent glyphs (visible as seams in `█`-drawn bars, box-drawing
 borders, htop, etc.):
@@ -282,11 +282,11 @@ borders, htop, etc.):
 
 **Pixel-truth testing.** Seam detection with a `>40` ink threshold is
 unreliable: the `#2b2b2b` background has brightness 43, so every pixel counts
-as ink. `client-wasm/demo/render-test.html` instead paints a 10×10 `█` grid
+as ink. `client/res/render-test.html` instead paints a 10×10 `█` grid
 (plus `─`/`│` runs and a bold-blue "boldblue" check) and reports rows/columns
-whose max brightness stays under 200 ("dim"). `client-wasm/demo/render-check.sh`
+whose max brightness stays under 200 ("dim"). `client/res/render-check.sh`
 runs it headless and asserts **zero** dim rows/cols on the block grid.
-Run locally: `wasm-pack build --target web && ./client-wasm/demo/render-check.sh`.
+Run locally: `wasm-pack build --target web && ./client/res/render-check.sh`.
 
 
 ---
@@ -404,7 +404,7 @@ Integration tests boot real daemons on ephemeral ports with isolated
 | `src/ui/remote.rs` | Connect-mode WebSocket client (`run_client`/`send_op`) |
 | `src/ui/components/` | Desktop widget panels (header/staging/diff/commit/history/actions) |
 | `web/dist/app.js` | Web client: selection invariant, "+" form mode, deep-links (`?t=`, `?view=`), view dock routing, krust terminal integration |
-| `client-wasm/src/lib.rs` | WASM terminal: cell measurement/raster scan, `draw_graphic_cell` block & box geometry, render loop (see 3.8) |
-| `client-wasm/demo/render-test.html` / `render-check.sh` | Pixel-truth regression harness: 10×10 `█` grid seam check (zero dim rows/cols required) |
+| `client/src/lib.rs` | WASM terminal: cell measurement/raster scan, `draw_graphic_cell` block & box geometry, render loop (see 3.8) |
+| `client/res/render-test.html` / `render-check.sh` | Pixel-truth regression harness: 10×10 `█` grid seam check (zero dim rows/cols required) |
 | `TASKS.md` | Original build roadmap (historical) |
 | `NOTES.md` | Design rationale |

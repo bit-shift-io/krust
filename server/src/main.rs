@@ -18,7 +18,7 @@ use std::{
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 
-const INDEX_HTML: &str = include_str!("../../client-wasm/demo/backend.html");
+const INDEX_HTML: &str = include_str!("../../client/res/server.html");
 
 const MAX_HISTORY_BYTES: usize = 1024 * 512; // Keep 512 KB scrollback buffer per session
 const BINARY_FRAME_MAX: usize = 16 * 1024; // Max bytes per WS binary frame
@@ -162,7 +162,7 @@ fn index_response(body: &'static str) -> ([(header::HeaderName, &'static str); 2
 
 /// Serve a file from the built WASM package directory at runtime.
 ///
-/// The package dir defaults to `<crate>/../client-wasm/pkg` (i.e. the
+/// The package dir defaults to `<crate>/../client/pkg` (i.e. the
 /// workspace layout); override with `KRUST_PKG_DIR`.
 fn pkg_dir() -> String {
     if let Ok(d) = std::env::var("KRUST_PKG_DIR") {
@@ -170,11 +170,11 @@ fn pkg_dir() -> String {
     }
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
         return std::path::Path::new(&manifest)
-            .join("../client-wasm/pkg")
+            .join("../client/pkg")
             .display()
             .to_string();
     }
-    "client-wasm/pkg".to_string()
+    "client/pkg".to_string()
 }
 
 async fn serve_pkg_file(

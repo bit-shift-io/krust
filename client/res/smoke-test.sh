@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke-test the WASM terminal: serves client-wasm/, opens demo/ in headless
+# Smoke-test the WASM terminal: serves client/, opens res/ in headless
 # Firefox, screenshots it, and checks the status bar for green (glyphs drawn)
 # vs red (error / no glyphs).
 set -euo pipefail
@@ -9,7 +9,7 @@ PORT="${PORT:-8123}"
 OUT="${TMPDIR:-/tmp}/krust-smoke.png"
 SRV_LOG="${TMPDIR:-/tmp}/httpd.log"
 
-setsid nohup python3 demo/server.py "$PORT" "$(pwd)" \
+setsid nohup python3 res/server.py "$PORT" "$(pwd)" \
   >"$SRV_LOG" 2>&1 < /dev/null &
 SRV=$!
 trap 'kill $SRV 2>/dev/null || true' EXIT
@@ -19,7 +19,7 @@ PROFILE="${TMPDIR:-/tmp}/ff-profile"
 rm -rf "$PROFILE"
 mkdir -p "$PROFILE"
 timeout 50 firefox -no-remote -profile "$PROFILE" --headless \
-  --window-size=800,600 --screenshot "$OUT" "http://127.0.0.1:$PORT/demo/" >/dev/null 2>&1
+  --window-size=800,600 --screenshot "$OUT" "http://127.0.0.1:$PORT/res/" >/dev/null 2>&1
 
 REGION="$OUT[500x30+0+570]"
 green=$(magick "$REGION" -channel G -separate -threshold 45% -format "%[fx:mean]" info:)

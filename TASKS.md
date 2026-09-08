@@ -3,12 +3,12 @@
 ## Phase 0: Prototype & Validation (Weeks 1-2) ✅
 
 ### Goal
-Get a minimal WASM + WebGL2 terminal running before touching the production backend.
+Get a minimal WASM + WebGL2 terminal running before touching the production server.
 
 ### Milestones
 
 - [x] **0.1: Set up Cargo workspace with two crates**
-  - Create `backend/` and `client-wasm/` directories
+  - Create `server/` and `client/` directories
   - Root `Cargo.toml` with `[workspace]` members
   - Verify `cargo check` passes across workspace
 
@@ -24,8 +24,8 @@ Get a minimal WASM + WebGL2 terminal running before touching the production back
   - Verify: incoming ANSI bytes → cell updates → WebGL render
   - **Success criteria**: A simple test pattern (e.g., "Hello World" with cursor) renders correctly
 
-- [x] **0.4: WebSocket binary message pipeline (backend → WASM)**
-  - Backend: stream PTY bytes over WS as `Message::Binary(ArrayBuffer)`
+- [x] **0.4: WebSocket binary message pipeline (server → WASM)**
+  - Server: stream PTY bytes over WS as `Message::Binary(ArrayBuffer)`
   - WASM: receive bytes, feed into VT100 parser
   - **Success criteria**: Spawning a shell via `portable-pty` and seeing output appear in the WASM canvas
 
@@ -37,10 +37,10 @@ Get a minimal WASM + WebGL2 terminal running before touching the production back
 
 ---
 
-## Phase 1: Backend Refactor (Weeks 3-4) ✅
+## Phase 1: Server Refactor (Weeks 3-4) ✅
 
 ### Goal
-Replace xterm.js-dependent backend with portable-pty + raw binary WS pipeline.
+Replace xterm.js-dependent server with portable-pty + raw binary WS pipeline.
 
 ### Milestones
 
@@ -48,7 +48,7 @@ Replace xterm.js-dependent backend with portable-pty + raw binary WS pipeline.
   - Remove embedded xterm.js/CSS/JS resources (lines 25-27)
   - Remove xterm-related route handlers
   - Add PTY session management using `portable-pty`
-  - Backend spawning shell, cloning master reader, broadcasting raw bytes over WS
+  - Server spawning shell, cloning master reader, broadcasting raw bytes over WS
 
 - [x] **1.2: WebSocket binary protocol**
   - Upgrade WS to `BinaryType::Arraybuffer`
@@ -78,7 +78,7 @@ Replace xterm.js-dependent backend with portable-pty + raw binary WS pipeline.
 
 ### Deliverable (end of Phase 1)
 - `cargo check` passes
-- Backend spawns a shell via PTY
+- Server spawns a shell via PTY
 - WS binary stream carries PTY output
 - Resize works
 - Keyboard input reaches the shell
@@ -92,7 +92,7 @@ Build the rendering pipeline + VT100 parser + selection overlay.
 
 ### Milestones
 
-- [x] **2.1: `client-wasm/Cargo.toml` configuration**
+- [x] **2.1: `client/Cargo.toml` configuration**
   - Add: `wasm-bindgen`, `wasm-bindgen-futures`, `web-sys`, `js-sys`
   - Add: `beamterm-renderer = "0.10"`
   - Add: VT100 parser crate (choice: `vt100` crate, or custom minimal parser)
@@ -127,13 +127,13 @@ Build the rendering pipeline + VT100 parser + selection overlay.
 - [x] **2.6: Input pipeline — browser keyboard → PTY raw bytes**
   - `keydown` event listener in WASM
   - Map key + modifiers to PTY escape sequences
-  - Send as `Message::Binary` over WebSocket to backend
-  - Backend writes bytes to PTY master (raw mode, no echo)
+  - Send as `Message::Binary` over WebSocket to the server
+  - Server writes bytes to PTY master (raw mode, no echo)
 
 - [x] **2.7: Resize handling (WASM side)**
   - On window resize: calculate cols = pixel_width / cell_width, rows = pixel_height / cell_height
   - Send JSON `{"type":"resize","cols":N,"rows":M}` over WS
-  - (Backend already handles this from Phase 1)
+  - (Server already handles this from Phase 1)
 
 - [x] **2.8: Scrollback & initial buffer state**
   - On first connect: either start with blank grid (fresh shell) OR
@@ -189,7 +189,7 @@ Handle edge cases, backpressure, and fallback paths.
   - Verify render loop stays < 1ms for typical grid sizes (80×24 to 120×40)
 
 - [x] **3.6: End-to-end test**
-  - Spawn `krust` backend
+  - Spawn the `krust` server
   - Open `index.html` via local web server
   - Verify: shell prompt appears, commands execute, output renders, copy/paste works, resize works, Shift-drag selection works
 
@@ -274,7 +274,7 @@ Migrate the existing `krust` codebase and deprecate xterm.js.
 | Area | Estimated Effort |
 |---|---|
 | Prototype WASM + beamterm + VT100 | 1 week |
-| Backend PTY + WS binary pipeline | 1 week |
+| Server PTY + WS binary pipeline | 1 week |
 | WASM client: overlay, input, resize | 1 week |
 | Backpressure, pastes, fallbacks | 1 week |
 | Migration & deprecation | 1 week |
@@ -286,10 +286,10 @@ Migrate the existing `krust` codebase and deprecate xterm.js.
 ## Migration Checklist (Phase 4)
 
 - [x] xterm.js resources removed from `src/main.rs` ✅
-- [x] Feature flag `new-terminal` removed from `client-wasm/Cargo.toml` ✅
+- [x] Feature flag `new-terminal` removed from `client/Cargo.toml` ✅
 - [x] `AGENTS.md` created ✅
 - [x] `NOTES.md` and `ARCHITECTURE.md` updated ✅
 - [x] `krust.spec` updated ✅
 - [ ] Final `cargo check` / `cargo test` — all warnings resolved
 - [ ] Remove xterm.js fallback demo path
-- [ ] Archive unused demo files from `client-wasm/demo/`
+- [ ] Archive unused demo files from `client/res/archive/`

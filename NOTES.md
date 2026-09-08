@@ -27,7 +27,7 @@
                         │
                         │ Binary frames (VT100 ANSI bytes)
 ┌──────────────────────────▼─────────────────────────────┐
-│                    Rust Backend                        │
+│                    Rust Server   │
 │                                                      │
 │   ┌───────────────┐         ┌───────────────────────┐  │
 │   │ Axum WebSocket │◄───────►│    portable-pty       │  │
@@ -51,7 +51,7 @@
 ### 2.2 WebSocket Binary Framing
 
 - **Strategy: Streaming VT100 parser + requestAnimationFrame flush**
-  - Backend streams raw PTY bytes over WS as un-framed `Message::Binary(ArrayBuffer)` chunks
+  - Server streams raw PTY bytes over WS as un-framed `Message::Binary(ArrayBuffer)` chunks
   - Frontend feeds every incoming chunk byte-by-byte into a **stateful VT100 parser** (e.g., `vt100` crate compiled to WASM)
   - Parser updates internal cell matrix continuously
   - `requestAnimationFrame` loop flushes the grid to the WebGL canvas at a locked 60 FPS, independent of network chunk boundaries
@@ -59,11 +59,11 @@
 
 - **Alternative: Length-prefixed headers** (if you need explicit message boundaries)
   - 4-byte big-endian length prefix + payload
-  - Simpler for the backend but adds 4 bytes per chunk — not necessary if using a streaming parser
+  - Simpler for the server but adds 4 bytes per chunk — not necessary if using a streaming parser
 
-### 2.3 VT100 Parser Location: WASM Client (Not Backend)
+### 2.3 VT100 Parser Location: WASM Client (Not Server)
 
-- **Backend remains a thin router**: `portable-pty` → raw ANSI bytes → WebSocket
+- **Server remains a thin router**: `portable-pty` → raw ANSI bytes → WebSocket
 - **No grid state serialization** over WS — keeps network payloads tiny
 - **WASM client** compiles a VT100 parser (e.g., `vt100` crate or custom state machine) that consumes raw bytes and maintains the cell matrix
 - `beamterm-renderer` receives the populated cell matrix and renders a single instanced WebGL draw call
@@ -89,7 +89,7 @@
 | `PageUp` | `\x1b[5~` |
 | `PageDown` | `\x1b[6~` |
 
-- **Local echo: DISABLED** — backend PTY configures raw terminal (ICANON/ECHO off). Shell is solely responsible for echoing. Characters typed by the user go directly to the shell; the shell echoes them back through the PTY read loop.
+- **Local echo: DISABLED** — server PTY configures raw terminal (ICANON/ECHO off). Shell is solely responsible for echoing. Characters typed by the user go directly to the shell; the shell echoes them back through the PTY read loop.
 
 ### 2.6 Large Pastes & Backpressure
 
@@ -118,16 +118,16 @@
 **The existing `krust` codebase has been migrated:**
 
 - xterm.js resources removed from `src/main.rs`
-- WASM client (`client-wasm/`) is the primary terminal rendering path
-- Backend uses PTY + binary WebSocket pipeline (not JSON-based xterm.js messages)
-- xterm.js fallback assets kept in `res/` for environments without WebGL2
+- WASM client (`client/`) is the primary terminal rendering path
+- Server uses PTY + binary WebSocket pipeline (not JSON-based xterm.js messages)
+- xterm.js fallback removed entirely (WASM/Canvas 2D is the only rendering path)
 
 **Migration steps (already completed):**
 
 1. ✅ **Prototype the WASM client first** — get `vt100` parser + Canvas 2D renderer running
 2. ✅ **Feature-flag the new renderer**: Add config/env flag to switch between xterm.js and Rust/WASM paths; xterm.js kept as fallback only
 3. ✅ **Strip xterm.js resources** from `src/main.rs` — removed `include_str!` lines for xterm.js/addons
-4. ✅ **Reorganize Cargo workspace** — current workspace with `backend` + `client-wasm` crates
+4. ✅ **Reorganize Cargo workspace** — current workspace with `server` + `client` crates
 5. ✅ **Migrate the selection overlay** from the xterm.js DOM approach to the transparent overlay design
 6. ✅ **Implement the VT100 parser** on the WASM client — using `vt100` crate compiled to WASM
 7. ✅ **Wire up the WebSocket binary pipeline** — replace JSON messages with raw binary frames
@@ -139,7 +139,7 @@
 
 ## 4. Dependencies Overview
 
-### Backend (`backend/Cargo.toml`)
+### Server (`server/Cargo.toml`)
 - `tokio` (full) — async runtime
 - `axum` (ws) — WebSocket server
 - `portable-pty` — PTY management
@@ -147,7 +147,7 @@
 - `serde` + `serde_json` — JSON for resize/control messages
 - `tower-http` + `CorsLayer` — CORS enabled on all routes to allow cross-origin fetch from Grit web UI (`localhost:5000` → `localhost:3000`)
 
-### WASM Client (`client-wasm/Cargo.toml`)
+### WASM Client (`client/Cargo.toml`)
 - `wasm-bindgen` — JS interop
 - `wasm-bindgen-futures` — async WASM utilities
 - `web-sys` — Web APIs (WebSocket, Canvas, etc.)
@@ -189,7 +189,7 @@
 
 ## 7. Helpful Links
 
-- `backend/src/main.rs` — PTY server main file
-- `client-wasm/src/lib.rs` — WASM client library
-- `client-wasm/index.html` — minimal WASM client HTML page
+- `server/src/main.rs` — PTY server main file
+- `client/src/lib.rs` — WASM client library
+- `client/res/server.html` — production HTML page (embedded and served at `/`)
 - `AUDIT.md` — latest codebase audit report

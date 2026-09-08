@@ -41,9 +41,9 @@ The Canvas 2D renderer (`TerminalState::render()`) calls `fill_text()` per cell 
 
 | File | Purpose |
 |---|---|
-| `client-wasm/src/renderer.rs` | WebGL2 glyph atlas renderer implementation |
-| `client-wasm/src/lib.rs` | Public API (integrates renderer with WASM exports) |
-| `client-wasm/Cargo.toml` | `ab_glyph = "0.2"` dependency |
+| `client/src/renderer.rs` | WebGL2 glyph atlas renderer implementation |
+| `client/src/lib.rs` | Public API (integrates renderer with WASM exports) |
+| `client/Cargo.toml` | `ab_glyph = "0.2"` dependency |
 
 ### Key Types in `renderer.rs`
 

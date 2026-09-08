@@ -9,9 +9,9 @@ project. It describes the architecture, conventions, and key files.
 
 Krust is a Rust terminal emulator with a two-crate workspace:
 
-- **`backend/`** — Axum WebSocket server that spawns a system shell in a
+- **`server/`** — Axum WebSocket server that spawns a system shell in a
   `portable-pty` PTY and streams raw bytes to clients.
-- **`client-wasm/`** — WASM client compiled with `wasm-bindgen` that parses
+- **`client/`** — WASM client compiled with `wasm-bindgen` that parses
   VT100 ANSI bytes via the `vt100` crate and renders the terminal on a
   Canvas 2D surface.
 
@@ -24,35 +24,35 @@ documents (ARCHITECTURE.md, NOTES.md) are stale and should be ignored.
 
 | File | Purpose |
 |---|---|
-| `backend/src/main.rs` | Axum router, PTY session management, WebSocket handler, tests |
-| `client-wasm/src/lib.rs` | WASM terminal: VT100 parser, Canvas 2D renderer, input mapping, selection, tests |
-| `client-wasm/demo/backend.html` | Production HTML served by the backend (`include_str!`) |
-| `client-wasm/demo/index.html` | Minimal smoke-test HTML |
-| `client-wasm/pkg/` | `wasm-pack` build output (committed) |
-| `res/` | xterm.js fallback assets (used when WebGL2 unavailable) |
-| `Cargo.toml` | Workspace manifest (`backend`, `client-wasm`) |
+| `server/src/main.rs` | Axum router, PTY session management, WebSocket handler, tests |
+| `client/src/lib.rs` | WASM terminal: VT100 parser, Canvas 2D renderer, input mapping, selection, tests |
+| `client/res/server.html` | Production HTML served by the server (`include_str!`) |
+| `client/res/index.html` | Minimal smoke-test HTML |
+| `client/pkg/` | `wasm-pack` build output |
+| `Cargo.toml` | Workspace manifest (`server`, `client`) |
 | `TASKS.md` | Implementation roadmap |
 | `NOTES.md` | Design rationale and key decisions |
-| `rust_wasm_guide.md` | Reference guide for the Rust/WASM terminal architecture |
 
 ---
 
 ## Conventions
 
-- **Async runtime:** Tokio (`full` features) on the backend.
+- **Async runtime:** Tokio (`full` features) on the server.
 - **WebSocket protocol:** Binary frames (`ArrayBuffer`) for PTY output.
   JSON messages (`{"type":"Input","data":...}` and `{"type":"Resize",...}`)
-  for client→server control. The backend also accepts raw binary input frames.
+  for client→server control. The server also accepts raw binary input frames.
 - **PTY:** `portable-pty` crate. Shell comes from `$SHELL` or `/bin/sh`.
   `TERM=xterm-256color`, `COLORTERM=truecolor`.
 - **WASM client:** Single-threaded via `thread_local!` `RefCell<Option<TerminalState>>`.
   Public API exported with `#[wasm_bindgen]`.
 - **Tests:** Unit tests live alongside code in `#[cfg(test)] mod tests`.
-  Backend tests use `tower::util::ServiceExt` for one-shot HTTP requests.
+  Server tests use `tower::util::ServiceExt` for one-shot HTTP requests.
 - **CORS:** `tower-http::cors::CorsLayer::permissive()` is enabled on all
-  routes. The krust backend serves cross-origin requests from the Grit
+  routes. The krust server serves cross-origin requests from the Grit
   web UI (running on `localhost:5000`).
-- **Build:** `wasm-pack build --target web` then `cargo build`/`cargo run`.
+- **Build:** `server/build.rs` runs `wasm-pack build --target web` into
+  `client/pkg/` when stale, so a plain `cargo build`/`cargo run` suffices
+  (skip with `KRUST_SKIP_WASM_BUILD=1`).
 
 ---
 
@@ -90,8 +90,6 @@ documents (ARCHITECTURE.md, NOTES.md) are stale and should be ignored.
 | `selected_text()` | Extract selected text |
 | `clear_selection()` | Clear active selection |
 | `handle_click(x, y)` | Clear selection, return clicked cell |
-| `is_webgl2_available()` / `check_fallback()` | WebGL2 availability |
-| `show_fallback_ui(msg)` / `hide_fallback_ui()` | Fallback banner |
 | `version()` | Module version string |
 
 ---
@@ -100,7 +98,7 @@ documents (ARCHITECTURE.md, NOTES.md) are stale and should be ignored.
 
 ```bash
 cargo test                    # all workspace tests
-cargo test -p terminal-backend  # backend only
+cargo test -p krust  # server only
 cargo test -p terminal-client   # WASM client only
 ```
 

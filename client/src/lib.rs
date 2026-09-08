@@ -1,14 +1,13 @@
-// client-wasm terminal module
+// client terminal module
 // WASM terminal integration Phase 0-3
 //
-// Provides the Rust/WASM terminal backend:
+// Provides the Rust/WASM terminal:
 // - VT100 parser for ANSI escape sequences
-// - WebGL2 glyph atlas renderer (sharp vector text via pre-rasterized atlas)
-// - WebSocket binary message pipeline from backend
+// - Canvas 2D glyph renderer (sharp vector text via native text rasterization)
+// - WebSocket binary message pipeline from the server
 // - Selection overlay support
 // - Keyboard input pipeline
 // - Resize handling
-// - WebGL2 fallback detection
 // - Error boundaries & panic handling
 
 #![allow(missing_docs)]
@@ -36,7 +35,6 @@ const DEFAULT_FG: u32 = 0xf0f0f0;
 const DEFAULT_BG: u32 = 0x2b2b2b;
 
 /// CSS font stack used by the canvas-2D glyph renderer (native vector text).
-// Matches the xterm.js fallback terminal (`res/index.html`): JetBrains Mono at 14px.
 const FONT_STACK: &str =
     "14px/18px 'JetBrains Mono', 'Fira Code', Menlo, Consolas, monospace";
 /// Bold variant of [`FONT_STACK`].
@@ -45,8 +43,8 @@ const FONT_STACK_BOLD: &str =
 
 /// Convert an ANSI/VT100 index (0-255) to its xterm-256 RGB value.
 ///
-/// The 16-color block matches the xterm.js default theme so `ls` and other
-/// colored programs render identically to the xterm.js fallback terminal.
+/// The 16-color block matches the xterm default theme so `ls` and other
+/// colored programs render with the standard xterm palette.
 fn xterm_palette(idx: u8) -> u32 {
     match idx {
         0..=15 => {
@@ -462,7 +460,7 @@ fn is_printable_ascii(c: char) -> bool {
 ///
 /// Follows the mapping table in `NOTES.md`: Ctrl+letter → control code,
 /// arrows → CSI sequences, F-keys → `CSI N~`, Alt+char → `ESC char`.
-/// Local echo is disabled by the backend, so nothing is echoed here.
+/// Local echo is disabled by the server, so nothing is echoed here.
 fn map_key(key: &str, ctrl: bool, alt: bool, shift: bool, _meta: bool) -> Vec<u8> {
     let single_char = if key.chars().count() == 1 {
         key.chars().next()
@@ -611,10 +609,6 @@ struct TerminalState {
     selection_start: Option<(u16, u16)>,
     /// Text selection end cell
     selection_end: Option<(u16, u16)>,
-    /// WebGL2 context availability flag
-    webgl2_available: bool,
-    /// Fallback state flag
-    fallback_mode: bool,
 }
 
 /// Selection mode for text selection
@@ -647,9 +641,6 @@ impl TerminalState {
         on_resize: Option<Function>,
     ) -> Result<Self, String> {
         let parser = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
-
-        let webgl2_available = Self::detect_webgl2()?;
-        let fallback_mode = !webgl2_available;
 
         let canvas = web_sys::window()
             .and_then(|w| w.document())
@@ -701,17 +692,7 @@ impl TerminalState {
             selection_mode: SelectionMode::None,
             selection_start: None,
             selection_end: None,
-            webgl2_available,
-            fallback_mode,
         })
-    }
-
-    /// Detect WebGL2 availability
-    fn detect_webgl2() -> Result<bool, String> {
-        // In a full WASM implementation, this would check the WebGL2 context
-        // For this stub, we return true (assuming WebGL2 is available)
-        // In a real implementation, this would use web_sys::WebGl2RenderingContext::is_webgl2
-        Ok(true)
     }
 
     /// Process incoming ANSI bytes through the VT100 parser
@@ -918,17 +899,6 @@ impl TerminalState {
         (self.rows, self.cols)
     }
 
-    /// Get whether WebGL2 is available
-    pub fn is_webgl2_available(&self) -> bool {
-        self.webgl2_available
-    }
-
-    /// Whether the terminal is in fallback mode
-    pub fn is_fallback_mode(&self) -> bool {
-        self.fallback_mode
-    }
-
-
 }
 
 // -- Global Terminal State --
@@ -947,8 +917,7 @@ thread_local! {
 /// * `canvas_id` - HTML canvas element ID (e.g., "terminal-canvas")
 /// * `on_resize` - JS function to call on terminal resize (rows, cols)
 ///
-/// Returns a JSON string describing the terminal state for JS setup,
-/// including WebGL2 availability and fallback mode status.
+/// Returns a JSON string describing the terminal state for JS setup.
 #[wasm_bindgen]
 pub fn init(canvas_id: &str, on_resize: &JsValue) -> Result<String, JsValue> {
     if TERM_STATE.with(|s| s.borrow().is_some()) {
@@ -969,8 +938,6 @@ pub fn init(canvas_id: &str, on_resize: &JsValue) -> Result<String, JsValue> {
         "cols": term_state.size().1,
         "cell_width": term_state.cell_width,
         "cell_height": term_state.cell_height,
-        "webgl2_available": term_state.is_webgl2_available(),
-        "fallback_mode": term_state.is_fallback_mode(),
     })
     .to_string();
 
@@ -1135,24 +1102,6 @@ pub fn version() -> String {
     "krust-terminal 0.3.0".to_string()
 }
 
-/// Get the WebGL2 availability status
-#[wasm_bindgen]
-pub fn is_webgl2_available() -> bool {
-    TERM_STATE.with(|cell| match cell.borrow().as_ref() {
-        Some(state) => state.webgl2_available,
-        None => false,
-    })
-}
-
-/// Get the fallback mode status
-#[wasm_bindgen]
-pub fn is_fallback_mode() -> bool {
-    TERM_STATE.with(|cell| match cell.borrow().as_ref() {
-        Some(state) => state.fallback_mode,
-        None => false,
-    })
-}
-
 /// Get the selection mode
 #[wasm_bindgen]
 pub fn selection_mode() -> String {
@@ -1234,7 +1183,7 @@ pub fn selected_text() -> String {
 
 /// Map a browser keyboard event to raw PTY bytes
 ///
-/// The returned bytes are sent to the backend over the binary WebSocket
+/// The returned bytes are sent to the server over the binary WebSocket
 /// channel and written to the PTY master (raw mode, no local echo).
 /// Follows the key mapping table in `NOTES.md`. Use the KeyboardEvent
 /// `key` property plus its modifier flags as arguments.
@@ -1253,57 +1202,6 @@ pub fn key_to_bytes(
 #[wasm_bindgen(start)]
 pub fn start() {
     console_error_panic_hook::set_once();
-}
-
-/// Check if the canvas is in fallback mode (WebGL2 unavailable)
-///
-/// This is called from JavaScript to determine whether to show
-/// the fallback UI or the WebGL2-based terminal.
-#[wasm_bindgen]
-pub fn check_fallback() -> bool {
-    is_fallback_mode()
-}
-
-/// Show fallback UI when WebGL2 is unavailable
-///
-/// Renders a fixed banner element (`#krust-fallback-banner`) with the given
-/// message when the terminal is running in fallback mode.
-#[wasm_bindgen]
-pub fn show_fallback_ui(message: &str) -> bool {
-    if !is_fallback_mode() {
-        return false;
-    }
-    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
-        return true;
-    };
-    if doc.get_element_by_id("krust-fallback-banner").is_none() {
-        if let Ok(banner) = doc.create_element("div") {
-            let _ = banner.set_attribute("id", "krust-fallback-banner");
-            let _ = banner.set_attribute(
-                "style",
-                "position:fixed;top:0;left:0;right:0;z-index:50;padding:8px 12px;background:#300;color:#f88;font:13px monospace;",
-            );
-            banner.set_text_content(Some(message));
-            if let Some(body) = doc.body() {
-                let node: &web_sys::Node = banner.unchecked_ref();
-                let _ = body.append_child(node);
-            }
-        }
-    }
-    true
-}
-
-/// Hide fallback UI and resume normal terminal operation
-#[wasm_bindgen]
-pub fn hide_fallback_ui() {
-    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-        if let Some(banner) = doc.get_element_by_id("krust-fallback-banner") {
-            if let Some(parent) = banner.parent_node() {
-                let node: &web_sys::Node = banner.unchecked_ref();
-                let _ = parent.remove_child(node);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

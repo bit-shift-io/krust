@@ -26,7 +26,7 @@ setsid nohup python3 demo/server.py "$PORT" "$(pwd)" \
 SRV=$!
 trap 'kill $SRV 2>/dev/null || true' EXIT
 for i in $(seq 1 20); do
-    curl -sf "http://127.0.0.1:$PORT/demo/render-test.html" -o /dev/null && break
+    curl -sf "http://127.0.0.1:$PORT/res/render-test.html" -o /dev/null && break
     sleep 0.5
 done
 
@@ -36,7 +36,7 @@ rm -rf "$PROFILE"
 timeout 60 "$CR" --headless=new --no-sandbox --disable-gpu \
   --user-data-dir="$PROFILE" \
   --virtual-time-budget=8000 \
-  --dump-dom "http://127.0.0.1:$PORT/demo/render-test.html" \
+  --dump-dom "http://127.0.0.1:$PORT/res/render-test.html" \
   >"$OUT" 2>/dev/null || { echo "FAIL: chromium did not dump the page"; exit 1; }
 
 # Extract the test JSON from the #result <pre> element.

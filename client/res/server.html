@@ -23,10 +23,6 @@
             query_replies,
             handle_resize,
             version,
-            is_webgl2_available,
-            check_fallback,
-            show_fallback_ui,
-            hide_fallback_ui,
             key_to_bytes,
             set_selection,
             selected_text,
@@ -94,8 +90,8 @@
                 try { repaint(); } catch (_) {}
             }
         });
-        // IntersectionObserver: xterm.js uses this to detect when the terminal
-        // becomes visible again in iframe contexts (like Grit). Much more reliable
+        // IntersectionObserver: detects when the terminal becomes visible again
+        // in iframe contexts (like Grit). Much more reliable
         // than focus/visibility events for detecting show/hide cycles.
         if ('IntersectionObserver' in window) {
             const observer = new IntersectionObserver((entries) => {
@@ -180,7 +176,6 @@
                 }));
             }, 600);
         }
-        let fallbackMode = false;
         let reconnectAttempts = 0;
 
         function fit() {
@@ -277,7 +272,7 @@
             if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
                 return;
             }
-            if (fallbackMode) return;
+            
             const bytes = key_to_bytes(e.key, e.ctrlKey, e.altKey, e.shiftKey, e.metaKey);
             if (bytes.length > 0) {
                 e.preventDefault();
@@ -302,7 +297,7 @@
         }
 
         window.addEventListener('paste', (e) => {
-            if (fallbackMode) return;
+            
             const text = e.clipboardData ? e.clipboardData.getData('text') : '';
             e.preventDefault();
             document.getElementById('sel-layer').innerHTML = '';
@@ -316,7 +311,7 @@
         }
 
         window.addEventListener('mousedown', (e) => {
-            if (fallbackMode) return;
+            
             if (e.button !== 0) return;
             selDragging = true;
             selMoved = false;
@@ -324,7 +319,7 @@
         });
 
         window.addEventListener('mousemove', (e) => {
-            if (fallbackMode) return;
+            
             if (!selDragging || !selAnchor) return;
             const cur = cellFromPoint(e.clientX, e.clientY);
             if (cur.row !== selAnchor.row || cur.col !== selAnchor.col) selMoved = true;
@@ -332,7 +327,7 @@
         });
 
         window.addEventListener('mouseup', (e) => {
-            if (fallbackMode) return;
+            
             if (e.button !== 0 || !selDragging) return;
             selDragging = false;
             if (!selMoved) {
@@ -363,7 +358,7 @@ const text = selected_text();
         let touchSel = null;
         let touchTimer = null;
         window.addEventListener('touchstart', (e) => {
-            if (fallbackMode) return;
+            
             if (e.touches.length !== 1) return;
             const t = e.touches[0];
             touchTimer = setTimeout(() => {
@@ -374,7 +369,7 @@ const text = selected_text();
         }, { passive: true });
 
         window.addEventListener('touchmove', (e) => {
-            if (fallbackMode) return;
+            
             if (!touchSel || e.touches.length !== 1) return;
             e.preventDefault();
             const t = e.touches[0];
@@ -384,7 +379,7 @@ const text = selected_text();
         }, { passive: false });
 
         window.addEventListener('touchend', (e) => {
-            if (fallbackMode) return;
+            
             if (touchTimer) { clearTimeout(touchTimer); touchTimer = null; }
             if (!touchSel) return;
             touchSel = null;
@@ -394,70 +389,10 @@ const text = selected_text();
             }
         });
 
-        function loadScript(src) {
-            return new Promise((resolve, reject) => {
-                const s = document.createElement('script');
-                s.src = src;
-                s.onload = resolve;
-                s.onerror = () => reject(new Error('failed to load ' + src));
-                document.head.appendChild(s);
-            });
-        }
-
-        async function bootXterm(sid) {
-            try {
-                fallbackMode = true;
-                await loadScript('/res/xterm.js');
-                await loadScript('/res/xterm-addon-fit.js');
-                const el = document.createElement('div');
-                el.id = 'xterm-fallback';
-                el.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;padding:6px;';
-                document.body.appendChild(el);
-                const term = new window.Terminal({ cols: 80, rows: 24, convertEol: true });
-                const fit = new window.FitAddon.FitAddon();
-                term.loadAddon(fit);
-                term.open(el);
-                fit.fit();
-                canvas.style.display = 'none';
-                const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-                 const wsUrl = buildWsUrl('/ws');
-                 ws = new WebSocket(wsUrl);
-                ws.binaryType = 'arraybuffer';
-                ws.onmessage = (ev) => term.write(new Uint8Array(ev.data));
-                ws.onerror = () => { showStatus('ws error'); };
-                ws.onclose = () => { showStatus('ws closed'); };
-                ws.onopen = () => {
-                    ws.send(JSON.stringify({
-                        type: 'Resize', cols: term.cols, rows: term.rows,
-                        pixel_width: el.clientWidth, pixel_height: el.clientHeight
-                    }));
-                    if (params.get('echo') === '1') {
-                        ws.send(new TextEncoder().encode('echo K_RUST_WIRED\r'));
-                    }
-                };
-                term.onData((d) => {
-                    if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode(d));
-                });
-                showStatus('fallback xterm.js sid=' + sid);
-            } catch (e) {
-                showStatus('fallback err ' + e);
-            }
-        }
-
         async function startTerminal() {
-            if (params.get('nogl') === '1') {
-                await bootXterm(sid);
-                return;
-            }
             const bytes = await (await fetch('/pkg/terminal_client_bg.wasm')).arrayBuffer();
             await init(bytes);
             const cfg = JSON.parse(term_init('terminal-canvas', null));
-            if (cfg.fallback_mode) {
-                show_fallback_ui('WebGL2 not available, using xterm.js fallback');
-                await bootXterm(sid);
-                return;
-            }
-            hide_fallback_ui();
             gridCols = cfg.cols;
             gridRows = cfg.rows;
             cellW = Math.max(1, cfg.cell_width || cellW);
@@ -501,9 +436,6 @@ const text = selected_text();
                     const unit = 'X'.repeat(1024) + '\n';
                     sendPaste(unit.repeat(parseInt(p, 10)), params.get('via') === 'fast');
                 }
-                if (params.get('cl') === '1') {
-                    setTimeout(() => canvas.dispatchEvent(new Event('webglcontextlost')), 1500);
-                }
                 const b = params.get('bench');
                 if (b) {
                     benchGoal = parseInt(b, 10);
@@ -529,23 +461,11 @@ ws.onmessage = (ev) => {
             ws.onerror = () => { showStatus('ws error'); };
             ws.onclose = () => {
                 showStatus('ws closed');
-                if (fallbackMode) return;
                 const delay = Math.min(1000 * Math.pow(2, reconnectAttempts++), 8000);
                 showStatus('reconnecting in ' + delay + 'ms');
                 setTimeout(() => connectPrimary(url), delay);
             };
         }
-
-        canvas.addEventListener('webglcontextlost', (e) => {
-            e.preventDefault();
-            show_fallback_ui('WebGL context lost, using xterm.js fallback');
-            fallbackMode = true;
-            if (ws) {
-                ws.onclose = null;
-                try { ws.close(); } catch (_) {}
-            }
-            bootXterm(sid);
-        });
         startTerminal().catch((e) => {
             showStatus('ERR ' + e);
         });

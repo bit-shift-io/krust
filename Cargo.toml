@@ -1,6 +1,6 @@
 [workspace]
-members = ["backend", "client-wasm"]
-default-members = ["backend"]
+members = ["server", "client"]
+default-members = ["server"]
 resolver = "2"
 
 [workspace.package]
