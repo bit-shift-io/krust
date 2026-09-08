@@ -354,7 +354,7 @@ fn graphic_rects(
     ch_h: f32,
     dpr: f64,
 ) -> Option<Vec<(f32, f32, f32, f32, f32)>> {
-    use super::{
+    use crate::graphics::{
         block_geometry, box_geometry, box_line_width, BarSide, StemSide, GRAPHIC_EPS,
     };
     let eps = (GRAPHIC_EPS * dpr) as f32;
@@ -652,8 +652,8 @@ impl WebGL2Renderer {
                 let (mut fg_r, mut fg_g, mut fg_b, mut bg_r, mut bg_g, mut bg_b) =
                     if r < prows as u32 && c < pcols as u32 {
                         if let Some(cell) = screen.cell(r as u16, c as u16) {
-                            let fg_rgb = super::cell_fg_rgb(&cell, default_fg);
-                            let bg_rgb = super::color_to_rgb(cell.bgcolor(), default_bg);
+                            let fg_rgb = crate::color::cell_fg_rgb(&cell, default_fg);
+                            let bg_rgb = crate::color::color_to_rgb(cell.bgcolor(), default_bg);
                             (
                                 ((fg_rgb >> 16) & 0xff) as f32 / 255.0,
                                 ((fg_rgb >> 8) & 0xff) as f32 / 255.0,

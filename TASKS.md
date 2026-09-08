@@ -159,3 +159,87 @@ with zero warnings.
 - `client/src/RENDERER_DESIGN.md` — briefly marked **SUPERSEDED**, then deleted
   (2026-09-08); its content is superseded by `ARCHITECTURE.md` §3.4 and the live
   `renderer.rs` (16-float instances, two-pass, per-cell colors, Hack font)
+
+---
+
+## Phase 6: Module Splits
+
+> Optional structural refactors from the Sept 8 2026 audit (AUDIT.md §2).
+> Each step is isolated to 1–2 files and verified with `cargo test` + `cargo check`.
+
+### 6.1: Split `client/src/lib.rs` into modules [Low] ✅
+
+Target: extract logical sections from the 1554-line monolith into focused modules.
+The existing `mod renderer;` stays; new sibling modules are added under `client/src/`.
+
+Done 2026-09-08: `color.rs`, `measure.rs`, `graphics.rs`, `input.rs`, `selection.rs`,
+`query.rs`, `state.rs`, `exports.rs` created; `lib.rs` reduced to module declarations
++ tests. `renderer.rs` updated to import from `crate::graphics`/`crate::color`.
+All 28 client tests pass; `cargo check` (host + wasm32) and
+`wasm-pack build --target web` clean.
+
+1. **Create `client/src/color.rs`** — move `xterm_palette`, `color_to_rgb`, `cell_fg_rgb`,
+   and constants `DEFAULT_FG`/`DEFAULT_BG` (~50 lines). Keep `pub(crate)` visibility.
+   Verify: `cargo test -p terminal-client`.
+
+2. **Create `client/src/measure.rs`** — move `MEASURE_PROBES`, `rasterized_glyph_height_max`,
+   `measure_text_advance`, `measure_cell_dimensions`, `measure_cell_dimensions_scratch`,
+   `finish_cell_dims`, `css_color`, and constants `FONT_STACK`/`FONT_STACK_BOLD`/`CELL_EPSILON`
+   (~135 lines). Verify: `cargo test -p terminal-client`.
+
+3. **Create `client/src/graphics.rs`** — move `GRAPHIC_EPS`, `BarSide`, `StemSide`, `LineWeight`,
+   `block_geometry`, `box_geometry`, `draw_graphic_cell`, `box_line_width`, `draw_box_lines`
+   (~235 lines). Verify: `cargo test -p terminal-client`.
+
+4. **Create `client/src/input.rs`** — move `xterm_modifier_param`, `is_printable_ascii`, `map_key`
+   (~140 lines). Verify: `cargo test -p terminal-client`.
+
+5. **Create `client/src/selection.rs`** — move `extract_selection` function and the
+   `SelectionMode` enum + its `Display` impl (~80 lines). Verify: `cargo test -p terminal-client`.
+
+6. **Create `client/src/query.rs`** — move `collect_query_replies` (~60 lines).
+   Verify: `cargo test -p terminal-client`.
+
+7. **Create `client/src/state.rs`** — move `TerminalState` struct + all its methods
+   (`new`, `process_bytes`, `render`, `render_canvas2d`, `selection_cells`, `selected`,
+   `trigger_resize`, `handle_selection_start`, `handle_selection_update`, `clear_selection`,
+   `canvas_id`, `size`) and the `thread_local! { TERM_STATE }` (~400 lines).
+   Verify: `cargo test -p terminal-client`.
+
+8. **Create `client/src/exports.rs`** — move all `#[wasm_bindgen]` exported functions
+   (`init`, `process_bytes`, `query_replies`, `repaint`, `handle_resize`, `version`,
+   `selection_mode`, `selected_text`, `set_selection`, `clear_selection`, `handle_click`,
+   `key_to_bytes`, `start`) (~300 lines). Verify: `cargo test -p terminal-client`.
+
+9. **Slim down `client/src/lib.rs`** — keep only `mod` declarations, top-level `use`
+   re-exports, and `#[cfg(test)] mod tests` (~20 lines + ~230 lines of tests).
+   Tests may reference moved items via `use super::*` or explicit imports.
+   Verify: `cargo test -p terminal-client` + `wasm-pack build --target web`.
+
+### 6.2: Split `server/src/main.rs` into modules [Low] ✅
+
+Target: extract session management from HTTP/WS handlers in the 572-line monolith.
+
+Done 2026-09-08: `session.rs` (PTY session layer: `Session`, `AppState`,
+`get_or_create_session`, `pty_write`, `pty_size`, `binary_chunks`,
+`drop_connection`, `MAX_HISTORY_BYTES`/`BINARY_FRAME_MAX`) and `handlers.rs`
+(`ws_handler`, `handle_socket`, `ByteBudget`, `ClientMessage`, `WsQuery`,
+`binary_frame`, `index`, `index_response`, `pkg_dir`, `serve_pkg_file`)
+created; `main.rs` reduced to `mod` declarations, router setup, and tests.
+All 11 server tests pass; `cargo check`/`cargo test` for the full workspace
+emit zero warnings.
+
+1. **Create `server/src/session.rs`** — move `Session` struct (+ add an `impl` block with
+   `replay_history` and `maybe_cleanup` methods), `AppState`, `get_or_create_session`,
+   `pty_write`, `pty_size`, `binary_chunks`, `drop_connection`, and constants
+   `MAX_HISTORY_BYTES`/`BINARY_FRAME_MAX` (~200 lines). No Axum imports needed.
+   Verify: `cargo test -p krust`.
+
+2. **Create `server/src/handlers.rs`** — move `ws_handler`, `handle_socket`, `ByteBudget`,
+   `ClientMessage`, `WsQuery`, `binary_frame`, `index`, `index_response`, `pkg_dir`,
+   `serve_pkg_file` (~220 lines). Imports `session::{AppState, Session, ...}`.
+   Verify: `cargo test -p krust`.
+
+3. **Slim down `server/src/main.rs`** — keep only `mod` declarations, `main()`, Router
+   setup, and `#[cfg(test)] mod tests` (~80 lines + ~150 lines of tests).
+   Verify: `cargo test -p krust` + `cargo check` (full workspace).
