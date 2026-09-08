@@ -36,19 +36,23 @@ const DEFAULT_FG: u32 = 0xf0f0f0;
 const DEFAULT_BG: u32 = 0x2b2b2b;
 
 /// CSS font stack used by the canvas-2D glyph renderer (native vector text).
+// Matches the xterm.js fallback terminal (`res/index.html`): JetBrains Mono at 14px.
 const FONT_STACK: &str =
-    "12px/18px 'DejaVu Sans Mono', Menlo, Consolas, 'Liberation Mono', monospace";
+    "14px/18px 'JetBrains Mono', 'Fira Code', Menlo, Consolas, monospace";
 /// Bold variant of [`FONT_STACK`].
 const FONT_STACK_BOLD: &str =
-    "bold 12px/18px 'DejaVu Sans Mono', Menlo, Consolas, 'Liberation Mono', monospace";
+    "bold 14px/18px 'JetBrains Mono', 'Fira Code', Menlo, Consolas, monospace";
 
 /// Convert an ANSI/VT100 index (0-255) to its xterm-256 RGB value.
+///
+/// The 16-color block matches the xterm.js default theme so `ls` and other
+/// colored programs render identically to the xterm.js fallback terminal.
 fn xterm_palette(idx: u8) -> u32 {
     match idx {
         0..=15 => {
             const ANSI: [u32; 16] = [
-                0x000000, 0x800000, 0x008000, 0x808000, 0x000080, 0x800080, 0x008080, 0xC0C0C0,
-                0x808080, 0xFF0000, 0x00FF00, 0xFFFF00, 0x0000FF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
+                0x000000, 0xCD0000, 0x00CD00, 0xCDCD00, 0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5,
+                0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00, 0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
             ];
             ANSI[idx as usize]
         }
@@ -72,6 +76,21 @@ fn color_to_rgb(color: Color, default: u32) -> u32 {
         Color::Idx(i) => xterm_palette(i),
         Color::Rgb(r, g, b) => ((r as u32) << 16) | ((g as u32) << 8) | b as u32,
     }
+}
+
+/// Foreground RGB for a cell, emulating xterm.js's
+/// `drawBoldTextInBrightColors` (default on): bold text whose color is one of
+/// the 8 base ANSI colors renders as the matching bright variant. This is what
+/// makes `ls` directories pop as bright blue instead of dark navy.
+fn cell_fg_rgb(cell: &vt100::Cell, default: u32) -> u32 {
+    if cell.bold() {
+        if let Color::Idx(i) = cell.fgcolor() {
+            if i < 8 {
+                return xterm_palette(i + 8);
+            }
+        }
+    }
+    color_to_rgb(cell.fgcolor(), default)
 }
 
 /// Measure actual cell dimensions from the font metrics
@@ -437,7 +456,7 @@ impl TerminalState {
                     let (fg0, bg0) = if row < prows && col < pcols {
                         match screen.cell(row, col) {
                             Some(c) => (
-                                color_to_rgb(c.fgcolor(), DEFAULT_FG),
+                                cell_fg_rgb(&c, DEFAULT_FG),
                                 color_to_rgb(c.bgcolor(), DEFAULT_BG),
                             ),
                             _ => (DEFAULT_FG, DEFAULT_BG),
@@ -465,7 +484,7 @@ impl TerminalState {
                 let (fg, text) = if row < prows && col < pcols {
                     match screen.cell(row, col) {
                         Some(c) if !c.contents().is_empty() => (
-                            color_to_rgb(c.fgcolor(), DEFAULT_FG),
+                            cell_fg_rgb(&c, DEFAULT_FG),
                             Some((c.contents().to_string(), c.bold())),
                         ),
                         _ => (DEFAULT_FG, None),
@@ -498,7 +517,7 @@ impl TerminalState {
             let cell = screen.cell(cr as u16, cc as u16);
             let (mut fg, mut bg) = if let Some(c) = cell {
                 (
-                    color_to_rgb(c.fgcolor(), DEFAULT_FG),
+                    cell_fg_rgb(&c, DEFAULT_FG),
                     color_to_rgb(c.bgcolor(), DEFAULT_BG),
                 )
             } else {
@@ -1037,8 +1056,10 @@ mod tests {
     #[test]
     fn xterm_256_palette_maps_known_colors() {
         assert_eq!(xterm_palette(0), 0x000000);
-        assert_eq!(xterm_palette(1), 0x800000);
+        assert_eq!(xterm_palette(1), 0xCD0000);
+        assert_eq!(xterm_palette(4), 0x0000EE);
         assert_eq!(xterm_palette(9), 0xFF0000);
+        assert_eq!(xterm_palette(12), 0x5C5CFF);
         assert_eq!(xterm_palette(15), 0xFFFFFF);
         assert_eq!(xterm_palette(16), 0x000000);
         assert_eq!(xterm_palette(196), 0xFF0000);
@@ -1049,11 +1070,31 @@ mod tests {
     fn color_to_rgb_maps_default_and_idx() {
         assert_eq!(color_to_rgb(Color::Default, DEFAULT_FG), DEFAULT_FG);
         assert_eq!(color_to_rgb(Color::Default, DEFAULT_BG), DEFAULT_BG);
-        assert_eq!(color_to_rgb(Color::Idx(1), DEFAULT_FG), 0x800000);
+        assert_eq!(color_to_rgb(Color::Idx(1), DEFAULT_FG), 0xCD0000);
         assert_eq!(
             color_to_rgb(Color::Rgb(255, 0, 128), DEFAULT_FG),
             0xFF0080
         );
+    }
+
+    #[test]
+    fn bold_base_colors_render_as_bright() {
+        let mut p = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
+        p.process(b"\x1b[1;34mX");
+        let cell = p.screen().cell(0, 0).unwrap();
+        assert!(cell.bold());
+        assert_eq!(cell.fgcolor(), Color::Idx(4));
+        assert_eq!(cell_fg_rgb(&cell, DEFAULT_FG), xterm_palette(12));
+        assert_eq!(cell_fg_rgb(&cell, DEFAULT_FG), 0x5C5CFF);
+    }
+
+    #[test]
+    fn non_bold_uses_palette_color() {
+        let mut p = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
+        p.process(b"\x1b[34mX");
+        let cell = p.screen().cell(0, 0).unwrap();
+        assert!(!cell.bold());
+        assert_eq!(cell_fg_rgb(&cell, DEFAULT_FG), 0x0000EE);
     }
 
     #[test]

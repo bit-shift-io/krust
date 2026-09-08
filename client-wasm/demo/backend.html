@@ -73,6 +73,9 @@
             return out;
         }
 
+        const status = document.getElementById('status');
+        const canvas = document.getElementById('terminal-canvas');
+
         let lastTitle = 'krust | terminal';
         let lastRenderTime = 0;
         // Robust re-render: covers focus, visibility changes, and Grit iframe context
@@ -98,7 +101,7 @@
             const observer = new IntersectionObserver((entries) => {
                 const entry = entries[entries.length - 1];
                 if (entry.isIntersecting && entry.intersectionRatio > 0) {
-                    fit();
+                    try { fit(); } catch (_) {}
                     try { repaint(); } catch (_) {}
                 }
             }, { threshold: 0 });
@@ -111,8 +114,6 @@
             }
         }, 500);
 
-        const status = document.getElementById('status');
-        const canvas = document.getElementById('terminal-canvas');
         let statusTimeout = null;
         function showStatus(message) {
             status.textContent = message;
