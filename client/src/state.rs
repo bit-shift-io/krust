@@ -50,6 +50,8 @@ pub(crate) struct TerminalState {
     selection_start: Option<(u16, u16)>,
     /// Text selection end cell
     selection_end: Option<(u16, u16)>,
+    /// Scrollback view offset (0 = normal screen at bottom, >0 = scrolled up)
+    scroll_offset: usize,
 }
 
 impl TerminalState {
@@ -154,12 +156,75 @@ impl TerminalState {
             selection_mode: SelectionMode::None,
             selection_start: None,
             selection_end: None,
+            scroll_offset: 0,
         })
     }
 
     /// Process incoming ANSI bytes through the VT100 parser
     pub(crate) fn process_bytes(&mut self, bytes: &[u8]) {
+        // Clamp the current scroll offset to the (possibly shrunken) history
+        // before new bytes arrive, so we always stay within valid range.
+        self.clamp_scroll();
         self.parser.process(bytes);
+    }
+
+    /// Clamp the current scroll offset to the actual scrollback bounds.
+    fn clamp_scroll(&mut self) {
+        let max = self.scrollback_len();
+        if self.scroll_offset > max {
+            self.scroll_offset = max;
+        }
+    }
+
+    /// Maximum scrollback offset currently available (number of history rows).
+    ///
+    /// Computed by probing the parser: setting the view to an out-of-range
+    /// offset clamps to the actual stored history length, which we then read
+    /// back and restore. Keeps the currently visible view intact.
+    pub(crate) fn scrollback_len(&mut self) -> usize {
+        let screen = self.parser.screen_mut();
+        screen.set_scrollback(usize::MAX);
+        let max = screen.scrollback();
+        screen.set_scrollback(self.scroll_offset);
+        max
+    }
+
+    /// Current scrollback view offset.
+    pub(crate) fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    /// Set the scrollback view offset (clamped to available history).
+    pub(crate) fn set_scroll_offset(&mut self, offset: usize) {
+        self.clear_selection();
+        self.scroll_offset = offset;
+        self.clamp_scroll();
+        self.apply_scrollback();
+    }
+
+    /// Adjust the scrollback view by `delta` lines (positive = up/back,
+    /// negative = down/forward). Returns the resulting offset.
+    pub(crate) fn scroll_by(&mut self, delta: isize) -> usize {
+        let cur = self.scroll_offset as isize;
+        let next = (cur + delta).max(0);
+        self.set_scroll_offset(next as usize);
+        self.scroll_offset
+    }
+
+    /// Snap the view to the bottom (normal screen).
+    pub(crate) fn scroll_to_bottom(&mut self) {
+        self.set_scroll_offset(0);
+    }
+
+    /// Snap the view to the oldest available history row.
+    pub(crate) fn scroll_to_top(&mut self) {
+        let max = self.scrollback_len();
+        self.set_scroll_offset(max);
+    }
+
+    /// Apply the current scroll offset to the parser screen view.
+    fn apply_scrollback(&mut self) {
+        self.parser.screen_mut().set_scrollback(self.scroll_offset);
     }
 
     /// Render the current parser screen.
@@ -167,16 +232,23 @@ impl TerminalState {
     /// Dispatches to the active renderer: Canvas 2D by default, WebGL2
     /// when it was selected as the fallback.
     pub(crate) fn render(&mut self) -> Result<(), String> {
+        self.apply_scrollback();
         if let Some(w) = self.webgl.as_ref() {
             let screen = self.parser.screen();
             let (cr, cc) = screen.cursor_position();
+            // Hide the block cursor when scrolled into history.
+            let cursor = if self.scroll_offset == 0 {
+                (cr, cc)
+            } else {
+                (u16::MAX, u16::MAX)
+            };
             let selection = self.selection_cells();
             return w.render(
                 screen,
                 DEFAULT_FG,
                 DEFAULT_BG,
                 &selection,
-                (cr, cc),
+                cursor,
             );
         }
         self.render_canvas2d()
@@ -319,9 +391,9 @@ impl TerminalState {
             }
         }
 
-        // 5. Cursor: background then text
+        // 5. Cursor: background then text (hidden when scrolled into history)
         let (cr, cc) = screen.cursor_position();
-        if (cr as u16) < rows && (cc as u16) < cols {
+        if self.scroll_offset == 0 && (cr as u16) < rows && (cc as u16) < cols {
             let cell = screen.cell(cr as u16, cc as u16);
             let (mut fg, mut bg) = if let Some(c) = cell {
                 (

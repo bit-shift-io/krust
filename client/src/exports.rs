@@ -110,6 +110,10 @@ pub fn handle_resize(width: i32, height: i32) -> Result<(), JsValue> {
             .as_mut()
             .ok_or_else(|| JsValue::from("init() not called"))?;
         let (cw, ch) = if let Some(ctx) = state.ctx() {
+            // Measure in CSS pixels: reset any dpr scale a prior render left
+            // on the context, so cell dims stay independent of devicePixelRatio
+            // (browser zoom) and rows/cols below are computed from CSS px.
+            let _ = ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
             measure_cell_dimensions(ctx)
         } else {
             (state.cell_width, state.cell_height)
@@ -123,8 +127,8 @@ pub fn handle_resize(width: i32, height: i32) -> Result<(), JsValue> {
         let phys_h = (height as f64) * dpr;
         let _ = state.canvas_mut().set_width(phys_w as u32);
         let _ = state.canvas_mut().set_height(phys_h as u32);
-        let cols = (phys_w / cw).floor() as u16;
-        let rows = (phys_h / ch).floor() as u16;
+        let cols = ((width as f64) / cw).floor() as u16;
+        let rows = ((height as f64) / ch).floor() as u16;
         let cols = cols.max(2);
         let rows = rows.max(1);
         state.resize_screen(rows, cols);
@@ -225,6 +229,84 @@ pub fn selected_text() -> String {
             }
         })
     }
+
+/// Scroll the terminal view by `delta` lines (positive = up into history,
+/// negative = down toward the live screen). Returns the resulting scroll
+/// offset (0 = live screen at the bottom).
+#[wasm_bindgen]
+pub fn scroll(delta: isize) -> u32 {
+    TERM_STATE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        match guard.as_mut() {
+            Some(state) => {
+                state.scroll_by(delta);
+                let _ = state.render();
+                state.scroll_offset() as u32
+            }
+            None => 0,
+        }
+    })
+}
+
+/// Snap the terminal view to the live screen (bottom of scrollback).
+#[wasm_bindgen]
+pub fn scroll_to_bottom() {
+    TERM_STATE.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut() {
+            state.scroll_to_bottom();
+            let _ = state.render();
+        }
+    });
+}
+
+/// Snap the terminal view to the oldest available history row.
+#[wasm_bindgen]
+pub fn scroll_to_top() {
+    TERM_STATE.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut() {
+            state.scroll_to_top();
+            let _ = state.render();
+        }
+    });
+}
+
+/// Set the terminal view to an absolute scrollback offset (0 = live screen).
+#[wasm_bindgen]
+pub fn scroll_to(offset: usize) -> u32 {
+    TERM_STATE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        match guard.as_mut() {
+            Some(state) => {
+                state.set_scroll_offset(offset);
+                let _ = state.render();
+                state.scroll_offset() as u32
+            }
+            None => 0,
+        }
+    })
+}
+
+/// Return the current scrollback view offset (0 = live screen at the bottom).
+#[wasm_bindgen]
+pub fn scroll_offset() -> u32 {
+    TERM_STATE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|s| s.scroll_offset() as u32)
+            .unwrap_or(0)
+    })
+}
+
+/// Return the number of scrollback history rows currently available.
+#[wasm_bindgen]
+pub fn scrollback_len() -> u32 {
+    TERM_STATE.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .map(|s| s.scrollback_len() as u32)
+            .unwrap_or(0)
+    })
+}
 
 /// Map a browser keyboard event to raw PTY bytes
 ///

@@ -10,11 +10,15 @@
         #status { position: fixed; top: 8px; right: 8px; z-index: 10; font: 12px monospace; color: #f0f0f0; background: rgba(0,0,0,0.7); padding: 4px 8px; opacity: 1; transition: opacity 0.5s ease-in-out; }
         #sel-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 5; pointer-events: none; opacity: 0; touch-action: none; }
         body.selecting #sel-layer { pointer-events: auto; opacity: 0.01; }
+        #scrollbar { position: fixed; top: 0; right: 0; width: 10px; height: 100%; z-index: 8; background: rgba(255,255,255,0.06); opacity: 0; transition: opacity 0.2s ease-in-out; }
+        #scrollbar:hover, body.scrolling #scrollbar { opacity: 1; }
+        #scrollbar-thumb { position: absolute; left: 1px; right: 1px; border-radius: 4px; background: rgba(255,255,255,0.4); }
     </style>
 </head>
 <body>
     <canvas id="terminal-canvas"></canvas>
     <div id="sel-layer" contenteditable="false"></div>
+    <div id="scrollbar"><div id="scrollbar-thumb"></div></div>
     <div id="status">connecting...</div>
     <script type="module">
         import init, {
@@ -27,7 +31,13 @@
             set_selection,
             selected_text,
             clear_selection,
-            repaint
+            repaint,
+            scroll,
+            scroll_to,
+            scroll_to_bottom,
+            scroll_to_top,
+            scroll_offset,
+            scrollback_len
         } from '/pkg/terminal_client.js';
 
         const params = new URLSearchParams(location.search);
@@ -129,6 +139,8 @@
         let selAnchor = null;
         let selDragging = false;
         let selMoved = false;
+        let curScroll = 0;
+        let scrollbarVisible = false;
         let bytesIn = 0;
         let benchGoal = parseInt(params.get('bench') || '0', 10);
         let benchMax = 0;
@@ -200,9 +212,76 @@
             return { row, col };
         }
 
+        const scrollbarEl = document.getElementById('scrollbar');
+        const scrollbarThumb = document.getElementById('scrollbar-thumb');
+
+        function updateScrollbar() {
+            const max = scrollback_len();
+            const cur = curScroll;
+            // Virtual buffer = history rows + visible viewport.
+            const total = max + gridRows;
+            const viewport = gridRows;
+            const scrollFrac = total > viewport ? max / (total - viewport) : 0;
+            const frac = total > viewport ? (total - viewport - cur) / (total - viewport) : 0;
+            const thumbH = Math.max(24, viewport / total * 100);
+            const trackH = 100 - thumbH;
+            const pos = cur === 0 ? 100 - thumbH : (total - viewport - cur) / (total - viewport) * trackH;
+            scrollbarThumb.style.height = thumbH + '%';
+            scrollbarThumb.style.top = pos + '%';
+            scrollbarVisible = max > 0;
+            scrollbarEl.style.height = 'calc(100% - 2px)';
+        }
+
+        function showScrollbarTemporarily() {
+            if (!scrollbarVisible) return;
+            document.body.classList.add('scrolling');
+            clearTimeout(scrollbarEl._hideTimer);
+            scrollbarEl._hideTimer = setTimeout(() => {
+                document.body.classList.remove('scrolling');
+            }, 1500);
+        }
+
+        function doScroll(delta) {
+            curScroll = scroll(delta);
+            updateScrollbar();
+            showScrollbarTemporarily();
+        }
+
+        function doScrollTo(offset) {
+            curScroll = scroll_to(offset);
+            updateScrollbar();
+            showScrollbarTemporarily();
+        }
+
+        function doScrollTop() {
+            scroll_to_top();
+            curScroll = scroll_offset();
+            updateScrollbar();
+            showScrollbarTemporarily();
+        }
+
+        function doScrollBottom() {
+            scroll_to_bottom();
+            curScroll = 0;
+            updateScrollbar();
+        }
+
         window.addEventListener('keydown', (e) => {
             const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
             const modifier = isMac ? e.metaKey : e.ctrlKey;
+
+            // PageUp / PageDown scroll the terminal viewport (not sent to shell).
+            // PageUp scrolls back into history, PageDown toward the live bottom.
+            if (e.key === 'PageUp' && !modifier && !e.altKey) {
+                e.preventDefault();
+                doScroll(gridRows);
+                return;
+            }
+            if (e.key === 'PageDown' && !modifier && !e.altKey) {
+                e.preventDefault();
+                doScroll(-gridRows);
+                return;
+            }
 
             // 1. Shift + Enter -> Send exact Alt+Enter sequence (\x1b\r)
             if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
@@ -389,6 +468,35 @@ const text = selected_text();
             }
         });
 
+        window.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            // Wheel down (deltaY > 0) scrolls toward the live bottom;
+            // wheel up (deltaY < 0) scrolls back into history.
+            const lines = Math.round(e.deltaY / Math.max(1, cellH));
+            if (lines !== 0) doScroll(-lines);
+        }, { passive: false });
+
+        scrollbarEl.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            const track = scrollbarEl.getBoundingClientRect();
+            const max = scrollback_len();
+            const frac = 1 - (e.clientY - track.top) / track.height;
+            let offset = max > 0 ? Math.round(frac * max) : 0;
+            // Clicking on the thumb itself still sets an approximate position;
+            // drag handles fine-tuning below.
+            doScrollTo(offset);
+            const onMove = (ev) => {
+                const f = 1 - (ev.clientY - track.top) / track.height;
+                doScrollTo(max > 0 ? Math.round(f * max) : 0);
+            };
+            const onUp = () => {
+                window.removeEventListener('mousemove', onMove);
+                window.removeEventListener('mouseup', onUp);
+            };
+            window.addEventListener('mousemove', onMove);
+            window.addEventListener('mouseup', onUp);
+        });
+
         async function startTerminal() {
             const bytes = await (await fetch('/pkg/terminal_client_bg.wasm')).arrayBuffer();
             await init(bytes);
@@ -398,6 +506,7 @@ const text = selected_text();
             cellW = Math.max(1, cfg.cell_width || cellW);
             cellH = Math.max(1, cfg.cell_height || cellH);
             fit();
+            updateScrollbar();
             window.addEventListener('resize', () => { fit(); sendResize(); });
             showStatus('krust terminal');
 
@@ -417,7 +526,7 @@ const text = selected_text();
                     if (dt > mx) mx = dt;
                     sum += dt; N++;
                 }
-                console.log('SELFTEST', JSON.stringify({ rows, N, maxMs: mx, avgMs: sum / N, wallMs: performance.now() - t0, bytesIn: bytesIn }));
+                console.log('SELFTEST', JSON.stringify({ rows, gridRows, gridCols, innerW: window.innerWidth, innerH: window.innerHeight, dpr: window.devicePixelRatio, N, maxMs: mx, avgMs: sum / N, wallMs: performance.now() - t0, bytesIn: bytesIn, scrollbackLen: scrollback_len(), offset: scroll_offset() }));
             }
             connectPrimary(buildWsUrl('/ws'));
         }
@@ -451,6 +560,10 @@ ws.onmessage = (ev) => {
                     const t0 = performance.now();
                     if (params.get('benchskip') !== '1') process_bytes(new Uint8Array(ev.data));
                     benchSample(performance.now() - t0);
+                    // Keep view in sync: when at the bottom we auto-follow new
+                    // output; when scrolled up the Rust side preserves the offset.
+                    curScroll = scroll_offset();
+                    updateScrollbar();
                     const title = extractTitle(new Uint8Array(ev.data));
                     if (title) {
                         lastTitle = title + ' | terminal';

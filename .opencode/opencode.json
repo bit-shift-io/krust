@@ -24,8 +24,6 @@
     },
     "read": {
       "*": "allow",
-      "data": "allow",
-      "data/**": "allow",
       "~/.cargo": "allow",
       "~/.cargo/**": "allow",
       "/tmp": "allow",
@@ -35,8 +33,6 @@
     },
     "edit": {
       "*": "allow",
-      "data": "deny",
-      "data/**": "deny",
       "~/.cargo": "allow",
       "~/.cargo/**": "allow",
       "/tmp": "allow",
@@ -46,7 +42,6 @@
     },
     "bash": {
       "*": "allow",
-      "*data*": "deny",
       "git commit*": "deny",
       "git push*": "deny"
     }
