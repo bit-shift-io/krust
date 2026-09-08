@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>krust render test</title>
+    <style>
+        html, body { margin: 0; background: #111; overflow: hidden; }
+        canvas { display: block; width: 800px; height: 600px; background: #000; }
+        #result { position: fixed; top: 8px; left: 8px; z-index: 10;
+                  font: 11px monospace; color: #0f0; background: rgba(0,0,0,0.85);
+                  padding: 6px 10px; white-space: pre; max-width: 1000px; }
+        body.fail #result { color: #f66; }
+    </style>
+</head>
+<body>
+    <canvas id="terminal-canvas" width="800" height="600" tabindex="0"></canvas>
+    <pre id="result">loading...</pre>
+    <script type="module">
+        import init, { init as term_init, process_bytes, repaint, handle_resize, version } from '../pkg/terminal_client.js';
+
+        const canvas = document.getElementById('terminal-canvas');
+        const result = document.getElementById('result');
+
+        function setResult(obj) {
+            result.textContent = JSON.stringify(obj);
+            document.body.className = obj.pass ? '' : 'fail';
+            document.title = 'krust-render-test ' + (obj.pass ? 'PASS' : 'FAIL');
+        }
+
+        function feedContent() {
+            const parts = [];
+            const push = (s) => parts.push(new TextEncoder().encode(s));
+            push('\x1b[2J\x1b[H');
+            push('\x1b[1;34mboldblue\x1b[0m\r\n');
+            push('─'.repeat(80) + '\r\n');
+            for (let i = 0; i < 6; i++) push('│'.repeat(40) + '\r\n');
+            push(' '.repeat(30) + '⠋⠁⠂⠄⠈⠐⠠⡀\r\n');
+            for (let i = 0; i < 8; i++) push('█'.repeat(10) + '\r\n');
+            const len = parts.reduce((n, p) => n + p.length, 0);
+            const joined = new Uint8Array(len);
+            let off = 0;
+            for (const p of parts) { joined.set(p, off); off += p.length; }
+            process_bytes(joined);
+        }
+
+        // Seam analysis: every line in a region should be uniformly bright.
+        // A "dim" row/column = its max channel brightness in the region never
+        // reaches FG level, i.e. an AA/background gap between glyph cells.
+        function analyzeArea(ctx, W, H, img, x0, y0, x1, y1, pane) {
+            const scale = 200;
+            const dimRows = [], dimCols = [], sample = [];
+            for (let y = y0; y < y1; y++) {
+                let mx = 0;
+                for (let x = x0; x < x1; x++) {
+                    const i = 4 * (y * W + x);
+                    const v = Math.max(img[i], img[i + 1], img[i + 2]);
+                    if (v > mx) mx = v;
+                }
+                if (mx < scale) dimRows.push(y);
+                if (y === y0 || y === y0 + 1) sample.push(mx);
+            }
+            for (let x = x0; x < x1; x++) {
+                let mx = 0;
+                for (let y = y0; y < y1; y++) {
+                    const i = 4 * (y * W + x);
+                    const v = Math.max(img[i], img[i + 1], img[i + 2]);
+                    if (v > mx) mx = v;
+                }
+                if (mx < scale) dimCols.push(x);
+            }
+            return { pane, dimRows, dimCols, sample, x0, y0, x1, y1, scale };
+        }
+        function seamSummary(a) {
+            return { rows: a.dimRows.length, cols: a.dimCols.length,
+                     rowPx: a.dimRows.length, colPx: a.dimCols.length };
+        }
+
+        async function run() {
+            const bytes = await (await fetch('../pkg/terminal_client_bg.wasm')).arrayBuffer();
+            await init(bytes);
+            const config = JSON.parse(term_init('terminal-canvas', null));
+            handle_resize(800, 600);
+            feedContent();
+            repaint();
+
+            const ctx = canvas.getContext('2d');
+            const W = canvas.width, H = canvas.height;
+            const cw = config.cell_width, ch = config.cell_height;
+            const img = ctx.getImageData(0, 0, W, H).data;
+
+            function isBright(x, y) {
+                if (x < 0 || y < 0 || x >= W || y >= H) return false;
+                const i = 4 * (y * W + x);
+                if (img[i + 3] === 0) return false;
+                return img[i] > 100 || img[i + 1] > 100 || img[i + 2] > 100;
+            }
+
+            let brightBlue = 0, darkBlue = 0;
+            for (let y = ch; y < 2 * ch; y++) {
+                for (let x = 0; x < 120; x += 2) {
+                    if (!isBright(x, y)) continue;
+                    const i = 4 * (y * W + x);
+                    if (img[i + 2] > 170 && img[i] > 40 && Math.abs(img[i] - img[i + 1]) < 50) brightBlue++;
+                    if (img[i + 2] > 170 && img[i] < 20 && img[i + 1] < 20) darkBlue++;
+                }
+            }
+
+            const R = Math.round;
+            const dash = analyzeArea(ctx, W, H, img, 0, R(ch), R(80 * cw), R(2 * ch), 'dash');
+            const pipe = analyzeArea(ctx, W, H, img, 0, R(2 * ch), R(2 * cw), R(8 * ch), 'pipe');
+            const blk = analyzeArea(ctx, W, H, img, 0, R(9 * ch), R(10 * cw), R(17 * ch), 'block');
+
+            const res = {
+                metrics: { cell_width: cw, cell_height: ch },
+                colors: { bright_blue_pixels: brightBlue, dark_blue_pixels: darkBlue },
+                dash: seamSummary(dash),
+                pipe: seamSummary(pipe),
+                block: seamSummary(blk),
+                block_vdim_rows: blk.dimRows.slice(0, 8),
+                block_hdim_cols: blk.dimCols.slice(0, 12),
+                version: version(),
+            };
+            res.pass = brightBlue > 0 && darkBlue === 0
+                && blk.dimRows.length === 0 && blk.dimCols.length === 0;
+            setResult(res);
+        }
+
+        run().catch((e) => setResult({ pass: false, error: String(e) }));
+    </script>
+</body>
+</html>

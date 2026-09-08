@@ -24,6 +24,7 @@ web-sys = { version = "0.3", features = [
     "Range",
     "CanvasRenderingContext2d",
     "TextMetrics",
+    "ImageData",
     "WebGl2RenderingContext",
     "WebGlBuffer",
     "WebGlProgram",

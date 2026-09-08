@@ -93,18 +93,343 @@ fn cell_fg_rgb(cell: &vt100::Cell, default: u32) -> u32 {
     color_to_rgb(cell.fgcolor(), default)
 }
 
-/// Measure actual cell dimensions from the font metrics
+/// Glyph shapes the renderer actually draws. Cell height is measured from these
+/// (see [`measure_cell_dimensions`]), so box-drawing/braille rows tile with no
+/// hairline seams regardless of which font the user's system resolves to.
+const MEASURE_PROBES: &[&str] = &["W", "0", "g", "j", "│", "─", "█", "▀", "░", "⠋", "⣿"];
+
+/// Maximum ink height of `probes` after rasterizing each glyph onto a scratch
+/// canvas. `None` if the 2D/`getImageData` pipeline is unavailable (the caller
+/// then falls back to font metric boxes).
+fn rasterized_glyph_height_max(
+    probes: &[&str],
+    _font_ctx: &CanvasRenderingContext2d,
+) -> Option<f64> {
+    let doc = web_sys::window()?.document()?;
+    let mut max_h = 0.0f64;
+    for ch in probes {
+        let Ok(scratch) = doc.create_element("canvas") else { return None };
+        let Ok(scratch) = scratch.dyn_into::<web_sys::HtmlCanvasElement>() else {
+            return None;
+        };
+        scratch.set_width(64);
+        scratch.set_height(64);
+        let Some(ctx) = scratch.get_context("2d").ok().flatten() else {
+            return None;
+        };
+        let Ok(ctx) = ctx.dyn_into::<CanvasRenderingContext2d>() else {
+            return None;
+        };
+        ctx.set_font(&FONT_STACK);
+        ctx.set_fill_style_str("#ffffff");
+        ctx.set_text_baseline("alphabetic");
+        let _ = ctx.fill_text(ch, 8.0, 40.0);
+        let Ok(img) = ctx.get_image_data(0.0, 0.0, 64.0, 64.0) else { return None };
+        let px = img.data();
+        let mut top_row = 64usize;
+        let mut bottom_row = 0usize;
+        for y in 0..64usize {
+            let mut ink = false;
+            for x in 8..24usize {
+                let alpha = px[(y * 64 + x) * 4 + 3] as f64;
+                if alpha > 0.0 {
+                    ink = true;
+                    break;
+                }
+            }
+            if ink {
+                top_row = top_row.min(y);
+                bottom_row = y;
+            }
+        }
+        if bottom_row >= top_row {
+            let h = (bottom_row - top_row + 1) as f64;
+            if h > max_h {
+                max_h = h;
+            }
+        }
+    }
+    Some(max_h)
+}
+
+/// Measure actual cell dimensions from the font.
+///
+/// Width comes from `"W"` (the monospace advance). Height is the tallest
+/// *painted* glyph across [`MEASURE_PROBES`], rasterized to pixels. The font
+/// metric boxes (`font_bounding_box_*`, and even `actual_bounding_box_*`) are
+/// larger than what is actually drawn at terminal sizes, which leaves hairline
+/// vertical seams between rows of `│`/`─` in box-drawing UIs (opencode borders,
+/// `htop`, `vim` splits, ...). Measuring ink directly makes the cell pitch match
+/// the painted glyphs for whatever font the system resolves the stack to.
 fn measure_cell_dimensions(ctx: &CanvasRenderingContext2d) -> (f64, f64) {
     ctx.set_font(FONT_STACK);
-    let metrics = ctx.measure_text("W").unwrap();
-    let width = metrics.width();
-    let height = metrics.font_bounding_box_ascent() + metrics.font_bounding_box_descent();
+    let width = ctx
+        .measure_text("W")
+        .map(|m| m.width())
+        .ok()
+        .unwrap_or(14.0);
+    let fallback = || {
+        let mut h = 0.0f64;
+        for ch in MEASURE_PROBES {
+            if let Ok(m) = ctx.measure_text(ch) {
+                let bh = m.actual_bounding_box_ascent() + m.actual_bounding_box_descent();
+                if bh > h {
+                    h = bh;
+                }
+            }
+        }
+        (h > 0.0).then_some(h)
+    };
+    let height = rasterized_glyph_height_max(MEASURE_PROBES, ctx)
+        .filter(|&h| h > 0.0)
+        .or_else(fallback)
+        .unwrap_or(20.0);
+    // Snap to whole device pixels (xterm-style): every cell starts on an
+    // integer coordinate, so adjacent glyphs share exact pixel boundaries
+    // instead of leaving anti-aliased hairline seams at fractional advances.
+    // Columns/rows are then `floor(canvas / cell)` and any leftover pixels
+    // become background padding around the terminal.
+    let width = width.round().max(1.0);
+    let height = height.round().max(1.0);
     (width, height)
 }
 
 /// Format a `0xRRGGBB` integer as an HTML/CSS `#rrggbb` string.
 fn css_color(rgb: u32) -> String {
     format!("#{:06x}", rgb)
+}
+
+// -- Graphic-glyph geometry -----------------------------------------------
+//
+// Block elements (U+2580..U+2593) and box-drawing (U+2500..U+257F) are painted
+// as solid rectangles instead of font text. Font glyphs paint slightly smaller
+// than their cell, which leaves ~1px horizontal / ~2px vertical background
+// seams between adjacent block and border cells. Geometry covers the cell
+// exactly (plus a small epsilon bleed) so grids and borders tile seamlessly.
+
+/// Overdraw amount (device px) for graphic cells, hiding anti-aliasing seams.
+const GRAPHIC_EPS: f64 = 0.7;
+
+/// Horizontal half of a box-drawing glyph.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BarSide {
+    None,
+    Left,
+    Right,
+    Full,
+}
+
+/// Vertical half of a box-drawing glyph.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StemSide {
+    None,
+    Up,
+    Down,
+    Full,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LineWeight {
+    Light,
+    Heavy,
+    Double,
+}
+
+/// Fractional rect + alpha for a block element, in cell units.
+fn block_geometry(c: char) -> Option<(f64, f64, f64, f64, f64)> {
+    let g = match c {
+        '\u{2580}' => (0.0, 0.0, 1.0, 0.5, 1.0),   // ▀ upper half
+        '\u{2584}' => (0.0, 0.5, 1.0, 1.0, 1.0),   // ▄ lower half
+        '\u{2588}' => (0.0, 0.0, 1.0, 1.0, 1.0),   // █ full block
+        '\u{258C}' => (0.0, 0.0, 0.5, 1.0, 1.0),   // ▌ left half
+        '\u{2590}' => (0.5, 0.0, 1.0, 1.0, 1.0),   // ▐ right half
+        '\u{2591}' => (0.0, 0.0, 1.0, 1.0, 0.25),  // ░ light shade
+        '\u{2592}' => (0.0, 0.0, 1.0, 1.0, 0.5),   // ▒ medium shade
+        '\u{2593}' => (0.0, 0.0, 1.0, 1.0, 0.75),  // ▓ dark shade
+        _ => return None,
+    };
+    Some(g)
+}
+
+fn box_geometry(c: char) -> Option<(BarSide, StemSide, LineWeight)> {
+    use BarSide as B;
+    use LineWeight as W;
+    use StemSide as S;
+    let g = match c {
+        '\u{2500}' => (B::Full, S::None, W::Light),   // ─
+        '\u{2501}' => (B::Full, S::None, W::Heavy),   // ━
+        '\u{2502}' => (B::None, S::Full, W::Light),   // │
+        '\u{2503}' => (B::None, S::Full, W::Heavy),   // ┃
+        '\u{250C}' => (B::Right, S::Up, W::Light),    // ┌
+        '\u{250D}' => (B::Right, S::Up, W::Light),    // ┍
+        '\u{250E}' => (B::Right, S::Up, W::Heavy),    // ┎
+        '\u{250F}' => (B::Right, S::Up, W::Heavy),    // ┏
+        '\u{2510}' => (B::Left, S::Up, W::Light),     // ┐
+        '\u{2511}' => (B::Left, S::Up, W::Light),     // ┑
+        '\u{2512}' => (B::Left, S::Up, W::Heavy),     // ┒
+        '\u{2513}' => (B::Left, S::Up, W::Heavy),     // ┓
+        '\u{2514}' => (B::Right, S::Down, W::Light),  // └
+        '\u{2515}' => (B::Right, S::Down, W::Light),  // ┕
+        '\u{2516}' => (B::Right, S::Down, W::Heavy),  // ┖
+        '\u{2517}' => (B::Right, S::Down, W::Heavy),  // ┗
+        '\u{2518}' => (B::Left, S::Down, W::Light),   // ┘
+        '\u{2519}' => (B::Left, S::Down, W::Light),   // ┙
+        '\u{251A}' => (B::Left, S::Down, W::Heavy),   // ┚
+        '\u{251B}' => (B::Left, S::Down, W::Heavy),   // ┛
+        '\u{251C}' => (B::Right, S::Full, W::Light),  // ├
+        '\u{251D}' => (B::Right, S::Full, W::Light),  // ┝
+        '\u{251E}' => (B::Right, S::Up, W::Light),    // ┞
+        '\u{251F}' => (B::Right, S::Down, W::Light),  // ┟
+        '\u{2520}' => (B::Right, S::Up, W::Light),    // ┠
+        '\u{2521}' => (B::Right, S::Down, W::Light),  // ┡
+        '\u{2522}' => (B::Right, S::Full, W::Light),  // ┢
+        '\u{2523}' => (B::Right, S::Full, W::Heavy),  // ┣
+        '\u{2524}' => (B::Left, S::Full, W::Light),   // ┤
+        '\u{2525}' => (B::Left, S::Full, W::Light),   // ┥
+        '\u{2526}' => (B::Left, S::Up, W::Light),     // ┦
+        '\u{2527}' => (B::Left, S::Down, W::Light),   // ┧
+        '\u{2528}' => (B::Left, S::Up, W::Light),     // ┨
+        '\u{2529}' => (B::Left, S::Down, W::Light),   // ┩
+        '\u{252A}' => (B::Left, S::Full, W::Light),   // ┪
+        '\u{252B}' => (B::Left, S::Full, W::Heavy),   // ┫
+        '\u{252C}' => (B::Full, S::Up, W::Light),     // ┬
+        '\u{252D}' => (B::Full, S::Up, W::Light),     // ┭
+        '\u{252E}' => (B::Full, S::Up, W::Light),     // ┮
+        '\u{252F}' => (B::Full, S::Up, W::Light),     // ┯
+        '\u{2530}' => (B::Full, S::Up, W::Light),     // ┰
+        '\u{2531}' => (B::Full, S::Up, W::Light),     // ┱
+        '\u{2532}' => (B::Full, S::Up, W::Light),     // ┲
+        '\u{2533}' => (B::Full, S::Up, W::Heavy),     // ┳
+        '\u{2534}' => (B::Full, S::Down, W::Light),   // ┴
+        '\u{2535}' => (B::Full, S::Down, W::Light),   // ┵
+        '\u{2536}' => (B::Full, S::Down, W::Light),   // ┶
+        '\u{2537}' => (B::Full, S::Down, W::Light),   // ┷
+        '\u{2538}' => (B::Full, S::Down, W::Light),   // ┸
+        '\u{2539}' => (B::Full, S::Down, W::Light),   // ┹
+        '\u{253A}' => (B::Full, S::Down, W::Light),   // ┺
+        '\u{253B}' => (B::Full, S::Down, W::Heavy),   // ┻
+        '\u{253C}' => (B::Full, S::Full, W::Light),   // ┼
+        '\u{253D}' => (B::Full, S::Full, W::Light),   // ┽
+        '\u{253E}' => (B::Full, S::Full, W::Light),   // ┾
+        '\u{253F}' => (B::Full, S::Full, W::Light),   // ┿
+        '\u{2540}' => (B::Full, S::Full, W::Light),   // ╀
+        '\u{2541}' => (B::Full, S::Full, W::Light),   // ╁
+        '\u{2542}' => (B::Full, S::Full, W::Light),   // ╂
+        '\u{2543}' => (B::Right, S::Full, W::Light),  // ╃
+        '\u{2544}' => (B::Left, S::Full, W::Light),   // ╄
+        '\u{2545}' => (B::Full, S::Up, W::Light),     // ╅
+        '\u{2546}' => (B::Full, S::Down, W::Light),   // ╆
+        '\u{2547}' => (B::Right, S::Full, W::Light),  // ╇
+        '\u{2548}' => (B::Left, S::Full, W::Light),   // ╈
+        '\u{2549}' => (B::Full, S::Up, W::Light),     // ╉
+        '\u{254A}' => (B::Full, S::Down, W::Light),   // ╊
+        '\u{254B}' => (B::Full, S::Full, W::Heavy),   // ╋
+        '\u{2550}' => (B::Full, S::None, W::Double),  // ═
+        '\u{2551}' => (B::None, S::Full, W::Double),  // ║
+        '\u{2554}' => (B::Right, S::Up, W::Double),   // ╔
+        '\u{2557}' => (B::Left, S::Up, W::Double),    // ╗
+        '\u{255A}' => (B::Right, S::Down, W::Double), // ╚
+        '\u{255D}' => (B::Left, S::Down, W::Double),  // ╝
+        '\u{2560}' => (B::Right, S::Full, W::Double), // ╠
+        '\u{2563}' => (B::Left, S::Full, W::Double),  // ╣
+        '\u{2566}' => (B::Full, S::Up, W::Double),    // ╦
+        '\u{2569}' => (B::Full, S::Down, W::Double),  // ╩
+        '\u{256C}' => (B::Full, S::Full, W::Double),  // ╬
+        '\u{256D}' => (B::Right, S::Up, W::Light),    // ╭ rounded
+        '\u{256E}' => (B::Left, S::Up, W::Light),     // ╮ rounded
+        '\u{256F}' => (B::Left, S::Down, W::Light),   // ╯ rounded
+        '\u{2570}' => (B::Right, S::Down, W::Light),  // ╰ rounded
+        '\u{2504}' | '\u{2508}' | '\u{254C}' | '\u{254D}' => (B::Full, S::None, W::Light),
+        '\u{2505}' | '\u{2506}' | '\u{2507}' | '\u{2509}' | '\u{250A}' | '\u{250B}' | '\u{254E}'
+        | '\u{254F}' => (B::None, S::Full, W::Light),
+        _ => return None,
+    };
+    Some(g)
+}
+
+/// Paint a graphic glyph (block element or box-drawing) as geometry covering
+/// its cell. Returns `true` when handled (caller skips the font path).
+fn draw_graphic_cell(
+    ctx: &CanvasRenderingContext2d,
+    col: u16,
+    row: u16,
+    cw: f64,
+    ch: f64,
+    glyph: &str,
+    color: u32,
+) -> bool {
+    let Some(c) = glyph.chars().next() else {
+        return false;
+    };
+    if let Some((fx0, fy0, fx1, fy1, alpha)) = block_geometry(c) {
+        let x = col as f64 * cw + fx0 * cw - GRAPHIC_EPS;
+        let y = row as f64 * ch + fy0 * ch - GRAPHIC_EPS;
+        let w = (fx1 - fx0) * cw + GRAPHIC_EPS * 2.0;
+        let h = (fy1 - fy0) * ch + GRAPHIC_EPS * 2.0;
+        if alpha < 1.0 {
+            ctx.set_global_alpha(alpha);
+        }
+        ctx.set_fill_style_str(&css_color(color));
+        ctx.fill_rect(x, y, w, h);
+        if alpha < 1.0 {
+            ctx.set_global_alpha(1.0);
+        }
+        return true;
+    }
+    let Some((bar, stem, weight)) = box_geometry(c) else {
+        return false;
+    };
+    let color = css_color(color);
+    ctx.set_fill_style_str(&color);
+    draw_box_lines(ctx, col, row, cw, ch, bar, stem, weight);
+    true
+}
+
+fn box_line_width(weight: LineWeight) -> (f64, f64) {
+    match weight {
+        LineWeight::Light => (2.0, 0.0),
+        LineWeight::Heavy => (3.0, 0.0),
+        LineWeight::Double => (1.5, 3.0),
+    }
+}
+
+fn draw_box_lines(
+    ctx: &CanvasRenderingContext2d,
+    col: u16,
+    row: u16,
+    cw: f64,
+    ch: f64,
+    bar: BarSide,
+    stem: StemSide,
+    weight: LineWeight,
+) {
+    let cx = col as f64 * cw + cw * 0.5;
+    let cy = row as f64 * ch + ch * 0.5;
+    let (t, gap) = box_line_width(weight);
+    let offsets: &[f64] = if gap > 0.0 { &[-gap, gap] } else { &[0.0] };
+
+    for &off in offsets {
+        if stem != StemSide::None {
+            let x = cx + off - t * 0.5;
+            let (y, h) = match stem {
+                StemSide::Full => (row as f64 * ch - GRAPHIC_EPS, ch + GRAPHIC_EPS * 2.0),
+                StemSide::Up => (row as f64 * ch - GRAPHIC_EPS, cy - row as f64 * ch + t * 0.5 + GRAPHIC_EPS),
+                StemSide::Down => (cy - t * 0.5 - GRAPHIC_EPS, (row as f64 + 1.0) * ch - (cy - t * 0.5 - GRAPHIC_EPS) + GRAPHIC_EPS),
+                _ => unreachable!(),
+            };
+            ctx.fill_rect(x, y, t, h);
+        }
+        if bar != BarSide::None {
+            let y = cy + off - t * 0.5;
+            let (x, w) = match bar {
+                BarSide::Full => (col as f64 * cw - GRAPHIC_EPS, cw + GRAPHIC_EPS * 2.0),
+                BarSide::Left => (col as f64 * cw - GRAPHIC_EPS, cx - col as f64 * cw + t * 0.5 + GRAPHIC_EPS),
+                BarSide::Right => (cx - t * 0.5 - GRAPHIC_EPS, (col as f64 + 1.0) * cw - (cx - t * 0.5 - GRAPHIC_EPS) + GRAPHIC_EPS),
+                _ => unreachable!(),
+            };
+            ctx.fill_rect(x, y, w, t);
+        }
+    }
 }
 
 /// Encode the standard xterm modifier parameter (1 + shift 1 + alt 2 + ctrl 4).
@@ -495,6 +820,9 @@ impl TerminalState {
                 if let Some((s, bold)) = text {
                     let draw_fg = if self.selected(row, col) { SELECTION_FG } else { fg };
                     if draw_fg != DEFAULT_BG {
+                        if draw_graphic_cell(&self.ctx, col, row, cw, ch, &s, draw_fg) {
+                            continue;
+                        }
                         let want = if bold { FONT_STACK_BOLD } else { FONT_STACK };
                         if font != want {
                             font = want.to_string();
@@ -530,7 +858,9 @@ impl TerminalState {
             if let Some(c) = cell {
                 let s = c.contents();
                 if !s.is_empty() {
-                    let _ = self.ctx.fill_text(s, cc as f64 * cw, cr as f64 * ch + ch * 0.5);
+                    if !draw_graphic_cell(&self.ctx, cc as u16, cr as u16, cw, ch, &s, fg) {
+                        let _ = self.ctx.fill_text(s, cc as f64 * cw, cr as f64 * ch + ch * 0.5);
+                    }
                 }
             }
         }
@@ -1095,6 +1425,31 @@ mod tests {
         let cell = p.screen().cell(0, 0).unwrap();
         assert!(!cell.bold());
         assert_eq!(cell_fg_rgb(&cell, DEFAULT_FG), 0x0000EE);
+    }
+
+    #[test]
+    fn block_geometry_covers_known_blocks() {
+        use crate::{BarSide as B, LineWeight as W, StemSide as S};
+        // Full block is opaque and covers the whole cell.
+        let g = block_geometry('\u{2588}').unwrap();
+        assert_eq!(g, (0.0, 0.0, 1.0, 1.0, 1.0));
+        // Half blocks cover exactly half; shades use alpha.
+        assert_eq!(block_geometry('\u{2580}').unwrap().3, 0.5);
+        assert_eq!(block_geometry('\u{2592}').unwrap().4, 0.5);
+        assert_eq!(block_geometry('\u{2584}').unwrap().1, 0.5);
+        // Non-block chars return None.
+        assert!(block_geometry('A').is_none());
+        assert!(box_geometry('A').is_none());
+        // Box-drawing corners encode the correct arms.
+        assert_eq!(box_geometry('\u{250C}').unwrap(), (B::Right, S::Up, W::Light)); // ┌
+        assert_eq!(box_geometry('\u{2510}').unwrap(), (B::Left, S::Up, W::Light));  // ┐
+        assert_eq!(box_geometry('\u{2514}').unwrap(), (B::Right, S::Down, W::Light)); // └
+        assert_eq!(box_geometry('\u{2518}').unwrap(), (B::Left, S::Down, W::Light)); // ┘
+        assert_eq!(box_geometry('\u{2500}').unwrap(), (B::Full, S::None, W::Light)); // ─
+        assert_eq!(box_geometry('\u{2502}').unwrap(), (B::None, S::Full, W::Light)); // │
+        assert_eq!(box_geometry('\u{2501}').unwrap().2, W::Heavy);             // ━
+        assert_eq!(box_geometry('\u{2550}').unwrap().2, W::Double);            // ═
+        assert!(box_geometry('A').is_none());
     }
 
     #[test]

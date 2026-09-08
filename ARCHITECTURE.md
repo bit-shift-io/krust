@@ -254,6 +254,40 @@ hidden when no scripts exist. The web UI exposes the same launcher inside
   upgrades work cross-origin from `localhost:5000`. `KRUST_PORT` (default
   3000) overrides krust's bind port.
 
+### 3.8 WASM Terminal Rendering — Cell Grid & Glyph Seams (`client-wasm/`)
+
+The WASM client (`client-wasm/src/lib.rs`) renders the VT100 grid onto a
+Canvas 2D surface. Two changes eliminate the hairline gaps that appeared
+between adjacent glyphs (visible as seams in `█`-drawn bars, box-drawing
+borders, htop, etc.):
+
+* **Whole-pixel cell grid (xterm-style).** `measure_cell_dimensions` sizes
+  the cell by rasterizing probe glyphs onto a scratch canvas and measuring the
+  painted ink height (`rasterized_glyph_height_max`), then **rounds both
+  dimensions to whole pixels** (8.4 → 8, 18.0 → 18). Columns/rows are
+  `floor(canvas / cell)`, so every cell starts on an integer device
+  coordinate; leftover pixels become background padding around the terminal.
+  Fractional advances would otherwise place each glyph at a sub-pixel offset
+  and leave anti-aliased hairline seams on every cell boundary.
+* **Geometry-drawn block & box glyphs.** The font glyphs for U+2580–2593
+  (blocks/shades) and U+2500–257F (box drawing) paint slightly shorter than
+  their advance width/height, so even on an integer grid they leave slivers.
+  `draw_graphic_cell` renders these as vector fills instead: `block_geometry`
+  yields full/half/quarter coverage rects (dark/light/medium shades become
+  translucent fills at 0.25/0.5/0.75 alpha), `box_geometry` maps each
+  codepoint to horizontal/vertical bar arms with light/heavy/double weights,
+  and `draw_box_lines` strokes them with a `GRAPHIC_EPS = 0.7` device-pixel
+  bleed so strokes overdraw into neighboring cells. `render()` falls back to
+  the font path for anything else (braille, weighted diagonal halves, etc.).
+
+**Pixel-truth testing.** Seam detection with a `>40` ink threshold is
+unreliable: the `#2b2b2b` background has brightness 43, so every pixel counts
+as ink. `client-wasm/demo/render-test.html` instead paints a 10×10 `█` grid
+(plus `─`/`│` runs and a bold-blue "boldblue" check) and reports rows/columns
+whose max brightness stays under 200 ("dim"). `client-wasm/demo/render-check.sh`
+runs it headless and asserts **zero** dim rows/cols on the block grid.
+Run locally: `wasm-pack build --target web && ./client-wasm/demo/render-check.sh`.
+
 
 ---
 
@@ -370,5 +404,7 @@ Integration tests boot real daemons on ephemeral ports with isolated
 | `src/ui/remote.rs` | Connect-mode WebSocket client (`run_client`/`send_op`) |
 | `src/ui/components/` | Desktop widget panels (header/staging/diff/commit/history/actions) |
 | `web/dist/app.js` | Web client: selection invariant, "+" form mode, deep-links (`?t=`, `?view=`), view dock routing, krust terminal integration |
+| `client-wasm/src/lib.rs` | WASM terminal: cell measurement/raster scan, `draw_graphic_cell` block & box geometry, render loop (see 3.8) |
+| `client-wasm/demo/render-test.html` / `render-check.sh` | Pixel-truth regression harness: 10×10 `█` grid seam check (zero dim rows/cols required) |
 | `TASKS.md` | Original build roadmap (historical) |
 | `NOTES.md` | Design rationale |

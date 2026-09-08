@@ -451,8 +451,6 @@ impl WebGL2Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn atlas_builds_with_48_chars() {
         if let Ok(font_bytes) = std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf") {
