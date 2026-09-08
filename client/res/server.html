@@ -21,24 +21,40 @@
     <div id="scrollbar"><div id="scrollbar-thumb"></div></div>
     <div id="status">connecting...</div>
     <script type="module">
-        import init, {
-            init as term_init,
-            process_bytes,
-            query_replies,
-            handle_resize,
-            version,
-            key_to_bytes,
-            set_selection,
-            selected_text,
-            clear_selection,
-            repaint,
-            scroll,
-            scroll_to,
-            scroll_to_bottom,
-            scroll_to_top,
-            scroll_offset,
-            scrollback_len
-        } from '/pkg/terminal_client.js';
+import init, {
+    init as term_init,
+    process_bytes,
+    query_replies,
+    handle_resize,
+    version,
+    key_to_bytes,
+    set_selection,
+    selected_text,
+    clear_selection,
+    repaint,
+    scroll,
+    scroll_to,
+    scroll_to_bottom,
+    scroll_to_top,
+    scroll_offset,
+    scrollback_len
+} from '/pkg/terminal_client.js';
+
+// Render loop for frame coalescing
+let renderScheduled = false;
+function scheduleRender() {
+    if (!renderScheduled) {
+        renderScheduled = true;
+        requestAnimationFrame(() => {
+            renderScheduled = false;
+            try { repaint(); } catch (_) {}
+        });
+    }
+}
+
+// Call scheduleRender() after process_bytes to enable coalescing
+// Keep existing direct repaint() calls for UI events (focus, resize, etc.)
+// but consider migrating them to scheduleRender() as well for consistency
 
         const params = new URLSearchParams(location.search);
         const sid = params.get('s') || params.get('session') || (Math.random().toString(36).substring(2, 6));
@@ -522,6 +538,7 @@ const text = selected_text();
                 for (let off = 0; off < chunk.length; off += 1024) {
                     const t = performance.now();
                     process_bytes(chunk.subarray(off, Math.min(off + 1024, chunk.length)));
+                    scheduleRender();
                     const dt = performance.now() - t;
                     if (dt > mx) mx = dt;
                     sum += dt; N++;
@@ -558,7 +575,10 @@ ws.onmessage = (ev) => {
                     const reps = query_replies(new Uint8Array(ev.data));
                     if (reps.length) ws.send(reps);
                     const t0 = performance.now();
-                    if (params.get('benchskip') !== '1') process_bytes(new Uint8Array(ev.data));
+                    if (params.get('benchskip') !== '1') {
+                        process_bytes(new Uint8Array(ev.data));
+                        scheduleRender();
+                    }
                     benchSample(performance.now() - t0);
                     // Keep view in sync: when at the bottom we auto-follow new
                     // output; when scrolled up the Rust side preserves the offset.

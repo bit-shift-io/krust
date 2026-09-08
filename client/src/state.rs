@@ -8,7 +8,7 @@ use js_sys::Function;
 use std::cell::RefCell;
 use vt100::Parser;
 use wasm_bindgen::{JsCast, JsValue};
-use web_sys::CanvasRenderingContext2d;
+use web_sys::{console, CanvasRenderingContext2d};
 
 use crate::color::{cell_fg_rgb, color_to_rgb, DEFAULT_BG, DEFAULT_FG};
 use crate::graphics::draw_graphic_cell;
@@ -22,8 +22,11 @@ pub(crate) const DEFAULT_ROWS: u16 = 24;
 pub(crate) const DEFAULT_COLS: u16 = 80;
 pub(crate) const SCROLLBACK_LEN: usize = 1024;
 
-/// Terminal state parsed from ANSI byte streams, drawn to the canvas via the
-/// active renderer (Canvas 2D by default, WebGL2 fallback).
+/// Terminal state fields.
+///
+/// Holds the vt100 parser, the active renderer (Canvas 2D default, WebGL2
+/// fallback), cell dimensions, and selection state. Exposes the methods the
+/// WASM exports mutate it through.
 pub(crate) struct TerminalState {
     /// vt100 parser
     parser: Parser,
@@ -46,12 +49,31 @@ pub(crate) struct TerminalState {
     on_resize: Option<Box<dyn FnMut(u16, u16) + 'static>>,
     /// Selection mode
     selection_mode: SelectionMode,
+    /// Normal screen scrollback offset saved when entering alternate screen
+    saved_normal_offset_for_alt: Option<usize>,
     /// Text selection start cell
     selection_start: Option<(u16, u16)>,
     /// Text selection end cell
     selection_end: Option<(u16, u16)>,
-    /// Scrollback view offset (0 = normal screen at bottom, >0 = scrolled up)
-    scroll_offset: usize,
+    /// Scrollback view offset for the normal screen (0 = normal screen at bottom, >0 = scrolled up)
+    normal_scroll_offset: usize,
+    /// Scrollback view offset for the alternate screen (typically always 0)
+    alternate_scroll_offset: usize,
+    /// Previous screen state, used to diff against the current screen after
+    /// each `process_bytes` batch to find cells that changed.
+    prev_screen: Option<vt100::Screen>,
+    /// Cells that changed since the last render. Consumed by the renderer to
+    /// redraw only the affected cells instead of the whole grid.
+    dirty_cells: Vec<(u16, u16)>,
+    /// True when a full redraw is required (resize, scroll, selection change,
+    /// first frame). Cleared after the next render.
+    full_redraw: bool,
+    /// Last rendered cursor cell, so the old highlight can be cleared when
+    /// the cursor moves or becomes hidden.
+    prev_cursor: Option<(u16, u16)>,
+    /// True when a render pass has been scheduled via `schedule_render`
+    /// and needs to be flushed on the next JS animation frame.
+    needs_render: bool,
 }
 
 impl TerminalState {
@@ -154,90 +176,237 @@ impl TerminalState {
             cell_height,
             on_resize,
             selection_mode: SelectionMode::None,
+            saved_normal_offset_for_alt: None,
             selection_start: None,
             selection_end: None,
-            scroll_offset: 0,
+            normal_scroll_offset: 0,
+            alternate_scroll_offset: 0,
+            prev_screen: None,
+            dirty_cells: Vec::new(),
+            full_redraw: true,
+            prev_cursor: None,
+            needs_render: false,
         })
     }
 
     /// Process incoming ANSI bytes through the VT100 parser
     pub(crate) fn process_bytes(&mut self, bytes: &[u8]) {
+        let screen_before = self.parser.screen().alternate_screen();
+
         // Clamp the current scroll offset to the (possibly shrunken) history
         // before new bytes arrive, so we always stay within valid range.
         self.clamp_scroll();
+        // First batch: record the pre-processing screen so the first diff
+        // produces a sensible dirty set (full grid) instead of nothing.
+        if self.prev_screen.is_none() {
+            self.prev_screen = Some(self.parser.screen().clone());
+        }
         self.parser.process(bytes);
+
+        let screen_after = self.parser.screen().alternate_screen();
+
+        if !screen_before && screen_after {
+            self.saved_normal_offset_for_alt = Some(self.normal_scroll_offset);
+            self.parser.screen_mut().set_scrollback(self.normal_scroll_offset);
+        } else if screen_before && !screen_after {
+            if let Some(saved) = self.saved_normal_offset_for_alt.take() {
+                self.normal_scroll_offset = saved;
+                self.parser.screen_mut().set_scrollback(saved);
+            }
+        }
+
+        self.compute_dirty_cells();
+    }
+
+    /// Mark every cell dirty so the next render is a full redraw.
+    pub(crate) fn mark_all_dirty(&mut self) {
+        self.full_redraw = true;
+        self.dirty_cells.clear();
+    }
+
+    /// Compare the current screen against the previous one and record the
+    /// cells whose content or attributes changed. Also flags the wide
+    /// character partner, so a wide glyph is always redrawn as a unit.
+    fn compute_dirty_cells(&mut self) {
+        if self.full_redraw {
+            return;
+        }
+        let Some(prev) = self.prev_screen.clone() else {
+            self.full_redraw = true;
+            return;
+        };
+        let screen = self.parser.screen().clone();
+        let (prows, pcols) = screen.size();
+        let rows = if self.rows > 0 { self.rows } else { prows };
+        let cols = if self.cols > 0 { self.cols } else { pcols };
+        let mut dirty = Vec::new();
+        for row in 0..rows {
+            for col in 0..cols {
+                if Self::cell_changed(&prev, &screen, row, col) {
+                    dirty.push((row, col));
+                    // Wide character partner: redraw the other half too.
+                    if let Some(c) = screen.cell(row, col) {
+                        if c.is_wide() && col + 1 < cols {
+                            dirty.push((row, col + 1));
+                        } else if c.is_wide_continuation() && col > 0 {
+                            dirty.push((row, col - 1));
+                        }
+                    }
+                    // The previous screen's wide partner may also need a
+                    // redraw if the glyph changed or disappeared.
+                    if let Some(pc) = prev.cell(row, col) {
+                        if pc.is_wide() && col + 1 < cols {
+                            dirty.push((row, col + 1));
+                        } else if pc.is_wide_continuation() && col > 0 {
+                            dirty.push((row, col - 1));
+                        }
+                    }
+                }
+            }
+        }
+        dirty.sort_unstable();
+        dirty.dedup();
+        self.dirty_cells = dirty;
+        self.prev_screen = Some(screen);
+    }
+
+    /// Whether the cell at (`row`, `col`) differs between two screens.
+    fn cell_changed(a: &vt100::Screen, b: &vt100::Screen, row: u16, col: u16) -> bool {
+        match (a.cell(row, col), b.cell(row, col)) {
+            (Some(ca), Some(cb)) => {
+                ca.contents() != cb.contents()
+                    || ca.fgcolor() != cb.fgcolor()
+                    || ca.bgcolor() != cb.bgcolor()
+                    || ca.bold() != cb.bold()
+                    || ca.dim() != cb.dim()
+                    || ca.italic() != cb.italic()
+                    || ca.underline() != cb.underline()
+                    || ca.inverse() != cb.inverse()
+            }
+            (Some(_), None) | (None, Some(_)) => true,
+            (None, None) => false,
+        }
+    }
+
+    /// Returns the scroll offset for the currently active screen.
+    fn active_scroll_offset(&self) -> usize {
+        let screen = self.parser.screen();
+        if screen.alternate_screen() {
+            self.alternate_scroll_offset
+        } else {
+            self.normal_scroll_offset
+        }
     }
 
     /// Clamp the current scroll offset to the actual scrollback bounds.
     fn clamp_scroll(&mut self) {
-        let max = self.scrollback_len();
-        if self.scroll_offset > max {
-            self.scroll_offset = max;
+        let max = self.active_scrollback_len();
+        let cur = self.active_scroll_offset();
+        if cur > max {
+            let screen = self.parser.screen();
+            if screen.alternate_screen() {
+                self.alternate_scroll_offset = max;
+            } else {
+                self.normal_scroll_offset = max;
+            }
         }
     }
 
-    /// Maximum scrollback offset currently available (number of history rows).
-    ///
-    /// Computed by probing the parser: setting the view to an out-of-range
-    /// offset clamps to the actual stored history length, which we then read
-    /// back and restore. Keeps the currently visible view intact.
-    pub(crate) fn scrollback_len(&mut self) -> usize {
+    /// Returns the scrollback length for the currently active screen.
+    fn active_scrollback_len(&mut self) -> usize {
+        let offset = if self.parser.screen().alternate_screen() {
+            self.alternate_scroll_offset
+        } else {
+            self.normal_scroll_offset
+        };
         let screen = self.parser.screen_mut();
         screen.set_scrollback(usize::MAX);
         let max = screen.scrollback();
-        screen.set_scrollback(self.scroll_offset);
+        screen.set_scrollback(offset);
         max
     }
 
-    /// Current scrollback view offset.
-    pub(crate) fn scroll_offset(&self) -> usize {
-        self.scroll_offset
+    /// Returns the scrollback length for the currently active screen.
+    pub(crate) fn scrollback_len(&mut self) -> usize {
+        self.active_scrollback_len()
     }
 
-    /// Set the scrollback view offset (clamped to available history).
+    /// Current scrollback view offset (0 = active screen at bottom, >0 = scrolled up).
+    pub(crate) fn scroll_offset(&self) -> usize {
+        self.active_scroll_offset()
+    }
+
+    /// Set the scrollback view offset for the currently active screen.
     pub(crate) fn set_scroll_offset(&mut self, offset: usize) {
-        self.clear_selection();
-        self.scroll_offset = offset;
-        self.clamp_scroll();
-        self.apply_scrollback();
+        let current = self.active_scroll_offset();
+        if current != offset {
+            self.clear_selection();
+            // Update the appropriate offset
+            let screen = self.parser.screen();
+            if screen.alternate_screen() {
+                self.alternate_scroll_offset = offset;
+            } else {
+                self.normal_scroll_offset = offset;
+            }
+            self.clamp_scroll();
+            self.apply_scrollback();
+            self.mark_all_dirty();
+        }
     }
 
     /// Adjust the scrollback view by `delta` lines (positive = up/back,
     /// negative = down/forward). Returns the resulting offset.
     pub(crate) fn scroll_by(&mut self, delta: isize) -> usize {
-        let cur = self.scroll_offset as isize;
+        let cur = self.active_scroll_offset() as isize;
         let next = (cur + delta).max(0);
         self.set_scroll_offset(next as usize);
-        self.scroll_offset
+        self.active_scroll_offset()
     }
 
-    /// Snap the view to the bottom (normal screen).
+    /// Snap the view to the bottom (active screen).
     pub(crate) fn scroll_to_bottom(&mut self) {
         self.set_scroll_offset(0);
     }
 
-    /// Snap the view to the oldest available history row.
+    /// Snap the view to the oldest available history row on the active screen.
     pub(crate) fn scroll_to_top(&mut self) {
-        let max = self.scrollback_len();
+        let max = self.active_scrollback_len();
         self.set_scroll_offset(max);
     }
 
-    /// Apply the current scroll offset to the parser screen view.
+    /// Apply the current scroll offset to the parser screen view for the
+    /// currently active screen.
     fn apply_scrollback(&mut self) {
-        self.parser.screen_mut().set_scrollback(self.scroll_offset);
+        let screen_alt = self.parser.screen().alternate_screen();
+        let offset = if screen_alt {
+            self.alternate_scroll_offset
+        } else {
+            self.normal_scroll_offset
+        };
+        let old_offset = self.parser.screen().scrollback();
+        if old_offset != offset {
+            web_sys::console::log_1(&format!(
+                "APPLY_SCROLLBACK: screen_alt={} old_off={} new_off={} normal={} alt={}",
+                screen_alt, old_offset, offset,
+                self.normal_scroll_offset, self.alternate_scroll_offset
+            ).into());
+        }
+        self.parser.screen_mut().set_scrollback(offset);
     }
 
-    /// Render the current parser screen.
-    ///
     /// Dispatches to the active renderer: Canvas 2D by default, WebGL2
-    /// when it was selected as the fallback.
+    /// when it was selected as the fallback. Honors the `needs_render`
+    /// flag set by `schedule_render` to enable frame coalescing.
     pub(crate) fn render(&mut self) -> Result<(), String> {
+        // Always render (caller decides when to invoke). The `needs_render`
+        // flag only controls full vs selective strategy inside render_canvas2d.
+        self.needs_render = false;
         self.apply_scrollback();
         if let Some(w) = self.webgl.as_ref() {
             let screen = self.parser.screen();
             let (cr, cc) = screen.cursor_position();
             // Hide the block cursor when scrolled into history.
-            let cursor = if self.scroll_offset == 0 {
+            let cursor = if self.active_scroll_offset() == 0 {
                 (cr, cc)
             } else {
                 (u16::MAX, u16::MAX)
@@ -272,17 +441,14 @@ impl TerminalState {
 
     /// Draw the current parser screen with native Canvas 2D text.
     ///
-    /// Each visible cell is painted in CSS pixels on the DPR-scaled canvas:
-    /// Rendering order ensures crisp text with visible selection highlight:
-    /// 1. Clear whole canvas to default background
-    /// 2. Fill background rects for cells with non-default background
-    /// 3. Draw all glyph text (foreground color)
-    /// 4. Fill selection background rects (swapped colors) on top of text
-    /// 5. Draw cursor background and text on top
+    /// Renders either the whole grid (first frame, resize, scroll, selection
+    /// change) or only the cells that changed since the last frame, keeping
+    /// redraw cost proportional to the amount of new output.
     fn render_canvas2d(&mut self) -> Result<(), String> {
-        let ctx = self.ctx.as_ref().ok_or("no renderer")?;
-        let screen = self.parser.screen();
-        let (prows, pcols) = screen.size();
+        // Clone the (cheap) context handle so no borrow of `self` lingers
+        // while the render helpers mutate other fields.
+        let ctx = self.ctx.clone().ok_or("no renderer")?;
+        let (prows, pcols) = self.parser.screen().size();
         let rows = if self.rows > 0 { self.rows } else { prows };
         let cols = if self.cols > 0 { self.cols } else { pcols };
         let cw = self.cell_width;
@@ -291,9 +457,39 @@ impl TerminalState {
         let dpr = web_sys::window()
             .map(|w| w.device_pixel_ratio())
             .unwrap_or(1.0);
+
+        // Full redraw when forced, or when enough of the grid changed that a
+        // selective pass would cost more than just repainting everything.
+        let total = (rows as usize).saturating_mul(cols as usize);
+        let dirty_count = self.dirty_cells.len();
+        let full = self.full_redraw || dirty_count >= total / 2;
+        self.full_redraw = false;
+
+        let dirty = std::mem::take(&mut self.dirty_cells);
+
+        let _ = ctx.set_transform(dpr.max(1.0), 0.0, 0.0, dpr.max(1.0), 0.0, 0.0);
+
+        if full {
+            self.render_full_grid(&ctx, rows, cols, cw, ch, dpr)
+        } else {
+            self.render_dirty_cells(&ctx, rows, cols, cw, ch, dpr, dirty)
+        }
+    }
+
+    /// Repaint the entire grid (first frame, resize, scroll, selection change).
+    fn render_full_grid(
+        &mut self,
+        ctx: &CanvasRenderingContext2d,
+        rows: u16,
+        cols: u16,
+        cw: f64,
+        ch: f64,
+        dpr: f64,
+    ) -> Result<(), String> {
+        let screen = self.parser.screen();
+        let (prows, pcols) = screen.size();
         let css_w = self.canvas.width() as f64 / dpr;
         let css_h = self.canvas.height() as f64 / dpr;
-        let _ = ctx.set_transform(dpr.max(1.0), 0.0, 0.0, dpr.max(1.0), 0.0, 0.0);
 
         // 1. Clear to default background
         ctx.set_fill_style_str(&css_color(DEFAULT_BG));
@@ -391,32 +587,187 @@ impl TerminalState {
             }
         }
 
-        // 5. Cursor: background then text (hidden when scrolled into history)
-        let (cr, cc) = screen.cursor_position();
-        if self.scroll_offset == 0 && (cr as u16) < rows && (cc as u16) < cols {
-            let cell = screen.cell(cr as u16, cc as u16);
-            let (mut fg, mut bg) = if let Some(c) = cell {
-                (
-                    cell_fg_rgb(&c, DEFAULT_FG),
-                    color_to_rgb(c.bgcolor(), DEFAULT_BG),
-                )
+// 5. Cursor: background then text (hidden when scrolled into history)
+        let cur = self.visible_cursor(screen, rows, cols);
+        let cursor_pos = self.draw_cursor(ctx, cur, cw, ch)?;
+        self.prev_cursor = cursor_pos;
+        Ok(())
+    }
+
+    /// Redraw only cells that changed since the last render, plus the cursor.
+    fn render_dirty_cells(
+        &mut self,
+        ctx: &CanvasRenderingContext2d,
+        rows: u16,
+        cols: u16,
+        cw: f64,
+        ch: f64,
+        dpr: f64,
+        mut dirty: Vec<(u16, u16)>,
+    ) -> Result<(), String> {
+        let screen = self.parser.screen();
+        let (prows, pcols) = screen.size();
+        let css_w = self.canvas.width() as f64 / dpr;
+        let css_h = self.canvas.height() as f64 / dpr;
+
+        // Clear the entire canvas to default background so no stale
+        // pixels leak between cells (sub-pixel gaps, cursor highlights, etc.).
+        ctx.set_fill_style_str(&css_color(DEFAULT_BG));
+        ctx.fill_rect(0.0, 0.0, css_w.max(1.0), css_h.max(1.0));
+
+        // Cells to repaint: everything marked dirty, plus the current and
+        // previous cursor cells (cursor highlight must follow the cursor).
+        let cur = self.visible_cursor(screen, rows, cols);
+        if let Some(c) = cur {
+            dirty.push(c);
+        }
+        if let Some(pc) = self.prev_cursor {
+            if pc.0 < rows && pc.1 < cols {
+                dirty.push(pc);
+            }
+        }
+        dirty.sort_unstable();
+        dirty.dedup();
+
+        ctx.set_text_baseline("middle");
+        let mut font = FONT_STACK.to_string();
+        ctx.set_font(&font);
+
+        for &(row, col) in dirty.iter() {
+            // Full-cell base repaint in default background clears any stale
+            // glyph or highlight left by the previous frame.
+            ctx.set_fill_style_str(&css_color(DEFAULT_BG));
+            ctx.fill_rect(col as f64 * cw, row as f64 * ch, cw, ch);
+
+            let cell = if row < prows && col < pcols {
+                screen.cell(row, col)
             } else {
-                (DEFAULT_FG, DEFAULT_BG)
+                None
             };
-            std::mem::swap(&mut fg, &mut bg);
-            ctx.set_fill_style_str(&css_color(bg));
-            ctx.fill_rect(cc as f64 * cw, cr as f64 * ch, cw, ch);
-            ctx.set_fill_style_str(&css_color(fg));
+            let selected = self.selected(row, col);
+
+            // 2. Background if non-default.
+            let bg = match cell {
+                Some(c) => color_to_rgb(c.bgcolor(), DEFAULT_BG),
+                _ => DEFAULT_BG,
+            };
+            if bg != DEFAULT_BG && !selected {
+                ctx.set_fill_style_str(&css_color(bg));
+                ctx.fill_rect(col as f64 * cw, row as f64 * ch, cw, ch);
+            }
+
+            // 3. Selection background BEFORE text.
+            if selected {
+                let (fg0, bg0) = match cell {
+                    Some(c) => (
+                        cell_fg_rgb(&c, DEFAULT_FG),
+                        color_to_rgb(c.bgcolor(), DEFAULT_BG),
+                    ),
+                    _ => (DEFAULT_FG, DEFAULT_BG),
+                };
+                let (mut fg, mut bg) = (fg0, bg0);
+                std::mem::swap(&mut fg, &mut bg);
+                ctx.set_fill_style_str(&css_color(bg));
+                ctx.fill_rect(
+                    col as f64 * cw - CELL_EPSILON,
+                    row as f64 * ch - CELL_EPSILON,
+                    cw + CELL_EPSILON * 2.0,
+                    ch + CELL_EPSILON * 2.0,
+                );
+            }
+
+            // 4. Text.
             if let Some(c) = cell {
                 let s = c.contents();
                 if !s.is_empty() {
-                    if !draw_graphic_cell(ctx, cc as u16, cr as u16, cw, ch, &s, fg) {
-                        let _ = ctx.fill_text(s, cc as f64 * cw, cr as f64 * ch + ch * 0.5);
+                    const SELECTION_FG: u32 = 0x000000;
+                    let fg = cell_fg_rgb(&c, DEFAULT_FG);
+                    let draw_fg = if selected { SELECTION_FG } else { fg };
+                    if draw_fg != DEFAULT_BG {
+                        if draw_graphic_cell(ctx, col, row, cw, ch, s, draw_fg) {
+                            continue;
+                        }
+                        let want = if c.bold() { FONT_STACK_BOLD } else { FONT_STACK };
+                        if font != want {
+                            font = want.to_string();
+                            ctx.set_font(&font);
+                        }
+                        ctx.set_fill_style_str(&css_color(draw_fg));
+                        let _ = ctx.fill_text(
+                            s,
+                            col as f64 * cw,
+                            row as f64 * ch + ch * 0.5,
+                        );
                     }
                 }
             }
         }
+
+        // 5. Cursor drawn last, on top of the regular cell content.
+        let cur = self.visible_cursor(screen, rows, cols);
+        let cursor_pos = self.draw_cursor(ctx, cur, cw, ch)?;
+        self.prev_cursor = cursor_pos;
         Ok(())
+    }
+
+    /// The cursor cell to render, or `None` when scrolled into history.
+    fn visible_cursor(&self, screen: &vt100::Screen, rows: u16, cols: u16) -> Option<(u16, u16)> {
+        let active_offset = if screen.alternate_screen() {
+            self.alternate_scroll_offset
+        } else {
+            self.normal_scroll_offset
+        };
+        if active_offset != 0 {
+            return None;
+        }
+        let (cr, cc) = screen.cursor_position();
+        if (cr as u16) < rows && (cc as u16) < cols {
+            Some((cr as u16, cc as u16))
+        } else {
+            None
+        }
+    }
+
+    /// Schedule a render call for the next `requestAnimationFrame` callback.
+    /// This enables frame coalescing: multiple `process_bytes` calls within a
+    /// single animation frame will only result in one render.
+    pub(crate) fn schedule_render(&mut self) {
+        self.needs_render = true;
+    }
+
+    /// Draw the block cursor (swapped fg/bg + glyph) on top of a cell.
+    /// `cursor` is the cell to draw, or `None` to skip cursor drawing.
+    fn draw_cursor(
+        &mut self,
+        ctx: &CanvasRenderingContext2d,
+        cursor: Option<(u16, u16)>,
+        cw: f64,
+        ch: f64,
+    ) -> Result<Option<(u16, u16)>, String> {
+        let Some((cr, cc)) = cursor else { return Ok(None) };
+        let screen = self.parser.screen();
+        let cell = screen.cell(cr, cc);
+        let (mut fg, mut bg) = if let Some(c) = cell {
+            (
+                cell_fg_rgb(&c, DEFAULT_FG),
+                color_to_rgb(c.bgcolor(), DEFAULT_BG),
+            )
+        } else {
+            (DEFAULT_FG, DEFAULT_BG)
+        };
+        std::mem::swap(&mut fg, &mut bg);
+        ctx.set_fill_style_str(&css_color(bg));
+        ctx.fill_rect(cc as f64 * cw, cr as f64 * ch, cw, ch);
+        ctx.set_fill_style_str(&css_color(fg));
+        if let Some(c) = cell {
+            let s = c.contents();
+            if !s.is_empty() {
+                if !draw_graphic_cell(ctx, cc, cr, cw, ch, s, fg) {
+                    let _ = ctx.fill_text(s, cc as f64 * cw, cr as f64 * ch + ch * 0.5);
+                }
+            }
+        }
+        Ok(Some((cr, cc)))
     }
 
     /// Whether the given cell lies inside the active selection rectangle
@@ -442,19 +793,27 @@ impl TerminalState {
         self.selection_mode = SelectionMode::Linear;
         self.selection_start = Some((row, col));
         self.selection_end = None;
+        self.mark_all_dirty();
     }
 
     /// Handle selection update
     pub(crate) fn handle_selection_update(&mut self, row: u16, col: u16) {
         if let Some(ref mut end) = self.selection_end {
-            *end = (row, col);
+            if *end != (row, col) {
+                *end = (row, col);
+                self.mark_all_dirty();
+            }
         } else if let Some(ref _start) = self.selection_start {
             self.selection_end = Some((row, col));
+            self.mark_all_dirty();
         }
     }
 
     /// Clear the active selection (reset both anchor and end to None)
     pub(crate) fn clear_selection(&mut self) {
+        if self.selection_start.is_some() || self.selection_end.is_some() {
+            self.mark_all_dirty();
+        }
         self.selection_start = None;
         self.selection_end = None;
         self.selection_mode = SelectionMode::None;

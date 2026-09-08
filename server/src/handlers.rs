@@ -13,7 +13,6 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::session::{get_or_create_session, pty_size, pty_write, AppState};
@@ -246,17 +245,17 @@ async fn handle_socket(
         _ = ws_recv_task => {},
     }
 
-    // Release this client. When the last client disconnects, drop the session
-    // (closing the PTY master fds, which SIGHUPs the shell) and remove it
-    // from the map so a fresh session is spawned on the next connect.
-    if crate::session::drop_connection(&session.connections) {
-        let mut sessions = state.sessions.write().await;
-        if sessions
-            .get(&session_id)
-            .map(|s| Arc::ptr_eq(s, &session))
-            .unwrap_or(false)
-        {
-            sessions.remove(&session_id);
-        }
-    }
+    // Release this client. The session is kept alive so that a refresh of the
+    // terminal page will re-use the existing session rather than creating a
+    // fresh one. (Closing the PTY master fds would reset the shell, which is
+    // undesired for a persistent terminal session.)
+    //
+    // NOTE: We do NOT remove the session from the map here. The session persists
+    // until the server process restarts, ensuring that a refresh lands on the
+    // same session and the terminal state (scrollback, cursor position, etc.)
+    // is preserved across page reloads.
+    //
+    // If a true session expiry is ever needed, it can be added as a background
+    // TTL task later.
+    let _ = crate::session::drop_connection(&session.connections);
 }

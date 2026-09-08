@@ -61,7 +61,7 @@ pub fn process_bytes(bytes: &[u8]) -> Result<String, JsValue> {
             .as_mut()
             .ok_or_else(|| JsValue::from("init() not called"))?;
         state.process_bytes(bytes);
-        state.render().map_err(|e| JsValue::from(e))?;
+        state.schedule_render();
         Ok(serde_json::json!({
             "processed": true,
             "byte_count": bytes.len(),
@@ -97,6 +97,7 @@ pub fn repaint() -> Result<(), JsValue> {
         let state = guard
             .as_mut()
             .ok_or_else(|| JsValue::from("init() not called"))?;
+        state.mark_all_dirty();
         state.render().map_err(|e| JsValue::from(e))
     })
 }
@@ -133,6 +134,7 @@ pub fn handle_resize(width: i32, height: i32) -> Result<(), JsValue> {
         let rows = rows.max(1);
         state.resize_screen(rows, cols);
         state.set_dims(rows, cols);
+        state.mark_all_dirty();
         if let Some(w) = state.webgl_mut() {
             w.cell_w = (cw * dpr).ceil() as u32;
             w.cell_h = (ch * dpr).ceil() as u32;
