@@ -103,6 +103,7 @@ struct AppState {
 #[derive(Deserialize)]
 struct WsQuery {
     s: Option<String>,
+    dir: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -203,11 +204,12 @@ async fn ws_handler(
         .s
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "default".to_string());
+    let start_dir = query.dir;
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, start_dir))
 }
 
-async fn get_or_create_session(state: &AppState, session_id: &str) -> Arc<Session> {
+async fn get_or_create_session(state: &AppState, session_id: &str, start_dir: Option<&str>) -> Arc<Session> {
     // Check if session already exists
     {
         let sessions = state.sessions.read().await;
@@ -236,6 +238,9 @@ async fn get_or_create_session(state: &AppState, session_id: &str) -> Arc<Sessio
     let mut cmd = CommandBuilder::new(shell);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    if let Some(dir) = start_dir {
+        cmd.cwd(dir);
+    }
 
     let _child = pair
         .slave
@@ -295,8 +300,8 @@ async fn get_or_create_session(state: &AppState, session_id: &str) -> Arc<Sessio
     session
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, session_id: String) {
-    let session = get_or_create_session(&state, &session_id).await;
+async fn handle_socket(socket: WebSocket, state: AppState, session_id: String, start_dir: Option<String>) {
+    let session = get_or_create_session(&state, &session_id, start_dir.as_deref()).await;
     session.connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
