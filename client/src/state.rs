@@ -8,7 +8,7 @@ use js_sys::Function;
 use std::cell::RefCell;
 use vt100::Parser;
 use wasm_bindgen::{JsCast, JsValue};
-use web_sys::{console, CanvasRenderingContext2d};
+use web_sys::CanvasRenderingContext2d;
 
 use crate::color::{cell_fg_rgb, color_to_rgb, DEFAULT_BG, DEFAULT_FG};
 use crate::graphics::draw_graphic_cell;
@@ -21,6 +21,51 @@ use crate::selection::SelectionMode;
 pub(crate) const DEFAULT_ROWS: u16 = 24;
 pub(crate) const DEFAULT_COLS: u16 = 80;
 pub(crate) const SCROLLBACK_LEN: usize = 1024;
+
+/// The `vt100` crate implements the ANSI save/restore cursor sequences
+/// (`ESC 7`/`ESC 8`) but silently ignores the CSI equivalents (`CSI s`/`CSI u`)
+/// that many TUIs (opencode, zsh) emit. Because DECSET/DECRESET 1049 save and
+/// restore the normal-grid cursor via `decsc`/`decrc`, ignoring `CSI s`/`CSI u`
+/// makes the cursor land at the home position after exiting the alternate
+/// screen. This maps `CSI s`/`CSI u` onto the implemented `ESC 7`/`ESC 8`
+/// before the bytes reach the parser.
+///
+/// Sequence tails that may straddle a `process_bytes` chunk boundary are
+/// carried in `carry` across calls.
+pub(crate) fn normalize_save_restore(bytes: &[u8], carry: &mut Vec<u8>) -> Vec<u8> {
+    let mut feed = std::mem::take(carry);
+    feed.extend_from_slice(bytes);
+
+    let carry_from = if feed.len() >= 2 && feed[feed.len() - 2] == 0x1b && feed[feed.len() - 1] == b'['
+    {
+        feed.len() - 2
+    } else if feed.len() >= 1 && feed[feed.len() - 1] == 0x1b {
+        feed.len() - 1
+    } else {
+        feed.len()
+    };
+
+    let mut out = Vec::with_capacity(feed.len());
+    let mut i = 0;
+    while i < carry_from {
+        if i + 2 < feed.len()
+            && feed[i] == 0x1b
+            && feed[i + 1] == b'['
+            && (feed[i + 2] == b's' || feed[i + 2] == b'u')
+        {
+            out.push(0x1b);
+            out.push(if feed[i + 2] == b's' { b'7' } else { b'8' });
+            i += 3;
+        } else {
+            out.push(feed[i]);
+            i += 1;
+        }
+    }
+    if carry_from < feed.len() {
+        *carry = feed[carry_from..].to_vec();
+    }
+    out
+}
 
 /// Terminal state fields.
 ///
@@ -74,6 +119,9 @@ pub(crate) struct TerminalState {
     /// True when a render pass has been scheduled via `schedule_render`
     /// and needs to be flushed on the next JS animation frame.
     needs_render: bool,
+    /// Incomplete tail of an ESC sequence from the previous `process_bytes`
+    /// call that may yet form a `CSI s`/`CSI u` cursor save/restore.
+    csi_su_carry: Vec<u8>,
 }
 
 impl TerminalState {
@@ -186,6 +234,7 @@ impl TerminalState {
             full_redraw: true,
             prev_cursor: None,
             needs_render: false,
+            csi_su_carry: Vec::new(),
         })
     }
 
@@ -201,7 +250,8 @@ impl TerminalState {
         if self.prev_screen.is_none() {
             self.prev_screen = Some(self.parser.screen().clone());
         }
-        self.parser.process(bytes);
+        let normalized = normalize_save_restore(bytes, &mut self.csi_su_carry);
+        self.parser.process(&normalized);
 
         let screen_after = self.parser.screen().alternate_screen();
 
@@ -473,7 +523,8 @@ impl TerminalState {
             self.render_full_grid(&ctx, rows, cols, cw, ch, dpr)
         } else {
             self.render_dirty_cells(&ctx, rows, cols, cw, ch, dpr, dirty)
-        }
+        }?;
+        Ok(())
     }
 
     /// Repaint the entire grid (first frame, resize, scroll, selection change).

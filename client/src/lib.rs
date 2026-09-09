@@ -259,4 +259,50 @@ mod tests {
         let screen = parser.screen();
         assert_eq!(extract_selection(&screen, (0, 2), (0, 2)), "");
     }
+
+    #[test]
+    fn normalize_maps_csi_save_restore() {
+        use crate::state::normalize_save_restore;
+        let mut carry = Vec::new();
+        assert_eq!(normalize_save_restore(b"\x1b[s\x1b[u", &mut carry), b"\x1b7\x1b8");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn normalize_leaves_other_sequences_untouched() {
+        use crate::state::normalize_save_restore;
+        let mut carry = Vec::new();
+        assert_eq!(
+            normalize_save_restore(b"\x1b[H\x1b[?1049h\x1b[?1049l\x1b[K", &mut carry),
+            b"\x1b[H\x1b[?1049h\x1b[?1049l\x1b[K"
+        );
+    }
+
+    #[test]
+    fn normalize_carries_sequences_across_chunk_boundaries() {
+        use crate::state::normalize_save_restore;
+        let mut carry = Vec::new();
+        assert_eq!(normalize_save_restore(b"pre\x1b[", &mut carry), b"pre");
+        assert_eq!(carry, b"\x1b[");
+        assert_eq!(normalize_save_restore(b"s mid", &mut carry), b"\x1b7 mid");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn normalize_carries_lone_escape() {
+        use crate::state::normalize_save_restore;
+        let mut carry = Vec::new();
+        assert_eq!(normalize_save_restore(b"x\x1b", &mut carry), b"x");
+        assert_eq!(carry, b"\x1b");
+        assert_eq!(normalize_save_restore(b"[u", &mut carry), b"\x1b8");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn normalize_handles_complete_sequence_at_chunk_end() {
+        use crate::state::normalize_save_restore;
+        let mut carry = Vec::new();
+        assert_eq!(normalize_save_restore(b"\x1b[s", &mut carry), b"\x1b7");
+        assert!(carry.is_empty());
+    }
 }
