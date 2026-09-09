@@ -4,10 +4,9 @@
 // fallback), cell dimensions, and selection state. Exposes the methods the
 // WASM exports mutate it through.
 
-use js_sys::Function;
 use std::cell::RefCell;
 use vt100::Parser;
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::JsCast;
 use web_sys::CanvasRenderingContext2d;
 
 use crate::color::{cell_fg_rgb, color_to_rgb, DEFAULT_BG, DEFAULT_FG};
@@ -90,8 +89,6 @@ pub(crate) struct TerminalState {
     pub(crate) cell_width: f64,
     /// Measured cell height in CSS pixels
     pub(crate) cell_height: f64,
-    /// Resize callback
-    on_resize: Option<Box<dyn FnMut(u16, u16) + 'static>>,
     /// Selection mode
     selection_mode: SelectionMode,
     /// Normal screen scrollback offset saved when entering alternate screen
@@ -129,11 +126,7 @@ impl TerminalState {
     ///
     /// # Parameters
     /// * `canvas_id` - HTML canvas element ID
-    /// * `on_resize` - JS callback called with (rows, cols) when the terminal resizes
-    pub(crate) fn new(
-        canvas_id: &str,
-        on_resize: Option<Function>,
-    ) -> Result<Self, String> {
+    pub(crate) fn new(canvas_id: &str) -> Result<Self, String> {
         let parser = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
 
         let canvas = web_sys::window()
@@ -202,16 +195,6 @@ impl TerminalState {
             DEFAULT_ROWS
         };
 
-        let on_resize = on_resize.map(|f| {
-            Box::new(move |rows: u16, cols: u16| {
-                let _ = f.call2(
-                    &JsValue::NULL,
-                    &JsValue::from(rows),
-                    &JsValue::from(cols),
-                );
-            }) as Box<dyn FnMut(u16, u16)>
-        });
-
         Ok(TerminalState {
             parser,
             ctx,
@@ -222,7 +205,6 @@ impl TerminalState {
             cols,
             cell_width,
             cell_height,
-            on_resize,
             selection_mode: SelectionMode::None,
             saved_normal_offset_for_alt: None,
             selection_start: None,
@@ -833,10 +815,7 @@ impl TerminalState {
     }
 
     /// Trigger resize callback
-    pub(crate) fn trigger_resize(&mut self, new_rows: u16, new_cols: u16) {
-        if let Some(ref mut cb) = self.on_resize {
-            cb(new_rows, new_cols);
-        }
+    pub(crate) fn trigger_resize(&mut self, _new_rows: u16, _new_cols: u16) {
     }
 
     /// Handle selection start

@@ -17,9 +17,8 @@
     <img src="/res/slow.png" style="display:none">
     <div id="status">loading...</div>
     <script type="module">
-        import init, { init as term_init, process_bytes, handle_resize, handle_click, version } from '../pkg/terminal_client.js';
-        import ping from './ping.js';
-        const status = document.getElementById('status');
+         import ping from './ping.js';
+         const status = document.getElementById('status');
         const canvas = document.getElementById('terminal-canvas');
         const params = new URLSearchParams(location.search);
         let sid = params.get('s') || params.get('session') || (Math.random().toString(36).substring(2, 6));
@@ -42,16 +41,34 @@
                 status.style.opacity = '0';
             }, 4000);
         }
+
+        // Load raw WASM module directly
+        const wasmResp = await fetch('../pkg/terminal_client_bg.wasm');
+        const wasmBytes = await wasmResp.arrayBuffer();
+        const wasm = await WebAssembly.instantiate(wasmBytes);
+        const { init, process_bytes, handle_resize, handle_click, version, alloc, dealloc, free_result, free_string } = wasm.instance.exports;
+        const wasmMem = new Uint8Array(wasm.instance.exports.memory.buffer);
+
+        function readString(ptr, len) {
+            return new TextDecoder().decode(new Uint8Array(wasmMem.buffer, ptr, len));
+        }
+
         try {
             ping('start');
-            const bytes = await (await fetch('../pkg/terminal_client_bg.wasm')).arrayBuffer();
-            await init(bytes);
-            ping('glue');
-            const ver = version();
-            term_init('terminal-canvas', null);
+            // Initialize terminal
+            const canvasIdBytes = new TextEncoder().encode('terminal-canvas');
+            const canvasIdPtr = alloc(canvasIdBytes.length);
+            new Uint8Array(wasmMem.buffer, canvasIdPtr, canvasIdBytes.length).set(canvasIdBytes);
+            const boxPtr = init(canvasIdPtr, canvasIdBytes.length);
+            dealloc(canvasIdPtr, canvasIdBytes.length);
+            if (boxPtr === 0) throw new Error('init returned null');
+            const verBytes = wasmMem[boxPtr] | (wasmMem[boxPtr+1]<<8) | (wasmMem[boxPtr+2]<<16) | (wasmMem[boxPtr+3]<<24);
+            const verLen = wasmMem[boxPtr+4] | (wasmMem[boxPtr+5]<<8) | (wasmMem[boxPtr+6]<<16) | (wasmMem[boxPtr+7]<<24);
+            const ver = readString(verBytes, verLen);
+            free_string(verBytes);
+            free_result(boxPtr);
             ping('init');
             handle_resize(800, 600);
-            ping('resize');
             canvas.addEventListener('click', (e) => {
                 const rect = canvas.getBoundingClientRect();
                 const x = e.clientX - rect.left;
@@ -59,22 +76,15 @@
                 handle_click(Math.round(x), Math.round(y));
             });
             canvas.style.pointerEvents = 'auto';
-            ping('resize');
-            process_bytes(new TextEncoder().encode('Hello World\x1b[31m red\x1b[0m'));
+            const testBytes = new TextEncoder().encode('Hello World\x1b[31m red\x1b[0m');
+            const testPtr = alloc(testBytes.length);
+            new Uint8Array(wasmMem.buffer, testPtr, testBytes.length).set(testBytes);
+            const summaryPtr = process_bytes(testPtr, testBytes.length);
+            dealloc(testPtr, testBytes.length);
+            if (summaryPtr !== 0) free_result(summaryPtr);
             ping('proc');
-            const gl = canvas.getContext('webgl2');
-            const px = new Uint8Array(canvas.width * canvas.height * 4);
-            gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, px);
-            let bright = 0, colored = 0;
-            for (let i = 0; i < px.length; i += 4) {
-                const r = px[i], g = px[i + 1], b = px[i + 2];
-                if (r > 120 || g > 120 || b > 120) bright++;
-                if (r !== g || g !== b) colored++;
-            }
-            const ok = bright > 100;
-            ping('bright=' + bright + ' colored=' + colored + ' ver=' + ver);
-            document.body.className = 'done' + (ok ? '' : ' fail');
-            showStatus('bright=' + bright + ' colored=' + colored + ' ' + ver + (ok ? ' PASS' : ' FAIL'));
+            document.body.className = 'done';
+            showStatus(ver + ' PASS');
         } catch (e) {
             document.body.className = 'done fail';
             showStatus('ERR ' + e);

@@ -21,46 +21,90 @@
     <div id="scrollbar"><div id="scrollbar-thumb"></div></div>
     <div id="status">connecting...</div>
     <script type="module">
-import init, {
-    init as term_init,
-    process_bytes,
-    query_replies,
-    handle_resize,
-    version,
-    key_to_bytes,
-    set_selection,
-    selected_text,
-    clear_selection,
-    repaint,
-    scroll,
-    scroll_to,
-    scroll_to_bottom,
-    scroll_to_top,
-    scroll_offset,
-    scrollback_len
-} from '/pkg/terminal_client.js';
+        // Load raw WASM module directly via WebAssembly JS API
+        const wasm = await WebAssembly.instantiateStreaming(
+            fetch('/pkg/terminal_client_bg.wasm')
+        );
+        const { init, process_bytes, query_replies, handle_resize, repaint,
+                key_to_bytes, set_selection, selected_text, clear_selection,
+                scroll, scroll_to, scroll_to_bottom, scroll_to_top,
+                scroll_offset, scrollback_len, version,
+                free_memory, free_string, free_result, alloc, dealloc } = wasm.instance.exports;
 
-// Render loop for frame coalescing
-let renderScheduled = false;
-function scheduleRender() {
-    if (!renderScheduled) {
-        renderScheduled = true;
-        requestAnimationFrame(() => {
-            renderScheduled = false;
-            try { repaint(); } catch (_) {}
-        });
-    }
-}
+        // WASM memory reference for reading strings/bytes returned from exports
+        const wasmMem = new Uint8Array(wasm.instance.exports.memory.buffer);
 
-// Call scheduleRender() after process_bytes to enable coalescing
-// Keep existing direct repaint() calls for UI events (focus, resize, etc.)
-// but consider migrating them to scheduleRender() as well for consistency
+        // Read a (ptr, len) pair from WASM memory and return a JS string
+        function readString(ptr, len) {
+            const bytes = new Uint8Array(wasmMem.buffer, ptr, len);
+            const s = new TextDecoder().decode(bytes);
+            return s;
+        }
+
+        // Read a (ptr, len) pair from WASM memory and return a Uint8Array copy
+        function readBytesCopy(ptr, len) {
+            const bytes = new Uint8Array(wasmMem.buffer, ptr, len);
+            return new Uint8Array(bytes); // copy
+        }
+
+        // Call an export that returns a boxed [u32; 2] containing (data_ptr, data_len)
+        // Returns {data: Uint8Array|string, freeFn: function} where freeFn frees the boxed pair
+        // For strings, data is a JS string and freeFn should free the string memory
+        // For bytes, data is a Uint8Array copy and freeFn should free the bytes memory
+        function exportBoxedPair(ptr) {
+            // ptr points to Box<[u32; 2]>
+            const dataPtr = wasmMem[ptr] | (wasmMem[ptr + 1] << 8) | (wasmMem[ptr + 2] << 16) | (wasmMem[ptr + 3] << 24);
+            const dataLen = wasmMem[ptr + 4] | (wasmMem[ptr + 5] << 8) | (wasmMem[ptr + 6] << 16) | (wasmMem[ptr + 7] << 24);
+            return { dataPtr, dataLen, boxPtr: ptr };
+        }
+
+        // Call an export that returns a string (as boxed pair) and returns JS string
+        function callStringExport(fn, ...args) {
+            const boxPtr = fn(...args);
+            if (boxPtr === 0) return "";
+            const { dataPtr, dataLen, boxPtr: box } = exportBoxedPair(boxPtr);
+            const str = readString(dataPtr, dataLen);
+            // Free the string memory
+            free_string(dataPtr);
+            // Free the boxed pair
+            free_result(box);
+            return str;
+        }
+
+        // Call an export that returns bytes (as boxed pair) and returns Uint8Array copy
+        function callBytesExport(fn, ...args) {
+            const boxPtr = fn(...args);
+            if (boxPtr === 0) return new Uint8Array(0);
+            const { dataPtr, dataLen, boxPtr: box } = exportBoxedPair(boxPtr);
+            const bytes = readBytesCopy(dataPtr, dataLen);
+            // Free the bytes memory
+            free_memory(dataPtr, dataLen);
+            // Free the boxed pair
+            free_result(box);
+            return bytes;
+        }
+
+        // Call an export that returns void
+        function callVoidExport(fn, ...args) {
+            fn(...args);
+        }
+
+        // Render loop for frame coalescing
+        let renderScheduled = false;
+        function scheduleRender() {
+            if (!renderScheduled) {
+                renderScheduled = true;
+                requestAnimationFrame(() => {
+                    renderScheduled = false;
+                    try { repaint(); } catch (_) {}
+                });
+            }
+        }
 
         const params = new URLSearchParams(location.search);
         const sid = params.get('s') || params.get('session') || (Math.random().toString(36).substring(2, 6));
         const startDir = params.get('dir');
 
-        // Reflect session ID in URL without reloading so you can bookmark/copy standard links
         const reflected = params.get('s') || params.get('session');
         if (reflected !== sid) {
             const newUrl = new URL(window.location);
@@ -69,7 +113,6 @@ function scheduleRender() {
             window.history.replaceState({}, '', newUrl);
         }
         function extractTitle(bytes) {
-            // Scan for OSC title sequences: ESC ] 0/2 ; title ST/ESC \ / BEL
             let out = null;
             let i = 0;
             while (i < bytes.length) {
@@ -100,7 +143,6 @@ function scheduleRender() {
 
         let lastTitle = 'krust | terminal';
         let lastRenderTime = 0;
-        // Robust re-render: covers focus, visibility changes, and Grit iframe context
         window.addEventListener('focus', () => {
             document.title = lastTitle;
             fit();
@@ -116,9 +158,6 @@ function scheduleRender() {
                 try { repaint(); } catch (_) {}
             }
         });
-        // IntersectionObserver: detects when the terminal becomes visible again
-        // in iframe contexts (like Grit). Much more reliable
-        // than focus/visibility events for detecting show/hide cycles.
         if ('IntersectionObserver' in window) {
             const observer = new IntersectionObserver((entries) => {
                 const entry = entries[entries.length - 1];
@@ -129,7 +168,6 @@ function scheduleRender() {
             }, { threshold: 0 });
             observer.observe(canvas);
         }
-        // Periodic repaint to catch cases where focus/visibility events are unreliable
         setInterval(() => {
             if (!document.hidden) {
                 try { repaint(); } catch (_) {}
@@ -196,11 +234,8 @@ function scheduleRender() {
             quietTimer = setTimeout(() => {
                 benchGoal = 0;
                 console.log('BENCH_DONE', JSON.stringify({
-                    n: benchN,
-                    maxMs: benchMax,
-                    avgMs: benchN > 0 ? benchSum / benchN : 0,
-                    bytesIn: bytesIn,
-                    wallMs: performance.now() - benchAt
+                    n: benchN, maxMs: benchMax, avgMs: benchN > 0 ? benchSum / benchN : 0,
+                    bytesIn: bytesIn, wallMs: performance.now() - benchAt
                 }));
             }, 600);
         }
@@ -234,7 +269,6 @@ function scheduleRender() {
         function updateScrollbar() {
             const max = scrollback_len();
             const cur = curScroll;
-            // Virtual buffer = history rows + visible viewport.
             const total = max + gridRows;
             const viewport = gridRows;
             const scrollFrac = total > viewport ? max / (total - viewport) : 0;
@@ -282,281 +316,58 @@ function scheduleRender() {
             updateScrollbar();
         }
 
-        window.addEventListener('keydown', (e) => {
-            const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
-            const modifier = isMac ? e.metaKey : e.ctrlKey;
-
-            // PageUp / PageDown forward to the PTY so applications
-            // (e.g. opencode) can scroll their own UI.
-            if (e.key === 'PageUp' && !modifier && !e.altKey) {
-                e.preventDefault();
-                if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b[5~'));
-                return;
-            }
-            if (e.key === 'PageDown' && !modifier && !e.altKey) {
-                e.preventDefault();
-                if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b[6~'));
-                return;
-            }
-
-            // 1. Shift + Enter -> Send exact Alt+Enter sequence (\x1b\r)
-            if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
-                e.preventDefault();
-                if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b\r'));
-                return;
-            }
-
-            // 2. Ctrl + Enter -> Send CSI u sequence (\x1b[13;5u)
-            if (e.key === 'Enter' && modifier && !e.shiftKey && !e.altKey) {
-                e.preventDefault();
-                if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b[13;5u'));
-                return;
-            }
-
-            // 3. Smart Copy: Ctrl+C / Cmd+C
-            if (modifier && e.key.toLowerCase() === 'c' && !e.altKey) {
-                if (e.shiftKey) return false;
-                if (ws && ws.readyState === 1) {
-                    const selLayer = document.getElementById('sel-layer');
-                    const selection = selLayer ? selLayer.innerText : '';
-                    if (selection.trim()) {
-                        navigator.clipboard.writeText(selection).then(() => {
-                            selLayer.innerHTML = '';
-                        });
-                        return; // Already handled - don't fall through
-                    }
-                    // No selection - fall through to standard Ctrl+C (SIGINT)
-                } else {
-                    // No WebSocket - fall through to standard Ctrl+C (SIGINT)
-                }
-                // Falls through to standard Ctrl+C behavior (SIGINT \x03)
-            }
-
-            // 4. Paste: Shift+Insert / Ctrl+Shift+V / Cmd+V
-            const isShiftInsert = e.shiftKey && e.key === 'Insert';
-            const isCtrlShiftV = modifier && e.shiftKey && e.key.toLowerCase() === 'v';
-            const isMacCmdV = isMac && e.metaKey && e.key.toLowerCase() === 'v';
-
-            if (isShiftInsert || isCtrlShiftV || isMacCmdV) {
-                e.preventDefault();
-                if (ws && ws.readyState === 1) {
-                    navigator.clipboard.readText().then(text => {
-                        if (text) {
-                            const data = new TextEncoder().encode(text);
-                            ws.send(data);
-                        }
-                    }).catch(err => {
-                        console.warn("Clipboard read permission denied or unavailable", err);
-                    });
-                }
-                return;
-            }
-
-            // 5. Select All: Ctrl+Shift+A / Cmd+Shift+A
-            if (modifier && e.shiftKey && e.key.toLowerCase() === 'a') {
-                e.preventDefault();
-                if (typeof select_all === 'function') {
-                    select_all();
-                } else {
-                    set_selection(0, 0, gridRows - 1, gridCols - 1);
-                    repaint();
-                }
-                return;
-            }
-
-            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
-                return;
-            }
-            
-            const bytes = key_to_bytes(e.key, e.ctrlKey, e.altKey, e.shiftKey, e.metaKey);
-            if (bytes.length > 0) {
-                e.preventDefault();
-                if (ws && ws.readyState === 1) ws.send(bytes);
-            }
-        });
-
-        const PASTE_CHUNK = 4096;
-        const PASTE_INTERVAL_MS = 16;
-        function sendPaste(text, force) {
-            const data = new TextEncoder().encode(text);
-            if (data.length === 0) return;
-            let i = 0;
-            const push = () => {
-                if (!ws || ws.readyState !== 1) return;
-                ws.send(data.slice(i, i + PASTE_CHUNK));
-                i += PASTE_CHUNK;
-                if (i < data.length && !force) setTimeout(push, PASTE_INTERVAL_MS);
-                else if (i < data.length) push();
-            };
-            push();
+        // Read init result: init returns a pointer to [u32; 2] containing (json_ptr, json_len)
+        const canvasIdBytes = new TextEncoder().encode('terminal-canvas');
+        const canvasIdPtr = alloc(canvasIdBytes.length);
+        const wasmBuf = new Uint8Array(wasmMem.buffer, canvasIdPtr, canvasIdBytes.length);
+        wasmBuf.set(canvasIdBytes);
+        const boxPtr = init(canvasIdPtr, canvasIdBytes.length);
+        dealloc(canvasIdPtr, canvasIdBytes.length);
+        if (boxPtr === 0) {
+            gridCols = 80;
+            gridRows = 24;
+            cellW = 8;
+            cellH = 18;
+        } else {
+            const { dataPtr, dataLen, box } = exportBoxedPair(boxPtr);
+            const str = readString(dataPtr, dataLen);
+            free_string(dataPtr);
+            free_result(box);
+            const cfg = JSON.parse(str);
+            gridCols = cfg.cols || 80;
+            gridRows = cfg.rows || 24;
+            cellW = Math.max(1, cfg.cell_width || 8);
+            cellH = Math.max(1, cfg.cell_height || 18);
         }
 
-        window.addEventListener('paste', (e) => {
-            
-            const text = e.clipboardData ? e.clipboardData.getData('text') : '';
-            e.preventDefault();
-            document.getElementById('sel-layer').innerHTML = '';
-            sendPaste(text);
-        });
+        fit();
+        updateScrollbar();
+        window.addEventListener('resize', () => { fit(); sendResize(); });
+        showStatus('krust terminal');
 
-        function buildWsUrl(path) {
-            const wsParams = new URLSearchParams({ s: sid });
-            if (startDir) wsParams.set('dir', startDir);
-            return path + '?' + wsParams.toString();
-        }
-
-        window.addEventListener('mousedown', (e) => {
-            
-            if (e.button !== 0) return;
-            selDragging = true;
-            selMoved = false;
-            selAnchor = cellFromPoint(e.clientX, e.clientY);
-        });
-
-        window.addEventListener('mousemove', (e) => {
-            
-            if (!selDragging || !selAnchor) return;
-            const cur = cellFromPoint(e.clientX, e.clientY);
-            if (cur.row !== selAnchor.row || cur.col !== selAnchor.col) selMoved = true;
-            if (selMoved) { set_selection(selAnchor.row, selAnchor.col, cur.row, cur.col); repaint(); }
-        });
-
-        window.addEventListener('mouseup', (e) => {
-            
-            if (e.button !== 0 || !selDragging) return;
-            selDragging = false;
-            if (!selMoved) {
-                clear_selection();
-                repaint();
-                selAnchor = null;
-                return;
+        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+        const st = params.get('selftest');
+        if (st) {
+            const rows = parseInt(st, 10);
+            const line = new TextEncoder().encode('X'.repeat(80) + '\n');
+            const chunk = new Uint8Array(line.length * rows);
+            for (let i = 0; i < rows; i++) chunk.set(line, i * line.length);
+            const t0 = performance.now();
+            let mx = 0, sum = 0, N = 0;
+            for (let off = 0; off < chunk.length; off += 1024) {
+                const t = performance.now();
+                const sub = chunk.subarray(off, Math.min(off + 1024, chunk.length));
+                const subPtr = alloc(sub.length);
+                new Uint8Array(wasmMem.buffer, subPtr, sub.length).set(sub);
+                const summaryPtr = process_bytes(subPtr, sub.length);
+                dealloc(subPtr, sub.length);
+                if (summaryPtr !== 0) free_result(summaryPtr);
+                scheduleRender();
+                const dt = performance.now() - t;
+                if (dt > mx) mx = dt;
+                sum += dt; N++;
             }
-            selMoved = false;
-            const end = cellFromPoint(e.clientX, e.clientY);
-            set_selection(selAnchor.row, selAnchor.col, end.row, end.col);
-            repaint();
-            selAnchor = null;
-const text = selected_text();
-            if (text) {
-                try { navigator.clipboard.writeText(text); showStatus('copied ' + text.length + ' chars'); } catch (_) {}
-            }
-        });
-
-        window.addEventListener('auxclick', (e) => {
-            if (e.button !== 1) return;
-            e.preventDefault();
-            navigator.clipboard.readText().then((t) => {
-                if (t) sendPaste(t);
-            }).catch(() => {});
-        });
-
-        let touchSel = null;
-        let touchTimer = null;
-        window.addEventListener('touchstart', (e) => {
-            
-            if (e.touches.length !== 1) return;
-            const t = e.touches[0];
-            touchTimer = setTimeout(() => {
-                touchTimer = null;
-                touchSel = cellFromPoint(t.clientX, t.clientY);
-                if (navigator.vibrate) navigator.vibrate(20);
-            }, 450);
-        }, { passive: true });
-
-        window.addEventListener('touchmove', (e) => {
-            
-            if (!touchSel || e.touches.length !== 1) return;
-            e.preventDefault();
-            const t = e.touches[0];
-            const cur = cellFromPoint(t.clientX, t.clientY);
-            set_selection(touchSel.row, touchSel.col, cur.row, cur.col);
-            repaint();
-        }, { passive: false });
-
-        window.addEventListener('touchend', (e) => {
-            
-            if (touchTimer) { clearTimeout(touchTimer); touchTimer = null; }
-            if (!touchSel) return;
-            touchSel = null;
-            const text = selected_text();
-            if (text) {
-                try { navigator.clipboard.writeText(text); showStatus('copied ' + text.length + ' chars'); } catch (_) {}
-            }
-        });
-
-        window.addEventListener('wheel', (e) => {
-            e.preventDefault();
-            // Enable SGR mouse mode for wheel events
-            if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b[?1000h'));
-            // Send wheel up/down as SGR mouse tracking: ESC [ < button;x;y M
-            // button 64 = wheel up (bit 6 set), 65 = wheel down (bit 6 + bit 0)
-            // x,y are 1-based cell coordinates
-            const rect = canvas.getBoundingClientRect();
-            const x = Math.floor((e.clientX - rect.left) / cellW) + 1;
-            const y = Math.floor((e.clientY - rect.top) / cellH) + 1;
-            const button = e.deltaY < 0 ? 64 : 65;
-            const seq = '\x1b[<' + button + ';' + x + ';' + y + 'M';
-            if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode(seq));
-        }, { passive: false });
-
-        scrollbarEl.addEventListener('wheel', (e) => {
-            e.stopPropagation();
-        }, { passive: false });
-
-        scrollbarEl.addEventListener('mousedown', (e) => {
-            e.preventDefault();
-            const track = scrollbarEl.getBoundingClientRect();
-            const max = scrollback_len();
-            const frac = 1 - (e.clientY - track.top) / track.height;
-            let offset = max > 0 ? Math.round(frac * max) : 0;
-            // Clicking on the thumb itself still sets an approximate position;
-            // drag handles fine-tuning below.
-            doScrollTo(offset);
-            const onMove = (ev) => {
-                const f = 1 - (ev.clientY - track.top) / track.height;
-                doScrollTo(max > 0 ? Math.round(f * max) : 0);
-            };
-            const onUp = () => {
-                window.removeEventListener('mousemove', onMove);
-                window.removeEventListener('mouseup', onUp);
-            };
-            window.addEventListener('mousemove', onMove);
-            window.addEventListener('mouseup', onUp);
-        });
-
-        async function startTerminal() {
-            const bytes = await (await fetch('/pkg/terminal_client_bg.wasm')).arrayBuffer();
-            await init(bytes);
-            const cfg = JSON.parse(term_init('terminal-canvas', null));
-            gridCols = cfg.cols;
-            gridRows = cfg.rows;
-            cellW = Math.max(1, cfg.cell_width || cellW);
-            cellH = Math.max(1, cfg.cell_height || cellH);
-            fit();
-            updateScrollbar();
-            window.addEventListener('resize', () => { fit(); sendResize(); });
-            showStatus('krust terminal');
-
-            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-            const st = params.get('selftest');
-            if (st) {
-                const rows = parseInt(st, 10);
-                const line = new TextEncoder().encode('X'.repeat(80) + '\n');
-                const chunk = new Uint8Array(line.length * rows);
-                for (let i = 0; i < rows; i++) chunk.set(line, i * line.length);
-                const t0 = performance.now();
-                let mx = 0, sum = 0, N = 0;
-                for (let off = 0; off < chunk.length; off += 1024) {
-                    const t = performance.now();
-                    process_bytes(chunk.subarray(off, Math.min(off + 1024, chunk.length)));
-                    scheduleRender();
-                    const dt = performance.now() - t;
-                    if (dt > mx) mx = dt;
-                    sum += dt; N++;
-                }
-                console.log('SELFTEST', JSON.stringify({ rows, gridRows, gridCols, innerW: window.innerWidth, innerH: window.innerHeight, dpr: window.devicePixelRatio, N, maxMs: mx, avgMs: sum / N, wallMs: performance.now() - t0, bytesIn: bytesIn, scrollbackLen: scrollback_len(), offset: scroll_offset() }));
-            }
-            connectPrimary(buildWsUrl('/ws'));
+            console.log('SELFTEST', JSON.stringify({ rows, gridRows, gridCols, innerW: window.innerWidth, innerH: window.innerHeight, dpr: window.devicePixelRatio, N, maxMs: mx, avgMs: sum / N, wallMs: performance.now() - t0, bytesIn: bytesIn, scrollbackLen: scrollback_len(), offset: scroll_offset() }));
         }
 
         function connectPrimary(url) {
@@ -581,27 +392,40 @@ const text = selected_text();
                     ws.send(new TextEncoder().encode('seq 1 ' + b + '\r'));
                 }
             };
-ws.onmessage = (ev) => {
-                    bytesIn += ev.data.byteLength;
-                    const reps = query_replies(new Uint8Array(ev.data));
+            ws.onmessage = (ev) => {
+                bytesIn += ev.data.byteLength;
+                const byteLen = ev.data.byteLength;
+                const bytePtr = alloc(byteLen);
+                const wasmBuf = new Uint8Array(wasmMem.buffer, bytePtr, byteLen);
+                wasmBuf.set(ev.data);
+                const boxPtr = query_replies(bytePtr, byteLen);
+                dealloc(bytePtr, byteLen);
+                if (boxPtr !== 0) {
+                    const { dataPtr, dataLen, box } = exportBoxedPair(boxPtr);
+                    const reps = readBytesCopy(dataPtr, dataLen);
+                    free_memory(dataPtr, dataLen);
+                    free_result(box);
                     if (reps.length) ws.send(reps);
-                    const t0 = performance.now();
-                    if (params.get('benchskip') !== '1') {
-                        process_bytes(new Uint8Array(ev.data));
-                        scheduleRender();
-                    }
-                    benchSample(performance.now() - t0);
-                    // Keep view in sync: when at the bottom we auto-follow new
-                    // output; when scrolled up the Rust side preserves the offset.
-                    curScroll = scroll_offset();
-                    updateScrollbar();
-                    const title = extractTitle(new Uint8Array(ev.data));
-                    if (title) {
-                        lastTitle = title + ' | terminal';
-                        document.title = lastTitle;
-                    }
-                    
-                };
+                }
+                const t0 = performance.now();
+                if (params.get('benchskip') !== '1') {
+                    const inData = new Uint8Array(ev.data);
+                    const inPtr = alloc(inData.length);
+                    new Uint8Array(wasmMem.buffer, inPtr, inData.length).set(inData);
+                    const summaryPtr = process_bytes(inPtr, inData.length);
+                    dealloc(inPtr, inData.length);
+                    if (summaryPtr !== 0) free_result(summaryPtr);
+                    scheduleRender();
+                }
+                benchSample(performance.now() - t0);
+                curScroll = scroll_offset();
+                updateScrollbar();
+                const title = extractTitle(new Uint8Array(ev.data));
+                if (title) {
+                    lastTitle = title + ' | terminal';
+                    document.title = lastTitle;
+                }
+            };
             ws.onerror = () => { showStatus('ws error'); };
             ws.onclose = () => {
                 showStatus('ws closed');
@@ -610,8 +434,232 @@ ws.onmessage = (ev) => {
                 setTimeout(() => connectPrimary(url), delay);
             };
         }
-        startTerminal().catch((e) => {
-            showStatus('ERR ' + e);
+        connectPrimary(buildWsUrl('/ws'));
+
+        window.addEventListener('keydown', (e) => {
+            const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+            const modifier = isMac ? e.metaKey : e.ctrlKey;
+
+            if (e.key === 'PageUp' && !modifier && !e.altKey) {
+                e.preventDefault();
+                if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b[5~'));
+                return;
+            }
+            if (e.key === 'PageDown' && !modifier && !e.altKey) {
+                e.preventDefault();
+                if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b[6~'));
+                return;
+            }
+
+            if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+                e.preventDefault();
+                if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b\r'));
+                return;
+            }
+
+            if (e.key === 'Enter' && modifier && !e.shiftKey && !e.altKey) {
+                e.preventDefault();
+                if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b[13;5u'));
+                return;
+            }
+
+            if (modifier && e.key.toLowerCase() === 'c' && !e.altKey) {
+                if (e.shiftKey) return false;
+                if (ws && ws.readyState === 1) {
+                    const selLayer = document.getElementById('sel-layer');
+                    const selection = selLayer ? selLayer.innerText : '';
+                    if (selection.trim()) {
+                        navigator.clipboard.writeText(selection).then(() => {
+                            selLayer.innerHTML = '';
+                        });
+                        return;
+                    }
+                }
+            }
+
+            const isShiftInsert = e.shiftKey && e.key === 'Insert';
+            const isCtrlShiftV = modifier && e.shiftKey && e.key.toLowerCase() === 'v';
+            const isMacCmdV = isMac && e.metaKey && e.key.toLowerCase() === 'v';
+
+            if (isShiftInsert || isCtrlShiftV || isMacCmdV) {
+                e.preventDefault();
+                if (ws && ws.readyState === 1) {
+                    navigator.clipboard.readText().then(text => {
+                        if (text) {
+                            const data = new TextEncoder().encode(text);
+                            ws.send(data);
+                        }
+                    }).catch(err => {
+                        console.warn("Clipboard read permission denied or unavailable", err);
+                    });
+                }
+                return;
+            }
+
+            if (modifier && e.shiftKey && e.key.toLowerCase() === 'a') {
+                e.preventDefault();
+                set_selection(0, 0, gridRows - 1, gridCols - 1);
+                repaint();
+                return;
+            }
+
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
+                return;
+            }
+
+            // Map key to PTY bytes
+            const keyBytes = new TextEncoder().encode(e.key);
+            const keyPtr = alloc(keyBytes.length);
+            const wasmKeyBuf = new Uint8Array(wasmMem.buffer, keyPtr, keyBytes.length);
+            wasmKeyBuf.set(keyBytes);
+            const bytesPtr = key_to_bytes(keyPtr, keyBytes.length, e.ctrlKey, e.altKey, e.shiftKey, e.metaKey);
+            dealloc(keyPtr, keyBytes.length);
+            if (bytesPtr !== 0) {
+                const { dataPtr, dataLen, boxPtr } = exportBoxedPair(bytesPtr);
+                const bytes = readBytesCopy(dataPtr, dataLen);
+                free_memory(dataPtr, dataLen);
+                free_result(boxPtr);
+                if (bytes.length > 0) {
+                    e.preventDefault();
+                    if (ws && ws.readyState === 1) ws.send(bytes);
+                }
+            }
+        });
+
+        const PASTE_CHUNK = 4096;
+        const PASTE_INTERVAL_MS = 16;
+        function sendPaste(text, force) {
+            const data = new TextEncoder().encode(text);
+            if (data.length === 0) return;
+            let i = 0;
+            const push = () => {
+                if (!ws || ws.readyState !== 1) return;
+                ws.send(data.slice(i, i + PASTE_CHUNK));
+                i += PASTE_CHUNK;
+                if (i < data.length && !force) setTimeout(push, PASTE_INTERVAL_MS);
+                else if (i < data.length) push();
+            };
+            push();
+        }
+
+        window.addEventListener('paste', (e) => {
+            const text = e.clipboardData ? e.clipboardData.getData('text') : '';
+            e.preventDefault();
+            document.getElementById('sel-layer').innerHTML = '';
+            sendPaste(text);
+        });
+
+        function buildWsUrl(path) {
+            const wsParams = new URLSearchParams({ s: sid });
+            if (startDir) wsParams.set('dir', startDir);
+            return path + '?' + wsParams.toString();
+        }
+
+        window.addEventListener('mousedown', (e) => {
+            if (e.button !== 0) return;
+            selDragging = true;
+            selMoved = false;
+            selAnchor = cellFromPoint(e.clientX, e.clientY);
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (!selDragging || !selAnchor) return;
+            const cur = cellFromPoint(e.clientX, e.clientY);
+            if (cur.row !== selAnchor.row || cur.col !== selAnchor.col) selMoved = true;
+            if (selMoved) { set_selection(selAnchor.row, selAnchor.col, cur.row, cur.col); repaint(); }
+        });
+
+        window.addEventListener('mouseup', (e) => {
+            if (e.button !== 0 || !selDragging) return;
+            selDragging = false;
+            if (!selMoved) {
+                clear_selection();
+                repaint();
+                selAnchor = null;
+                return;
+            }
+            selMoved = false;
+            const end = cellFromPoint(e.clientX, e.clientY);
+            set_selection(selAnchor.row, selAnchor.col, end.row, end.col);
+            repaint();
+            selAnchor = null;
+            const text = callStringExport(selected_text);
+            if (text) {
+                try { navigator.clipboard.writeText(text); showStatus('copied ' + text.length + ' chars'); } catch (_) {}
+            }
+        });
+
+        window.addEventListener('auxclick', (e) => {
+            if (e.button !== 1) return;
+            e.preventDefault();
+            navigator.clipboard.readText().then((t) => {
+                if (t) sendPaste(t);
+            }).catch(() => {});
+        });
+
+        let touchSel = null;
+        let touchTimer = null;
+        window.addEventListener('touchstart', (e) => {
+            if (e.touches.length !== 1) return;
+            const t = e.touches[0];
+            touchTimer = setTimeout(() => {
+                touchTimer = null;
+                touchSel = cellFromPoint(t.clientX, t.clientY);
+                if (navigator.vibrate) navigator.vibrate(20);
+            }, 450);
+        }, { passive: true });
+
+        window.addEventListener('touchmove', (e) => {
+            if (!touchSel || e.touches.length !== 1) return;
+            e.preventDefault();
+            const t = e.touches[0];
+            const cur = cellFromPoint(t.clientX, t.clientY);
+            set_selection(touchSel.row, touchSel.col, cur.row, cur.col);
+            repaint();
+        }, { passive: false });
+
+        window.addEventListener('touchend', (e) => {
+            if (touchTimer) { clearTimeout(touchTimer); touchTimer = null; }
+            if (!touchSel) return;
+            touchSel = null;
+            const text = callStringExport(selected_text);
+            if (text) {
+                try { navigator.clipboard.writeText(text); showStatus('copied ' + text.length + ' chars'); } catch (_) {}
+            }
+        });
+
+        window.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b[?1000h'));
+            const rect = canvas.getBoundingClientRect();
+            const x = Math.floor((e.clientX - rect.left) / cellW) + 1;
+            const y = Math.floor((e.clientY - rect.top) / cellH) + 1;
+            const button = e.deltaY < 0 ? 64 : 65;
+            const seq = '\x1b[<' + button + ';' + x + ';' + y + 'M';
+            if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode(seq));
+        }, { passive: false });
+
+        scrollbarEl.addEventListener('wheel', (e) => {
+            e.stopPropagation();
+        }, { passive: false });
+
+        scrollbarEl.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            const track = scrollbarEl.getBoundingClientRect();
+            const max = scrollback_len();
+            const frac = 1 - (e.clientY - track.top) / track.height;
+            let offset = max > 0 ? Math.round(frac * max) : 0;
+            doScrollTo(offset);
+            const onMove = (ev) => {
+                const f = 1 - (ev.clientY - track.top) / track.height;
+                doScrollTo(max > 0 ? Math.round(f * max) : 0);
+            };
+            const onUp = () => {
+                window.removeEventListener('mousemove', onMove);
+                window.removeEventListener('mouseup', onUp);
+            };
+            window.addEventListener('mousemove', onMove);
+            window.addEventListener('mouseup', onUp);
         });
     </script>
 </body>

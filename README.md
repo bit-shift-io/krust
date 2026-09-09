@@ -17,6 +17,7 @@ the terminal on a Canvas 2D surface.
 * **Dynamic Tab Titles:** Updates browser tab names dynamically using OSC escape sequences.
 * **WebSocket Binary Pipeline:** Raw PTY bytes streamed as `ArrayBuffer` frames (no JSON framing for output).
 * **Backpressure:** Bounded per-client byte budget with coalescing on lag.
+* **No wasm-bindgen CLI:** Raw WASM module loaded via `WebAssembly.instantiateStreaming`; offline builds work without network access.
 
 ---
 
@@ -74,7 +75,7 @@ krust/
 │   ├── Cargo.toml
 │   ├── src/lib.rs
 │   ├── res/                # HTML pages + test harness
-│   └── pkg/                # wasm-pack output
+│   └── pkg/                # raw WASM output
 ```
 
 ---
@@ -82,7 +83,7 @@ krust/
 ## Development
 
 ```bash
-# Build & run (build.rs rebuilds the WASM client when stale)
+# Build & run (build.rs compiles the WASM client into client/pkg/ when stale; no wasm-bindgen CLI needed)
 cargo run --release
 
 # Run tests

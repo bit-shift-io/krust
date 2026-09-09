@@ -26,10 +26,6 @@ async fn main() {
         .route("/", get(handlers::index))
         .route("/ws", get(handlers::ws_handler))
         .route(
-            "/pkg/terminal_client.js",
-            get(|| handlers::serve_pkg_file("terminal_client.js", "application/javascript")),
-        )
-        .route(
             "/pkg/terminal_client_bg.wasm",
             get(|| handlers::serve_pkg_file("terminal_client_bg.wasm", "application/wasm")),
         )

@@ -11,7 +11,7 @@ Krust is a Rust terminal emulator with a two-crate workspace:
 
 - **`server/`** — Axum WebSocket server that spawns a system shell in a
   `portable-pty` PTY and streams raw bytes to clients.
-- **`client/`** — WASM client compiled with `wasm-bindgen` that parses
+- **`client/`** — WASM client compiled to raw WASM (no wasm-bindgen runtime) that parses
   VT100 ANSI bytes via the `vt100` crate and renders the terminal on a
   Canvas 2D surface.
 
@@ -44,15 +44,16 @@ documents (ARCHITECTURE.md, NOTES.md) are stale and should be ignored.
 - **PTY:** `portable-pty` crate. Shell comes from `$SHELL` or `/bin/sh`.
   `TERM=xterm-256color`, `COLORTERM=truecolor`.
 - **WASM client:** Single-threaded via `thread_local!` `RefCell<Option<TerminalState>>`.
-  Public API exported with `#[wasm_bindgen]`.
+  Public API exported with `#[no_mangle] pub extern "C" fn` (raw WASM ABI).
 - **Tests:** Unit tests live alongside code in `#[cfg(test)] mod tests`.
   Server tests use `tower::util::ServiceExt` for one-shot HTTP requests.
 - **CORS:** `tower-http::cors::CorsLayer::permissive()` is enabled on all
   routes. The krust server serves cross-origin requests from the Grit
   web UI (running on `localhost:5000`).
-- **Build:** `server/build.rs` runs `wasm-pack build --target web` into
-  `client/pkg/` when stale, so a plain `cargo build`/`cargo run` suffices
-  (skip with `KRUST_SKIP_WASM_BUILD=1`).
+- **Build:** `server/build.rs` runs `cargo build --release --target wasm32-unknown-unknown`
+  into `client/pkg/` (output only `terminal_client_bg.wasm`) when stale,
+  so a plain `cargo build`/`cargo run` suffices (skip with
+  `KRUST_SKIP_WASM_BUILD=1`). No wasm-bindgen CLI or JS glue is required.
 
 ---
 
