@@ -399,9 +399,9 @@ impl TerminalState {
                 self.normal_scroll_offset = offset;
             }
             self.clamp_scroll();
-            self.apply_scrollback();
-            self.mark_all_dirty();
         }
+        self.apply_scrollback();
+        self.mark_all_dirty();
     }
 
     /// Adjust the scrollback view by `delta` lines (positive = up/back,
@@ -440,8 +440,8 @@ impl TerminalState {
                 screen_alt, old_offset, offset,
                 self.normal_scroll_offset, self.alternate_scroll_offset
             ).into());
+            self.parser.screen_mut().set_scrollback(offset);
         }
-        self.parser.screen_mut().set_scrollback(offset);
     }
 
     /// Dispatches to the active renderer: Canvas 2D by default, WebGL2
