@@ -286,16 +286,16 @@ function scheduleRender() {
             const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
             const modifier = isMac ? e.metaKey : e.ctrlKey;
 
-            // PageUp / PageDown scroll the terminal viewport (not sent to shell).
-            // PageUp scrolls back into history, PageDown toward the live bottom.
+            // PageUp / PageDown forward to the PTY so applications
+            // (e.g. opencode) can scroll their own UI.
             if (e.key === 'PageUp' && !modifier && !e.altKey) {
                 e.preventDefault();
-                doScroll(gridRows);
+                if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b[5~'));
                 return;
             }
             if (e.key === 'PageDown' && !modifier && !e.altKey) {
                 e.preventDefault();
-                doScroll(-gridRows);
+                if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b[6~'));
                 return;
             }
 
@@ -486,10 +486,21 @@ const text = selected_text();
 
         window.addEventListener('wheel', (e) => {
             e.preventDefault();
-            // Wheel down (deltaY > 0) scrolls toward the live bottom;
-            // wheel up (deltaY < 0) scrolls back into history.
-            const lines = Math.round(e.deltaY / Math.max(1, cellH));
-            if (lines !== 0) doScroll(-lines);
+            // Enable SGR mouse mode for wheel events
+            if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b[?1000h'));
+            // Send wheel up/down as SGR mouse tracking: ESC [ < button;x;y M
+            // button 64 = wheel up (bit 6 set), 65 = wheel down (bit 6 + bit 0)
+            // x,y are 1-based cell coordinates
+            const rect = canvas.getBoundingClientRect();
+            const x = Math.floor((e.clientX - rect.left) / cellW) + 1;
+            const y = Math.floor((e.clientY - rect.top) / cellH) + 1;
+            const button = e.deltaY < 0 ? 64 : 65;
+            const seq = '\x1b[<' + button + ';' + x + ';' + y + 'M';
+            if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode(seq));
+        }, { passive: false });
+
+        scrollbarEl.addEventListener('wheel', (e) => {
+            e.stopPropagation();
         }, { passive: false });
 
         scrollbarEl.addEventListener('mousedown', (e) => {
