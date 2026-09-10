@@ -7,33 +7,9 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# WASM runtime dependencies
-wasm-bindgen = "0.2"
-web-sys = { version = "0.3", features = [
-    "Window",
-    "Document",
-    "Element",
-    "Node",
-    "HtmlElement",
-    "HtmlCanvasElement",
-    "WebSocket",
-    "MessageEvent",
-    "BinaryType",
-    "Storage",
-    "Selection",
-    "Range",
-    "CanvasRenderingContext2d",
-    "TextMetrics",
-    "ImageData",
-    "WebGl2RenderingContext",
-    "WebGlBuffer",
-    "WebGlProgram",
-    "WebGlShader",
-    "WebGlTexture",
-    "WebGlUniformLocation",
-    "console"
-] }
-js-sys = "0.3"
+# Pure-Rust dependencies only. Browser interop is handled by the raw "krust"
+# FFI module (imports provided by `res/krust_runtime.js`); no wasm-bindgen
+# runtime or web-sys/js-sys glue is required or linked.
 vt100 = "0.16"
 serde_json = "1.0"
 ab_glyph = "0.2"

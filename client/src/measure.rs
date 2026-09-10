@@ -4,8 +4,7 @@
 // given a 2D context before the renderer choice is made (a canvas only supports
 // one context type).
 
-use wasm_bindgen::JsCast;
-use web_sys::CanvasRenderingContext2d;
+use crate::ffi::{self, JsHandle};
 
 /// Epsilon to prevent 1-pixel anti-aliasing gaps between adjacent cell rects
 pub(crate) const CELL_EPSILON: f64 = 0.5;
@@ -22,40 +21,54 @@ pub(crate) const FONT_STACK_BOLD: &str =
 /// hairline seams regardless of which font the user's system resolves to.
 const MEASURE_PROBES: &[&str] = &["W", "0", "g", "j", "│", "─", "█", "▀", "░", "⠋", "⣿"];
 
+/// Number of integer pixels that must be read back by `getImageData` when the
+/// 2D pipeline is used for ink measurement.
+const SCRATCH_SIZE: usize = 64;
+
 /// Maximum ink height of `probes` after rasterizing each glyph onto a scratch
 /// canvas. `None` if the 2D/`getImageData` pipeline is unavailable (the caller
 /// then falls back to font metric boxes).
-fn rasterized_glyph_height_max(
-    probes: &[&str],
-    _font_ctx: &CanvasRenderingContext2d,
-) -> Option<f64> {
-    let doc = web_sys::window()?.document()?;
+fn rasterized_glyph_height_max(probes: &[&str], _font_ctx: JsHandle) -> Option<f64> {
+    let win = ffi::window();
+    if win == 0 {
+        return None;
+    }
+    let doc = ffi::window_document(win);
+    if doc == 0 {
+        return None;
+    }
     let mut max_h = 0.0f64;
+    let mut px = vec![0u8; SCRATCH_SIZE * SCRATCH_SIZE * 4];
     for ch in probes {
-        let Ok(scratch) = doc.create_element("canvas") else { return None };
-        let Ok(scratch) = scratch.dyn_into::<web_sys::HtmlCanvasElement>() else {
+        let scratch = ffi::document_create_canvas(doc);
+        if scratch == 0 {
             return None;
-        };
-        scratch.set_width(64);
-        scratch.set_height(64);
-        let Some(ctx) = scratch.get_context("2d").ok().flatten() else {
+        }
+        ffi::canvas_set_width(scratch, SCRATCH_SIZE as u32);
+        ffi::canvas_set_height(scratch, SCRATCH_SIZE as u32);
+        let ctx = ffi::canvas_get_2d(scratch);
+        if ctx == 0 {
+            ffi::release(scratch);
             return None;
-        };
-        let Ok(ctx) = ctx.dyn_into::<CanvasRenderingContext2d>() else {
+        }
+        ffi::ctx_set_font(ctx, FONT_STACK);
+        ffi::ctx_set_fill_style(ctx, "#ffffff");
+        ffi::ctx_set_text_baseline(ctx, "alphabetic");
+        ffi::ctx_fill_text(ctx, ch, 8.0, 40.0);
+        let written = ffi::ctx_get_image_data(ctx, 0.0, 0.0, SCRATCH_SIZE as f64, SCRATCH_SIZE as f64, &mut px);
+        if written < px.len() {
+            ffi::release(ctx);
+            ffi::release(scratch);
             return None;
-        };
-        ctx.set_font(&FONT_STACK);
-        ctx.set_fill_style_str("#ffffff");
-        ctx.set_text_baseline("alphabetic");
-        let _ = ctx.fill_text(ch, 8.0, 40.0);
-        let Ok(img) = ctx.get_image_data(0.0, 0.0, 64.0, 64.0) else { return None };
-        let px = img.data();
-        let mut top_row = 64usize;
+        }
+        ffi::release(ctx);
+        ffi::release(scratch);
+        let mut top_row = SCRATCH_SIZE;
         let mut bottom_row = 0usize;
-        for y in 0..64usize {
+        for y in 0..SCRATCH_SIZE {
             let mut ink = false;
             for x in 8..24usize {
-                let alpha = px[(y * 64 + x) * 4 + 3] as f64;
+                let alpha = px[(y * SCRATCH_SIZE + x) * 4 + 3] as f64;
                 if alpha > 0.0 {
                     ink = true;
                     break;
@@ -79,17 +92,20 @@ fn rasterized_glyph_height_max(
 /// Measure a `"W"` advance and text-metric fallback height on an existing 2D
 /// context. Returns `(width, height)`, where `height` is `None` when no ink
 /// fallback could be computed (caller should then use the painted-glyph path).
-fn measure_text_advance(ctx: &CanvasRenderingContext2d) -> (f64, Option<f64>) {
-    ctx.set_font(FONT_STACK);
-    let width = ctx
-        .measure_text("W")
-        .map(|m| m.width())
-        .ok()
-        .unwrap_or(14.0);
+fn measure_text_advance(ctx: JsHandle) -> (f64, Option<f64>) {
+    ffi::ctx_set_font(ctx, FONT_STACK);
+    let mut width = 14.0f64;
+    let tm = ffi::ctx_measure_text(ctx, "W");
+    if tm != 0 {
+        width = ffi::tm_width(tm).max(1.0);
+        ffi::release(tm);
+    }
     let mut h = 0.0f64;
     for ch in MEASURE_PROBES {
-        if let Ok(m) = ctx.measure_text(ch) {
-            let bh = m.actual_bounding_box_ascent() + m.actual_bounding_box_descent();
+        let tm = ffi::ctx_measure_text(ctx, ch);
+        if tm != 0 {
+            let bh = ffi::tm_ascent(tm) + ffi::tm_descent(tm);
+            ffi::release(tm);
             if bh > h {
                 h = bh;
             }
@@ -107,7 +123,7 @@ fn measure_text_advance(ctx: &CanvasRenderingContext2d) -> (f64, Option<f64>) {
 /// vertical seams between rows of `│`/`─` in box-drawing UIs (opencode borders,
 /// `htop`, `vim` splits, ...). Measuring ink directly makes the cell pitch match
 /// the painted glyphs for whatever font the system resolves the stack to.
-pub(crate) fn measure_cell_dimensions(ctx: &CanvasRenderingContext2d) -> (f64, f64) {
+pub(crate) fn measure_cell_dimensions(ctx: JsHandle) -> (f64, f64) {
     let (width, fallback) = measure_text_advance(ctx);
     finish_cell_dims(width, rasterized_glyph_height_max(MEASURE_PROBES, ctx).or(fallback))
 }
@@ -116,22 +132,35 @@ pub(crate) fn measure_cell_dimensions(ctx: &CanvasRenderingContext2d) -> (f64, f
 /// terminal canvas is never given a 2D context. This keeps the canvas free for
 /// a later `get_context("webgl2")` (a canvas may only have one context type).
 pub(crate) fn measure_cell_dimensions_scratch() -> Option<(f64, f64)> {
-    let doc = web_sys::window()?.document()?;
-    let Ok(scratch) = doc.create_element("canvas") else { return None };
-    let Ok(scratch) = scratch.dyn_into::<web_sys::HtmlCanvasElement>() else {
+    let win = ffi::window();
+    if win == 0 {
         return None;
-    };
-    let Some(ctx) = scratch.get_context("2d").ok().flatten() else {
+    }
+    let doc = ffi::window_document(win);
+    if doc == 0 {
         return None;
-    };
-    let Ok(ctx) = ctx.dyn_into::<CanvasRenderingContext2d>() else {
+    }
+    let scratch = ffi::document_create_canvas(doc);
+    if scratch == 0 {
         return None;
+    }
+    ffi::canvas_set_width(scratch, SCRATCH_SIZE as u32);
+    ffi::canvas_set_height(scratch, SCRATCH_SIZE as u32);
+    let ctx = ffi::canvas_get_2d(scratch);
+    let result = if ctx == 0 {
+        None
+    } else {
+        let (width, fallback) = measure_text_advance(ctx);
+        Some(finish_cell_dims(
+            width,
+            rasterized_glyph_height_max(MEASURE_PROBES, ctx).or(fallback),
+        ))
     };
-    let (width, fallback) = measure_text_advance(&ctx);
-    Some(finish_cell_dims(
-        width,
-        rasterized_glyph_height_max(MEASURE_PROBES, &ctx).or(fallback),
-    ))
+    if ctx != 0 {
+        ffi::release(ctx);
+    }
+    ffi::release(scratch);
+    result
 }
 
 /// Round the measured width/height to whole device pixels and sanity-guard them.

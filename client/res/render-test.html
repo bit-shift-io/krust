@@ -15,8 +15,16 @@
 <body>
     <canvas id="terminal-canvas" width="800" height="600" tabindex="0"></canvas>
     <pre id="result">loading...</pre>
+    <script src="./krust_runtime.js"></script>
     <script type="module">
-        import init, { init as term_init, process_bytes, repaint, handle_resize, version } from '../pkg/terminal_client.js';
+        const wasm = await WebAssembly.instantiate(
+            await (await fetch('../pkg/terminal_client_bg.wasm')).arrayBuffer(),
+            window.KRUST_RUNTIME.imports
+        );
+        window.KRUST_RUNTIME.install(wasm.instance.exports.memory);
+        const { init, process_bytes, repaint, handle_resize, version,
+                alloc, dealloc, free_memory, free_string, free_result } = wasm.instance.exports;
+        const mem = wasm.instance.exports.memory;
 
         const canvas = document.getElementById('terminal-canvas');
         const result = document.getElementById('result');
@@ -25,6 +33,22 @@
             result.textContent = JSON.stringify(obj);
             document.body.className = obj.pass ? '' : 'fail';
             document.title = 'krust-render-test ' + (obj.pass ? 'PASS' : 'FAIL');
+        }
+
+        function readString(ptr, len) {
+            return new TextDecoder().decode(new Uint8Array(mem.buffer, ptr, len));
+        }
+
+        // Call an export that returns a boxed [u32; 2] holding (data_ptr, data_len)
+        // and free the pair once fully read.
+        function callBoxedExport(fn, ...args) {
+            const boxPtr = fn(...args);
+            if (boxPtr === 0) return null;
+            const view = new Uint8Array(mem.buffer, boxPtr, 8);
+            const dataPtr = view[0] | (view[1] << 8) | (view[2] << 16) | (view[3] << 24);
+            const dataLen = view[4] | (view[5] << 8) | (view[6] << 16) | (view[7] << 24);
+            free_result(boxPtr);
+            return { dataPtr, dataLen };
         }
 
         function feedContent() {
@@ -40,7 +64,11 @@
             const joined = new Uint8Array(len);
             let off = 0;
             for (const p of parts) { joined.set(p, off); off += p.length; }
-            process_bytes(joined);
+            const ptr = alloc(joined.length);
+            new Uint8Array(mem.buffer, ptr, joined.length).set(joined);
+            const summary = process_bytes(ptr, joined.length);
+            dealloc(ptr, joined.length);
+            if (summary !== 0) free_result(summary);
         }
 
         // Seam analysis: every line in a region should be uniformly bright.
@@ -76,9 +104,17 @@
         }
 
         async function run() {
-            const bytes = await (await fetch('../pkg/terminal_client_bg.wasm')).arrayBuffer();
-            await init(bytes);
-            const config = JSON.parse(term_init('terminal-canvas', null));
+            const canvasIdBytes = new TextEncoder().encode('terminal-canvas');
+            const canvasIdPtr = alloc(canvasIdBytes.length);
+            new Uint8Array(mem.buffer, canvasIdPtr, canvasIdBytes.length).set(canvasIdBytes);
+            const initRet = callBoxedExport(init, canvasIdPtr, canvasIdBytes.length);
+            dealloc(canvasIdPtr, canvasIdBytes.length);
+            if (!initRet) {
+                setResult({ pass: false, error: 'init returned null' });
+                return;
+            }
+            const config = JSON.parse(readString(initRet.dataPtr, initRet.dataLen));
+            free_string(initRet.dataPtr);
             handle_resize(800, 600);
             feedContent();
             repaint();
@@ -146,7 +182,13 @@
                 dash: seamSummary(dash),
                 pipe: seamSummary(pipe),
                 block: seamSummary(blk),
-                version: version(),
+                version: (() => {
+                    const v = callBoxedExport(version);
+                    if (!v) return '';
+                    const s = readString(v.dataPtr, v.dataLen);
+                    free_string(v.dataPtr);
+                    return s;
+                })(),
             };
             // dash/pipe/block: a dim *column* in the dash row means a vertical
             // seam between two horizontally-adjacent ─ cells; a dim *row* in the

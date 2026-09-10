@@ -6,10 +6,9 @@
 
 use std::cell::RefCell;
 use vt100::Parser;
-use wasm_bindgen::JsCast;
-use web_sys::CanvasRenderingContext2d;
 
 use crate::color::{cell_fg_rgb, color_to_rgb, DEFAULT_BG, DEFAULT_FG};
+use crate::ffi::{self, JsHandle};
 use crate::graphics::draw_graphic_cell;
 use crate::measure::{
     css_color, measure_cell_dimensions_scratch, CELL_EPSILON, FONT_STACK, FONT_STACK_BOLD,
@@ -75,11 +74,11 @@ pub(crate) struct TerminalState {
     /// vt100 parser
     parser: Parser,
     /// 2D rendering context (Canvas 2D default path)
-    ctx: Option<CanvasRenderingContext2d>,
+    ctx: Option<JsHandle>,
     /// WebGL2 renderer (fallback; text pass not yet rendering glyphs)
     webgl: Option<renderer::WebGL2Renderer>,
     /// Canvas element (source of pixel dimensions)
-    canvas: web_sys::HtmlCanvasElement,
+    canvas: JsHandle,
     /// Canvas element ID
     canvas_id: String,
     /// Terminal dimensions in cells
@@ -129,17 +128,19 @@ impl TerminalState {
     pub(crate) fn new(canvas_id: &str) -> Result<Self, String> {
         let parser = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
 
-        let canvas = web_sys::window()
-            .and_then(|w| w.document())
-            .and_then(|d| d.get_element_by_id(canvas_id))
-            .and_then(|el| el.dyn_into::<web_sys::HtmlCanvasElement>().ok())
-            .ok_or_else(|| format!("canvas '#{}' not found", canvas_id))?;
+        let win = ffi::window();
+        let doc = if win != 0 { ffi::window_document(win) } else { 0 };
+        let canvas = if doc != 0 {
+            ffi::document_get_element_by_id(doc, canvas_id)
+        } else {
+            0
+        };
+        if canvas == 0 {
+            return Err(format!("canvas '#{}' not found", canvas_id));
+        }
 
         // Try Canvas 2D first; fall back to WebGL2
-        let dpr = web_sys::window()
-            .map(|w| w.device_pixel_ratio())
-            .unwrap_or(1.0)
-            .max(1.0);
+        let dpr = ffi::window_dpr(win);
 
         // Measure cell dims via a scratch canvas so the real terminal canvas is
         // never given a context before the primary renderer is chosen (a canvas
@@ -150,17 +151,9 @@ impl TerminalState {
         // Canvas 2D primary path. Text rendering is currently unreliable under
         // WebGL2 (glyphs missing in practice), so Canvas 2D is the default until
         // the WebGL2 text path is fixed.
-        let mut ctx = None;
-        let mut try_webgl = true;
-        if let Ok(c) = canvas
-            .get_context("2d")
-            .map_err(|_| ())
-            .and_then(|c| c.ok_or(()))
-            .and_then(|c| c.dyn_into::<CanvasRenderingContext2d>().map_err(|_| ()))
-        {
-            ctx = Some(c);
-            try_webgl = false;
-        }
+        let ctx = ffi::canvas_get_2d(canvas);
+        let ctx = (ctx != 0).then_some(ctx);
+        let try_webgl = ctx.is_none();
 
         // WebGL2 fallback: only when a 2D context could not be obtained.
         let mut webgl = None;
@@ -182,8 +175,8 @@ impl TerminalState {
             return Err("no rendering context available (2D failed and WebGL2 unavailable)".to_string());
         }
 
-        let canvas_w = canvas.offset_width() as f64;
-        let canvas_h = canvas.offset_height() as f64;
+        let canvas_w = ffi::element_offset_width(canvas);
+        let canvas_h = ffi::element_offset_height(canvas);
         let cols = if canvas_w > 0.0 {
             (canvas_w / cell_width).floor() as u16
         } else {
@@ -417,11 +410,11 @@ impl TerminalState {
         };
         let old_offset = self.parser.screen().scrollback();
         if old_offset != offset {
-            web_sys::console::log_1(&format!(
+            ffi::console_log(&format!(
                 "APPLY_SCROLLBACK: screen_alt={} old_off={} new_off={} normal={} alt={}",
                 screen_alt, old_offset, offset,
                 self.normal_scroll_offset, self.alternate_scroll_offset
-            ).into());
+            ));
             self.parser.screen_mut().set_scrollback(offset);
         }
     }
@@ -486,9 +479,7 @@ impl TerminalState {
         let cw = self.cell_width;
         let ch = self.cell_height;
 
-        let dpr = web_sys::window()
-            .map(|w| w.device_pixel_ratio())
-            .unwrap_or(1.0);
+        let dpr = ffi::window_dpr(ffi::window());
 
         // Full redraw when forced, or when enough of the grid changed that a
         // selective pass would cost more than just repainting everything.
@@ -499,12 +490,12 @@ impl TerminalState {
 
         let dirty = std::mem::take(&mut self.dirty_cells);
 
-        let _ = ctx.set_transform(dpr.max(1.0), 0.0, 0.0, dpr.max(1.0), 0.0, 0.0);
+        ffi::ctx_set_transform(ctx, dpr.max(1.0), 0.0, 0.0, dpr.max(1.0), 0.0, 0.0);
 
         if full {
-            self.render_full_grid(&ctx, rows, cols, cw, ch, dpr)
+            self.render_full_grid(ctx, rows, cols, cw, ch, dpr)
         } else {
-            self.render_dirty_cells(&ctx, rows, cols, cw, ch, dpr, dirty)
+            self.render_dirty_cells(ctx, rows, cols, cw, ch, dpr, dirty)
         }?;
         Ok(())
     }
@@ -512,7 +503,7 @@ impl TerminalState {
     /// Repaint the entire grid (first frame, resize, scroll, selection change).
     fn render_full_grid(
         &mut self,
-        ctx: &CanvasRenderingContext2d,
+        ctx: JsHandle,
         rows: u16,
         cols: u16,
         cw: f64,
@@ -521,16 +512,16 @@ impl TerminalState {
     ) -> Result<(), String> {
         let screen = self.parser.screen();
         let (prows, pcols) = screen.size();
-        let css_w = self.canvas.width() as f64 / dpr;
-        let css_h = self.canvas.height() as f64 / dpr;
+        let css_w = ffi::canvas_width(self.canvas) as f64 / dpr;
+        let css_h = ffi::canvas_height(self.canvas) as f64 / dpr;
 
         // 1. Clear to default background
-        ctx.set_fill_style_str(&css_color(DEFAULT_BG));
-        ctx.fill_rect(0.0, 0.0, css_w.max(1.0), css_h.max(1.0));
-        ctx.set_text_baseline("middle");
+        ffi::ctx_set_fill_style(ctx, &css_color(DEFAULT_BG));
+        ffi::ctx_fill_rect(ctx, 0.0, 0.0, css_w.max(1.0), css_h.max(1.0));
+        ffi::ctx_set_text_baseline(ctx, "middle");
 
         let mut font = FONT_STACK.to_string();
-        ctx.set_font(&font);
+        ffi::ctx_set_font(ctx, &font);
 
         // 2. Background rects for cells with non-default background
         for row in 0..rows {
@@ -544,8 +535,9 @@ impl TerminalState {
                     DEFAULT_BG
                 };
                 if bg != DEFAULT_BG && !self.selected(row, col) {
-                    ctx.set_fill_style_str(&css_color(bg));
-                    ctx.fill_rect(
+                    ffi::ctx_set_fill_style(ctx, &css_color(bg));
+                    ffi::ctx_fill_rect(
+                        ctx,
                         col as f64 * cw,
                         row as f64 * ch,
                         cw,
@@ -572,8 +564,9 @@ impl TerminalState {
                     };
                     let (mut fg, mut bg) = (fg0, bg0);
                     std::mem::swap(&mut fg, &mut bg);
-                    ctx.set_fill_style_str(&css_color(bg));
-                    ctx.fill_rect(
+                    ffi::ctx_set_fill_style(ctx, &css_color(bg));
+                    ffi::ctx_fill_rect(
+                        ctx,
                         col as f64 * cw - CELL_EPSILON,
                         row as f64 * ch - CELL_EPSILON,
                         cw + CELL_EPSILON * 2.0,
@@ -607,10 +600,11 @@ impl TerminalState {
                         let want = if bold { FONT_STACK_BOLD } else { FONT_STACK };
                         if font != want {
                             font = want.to_string();
-                            ctx.set_font(&font);
+                            ffi::ctx_set_font(ctx, &font);
                         }
-                        ctx.set_fill_style_str(&css_color(draw_fg));
-                        let _ = ctx.fill_text(
+                        ffi::ctx_set_fill_style(ctx, &css_color(draw_fg));
+                        ffi::ctx_fill_text(
+                            ctx,
                             &s,
                             col as f64 * cw,
                             row as f64 * ch + ch * 0.5,
@@ -630,7 +624,7 @@ impl TerminalState {
     /// Redraw only cells that changed since the last render, plus the cursor.
     fn render_dirty_cells(
         &mut self,
-        ctx: &CanvasRenderingContext2d,
+        ctx: JsHandle,
         rows: u16,
         cols: u16,
         cw: f64,
@@ -640,13 +634,13 @@ impl TerminalState {
     ) -> Result<(), String> {
         let screen = self.parser.screen();
         let (prows, pcols) = screen.size();
-        let css_w = self.canvas.width() as f64 / dpr;
-        let css_h = self.canvas.height() as f64 / dpr;
+        let css_w = ffi::canvas_width(self.canvas) as f64 / dpr;
+        let css_h = ffi::canvas_height(self.canvas) as f64 / dpr;
 
         // Clear the entire canvas to default background so no stale
         // pixels leak between cells (sub-pixel gaps, cursor highlights, etc.).
-        ctx.set_fill_style_str(&css_color(DEFAULT_BG));
-        ctx.fill_rect(0.0, 0.0, css_w.max(1.0), css_h.max(1.0));
+        ffi::ctx_set_fill_style(ctx, &css_color(DEFAULT_BG));
+        ffi::ctx_fill_rect(ctx, 0.0, 0.0, css_w.max(1.0), css_h.max(1.0));
 
         // Cells to repaint: everything marked dirty, plus the current and
         // previous cursor cells (cursor highlight must follow the cursor).
@@ -662,15 +656,15 @@ impl TerminalState {
         dirty.sort_unstable();
         dirty.dedup();
 
-        ctx.set_text_baseline("middle");
+        ffi::ctx_set_text_baseline(ctx, "middle");
         let mut font = FONT_STACK.to_string();
-        ctx.set_font(&font);
+        ffi::ctx_set_font(ctx, &font);
 
         for &(row, col) in dirty.iter() {
             // Full-cell base repaint in default background clears any stale
             // glyph or highlight left by the previous frame.
-            ctx.set_fill_style_str(&css_color(DEFAULT_BG));
-            ctx.fill_rect(col as f64 * cw, row as f64 * ch, cw, ch);
+            ffi::ctx_set_fill_style(ctx, &css_color(DEFAULT_BG));
+            ffi::ctx_fill_rect(ctx, col as f64 * cw, row as f64 * ch, cw, ch);
 
             let cell = if row < prows && col < pcols {
                 screen.cell(row, col)
@@ -685,8 +679,8 @@ impl TerminalState {
                 _ => DEFAULT_BG,
             };
             if bg != DEFAULT_BG && !selected {
-                ctx.set_fill_style_str(&css_color(bg));
-                ctx.fill_rect(col as f64 * cw, row as f64 * ch, cw, ch);
+                ffi::ctx_set_fill_style(ctx, &css_color(bg));
+                ffi::ctx_fill_rect(ctx, col as f64 * cw, row as f64 * ch, cw, ch);
             }
 
             // 3. Selection background BEFORE text.
@@ -700,8 +694,9 @@ impl TerminalState {
                 };
                 let (mut fg, mut bg) = (fg0, bg0);
                 std::mem::swap(&mut fg, &mut bg);
-                ctx.set_fill_style_str(&css_color(bg));
-                ctx.fill_rect(
+                ffi::ctx_set_fill_style(ctx, &css_color(bg));
+                ffi::ctx_fill_rect(
+                    ctx,
                     col as f64 * cw - CELL_EPSILON,
                     row as f64 * ch - CELL_EPSILON,
                     cw + CELL_EPSILON * 2.0,
@@ -723,10 +718,11 @@ impl TerminalState {
                         let want = if c.bold() { FONT_STACK_BOLD } else { FONT_STACK };
                         if font != want {
                             font = want.to_string();
-                            ctx.set_font(&font);
+                            ffi::ctx_set_font(ctx, &font);
                         }
-                        ctx.set_fill_style_str(&css_color(draw_fg));
-                        let _ = ctx.fill_text(
+                        ffi::ctx_set_fill_style(ctx, &css_color(draw_fg));
+                        ffi::ctx_fill_text(
+                            ctx,
                             s,
                             col as f64 * cw,
                             row as f64 * ch + ch * 0.5,
@@ -772,7 +768,7 @@ impl TerminalState {
     /// `cursor` is the cell to draw, or `None` to skip cursor drawing.
     fn draw_cursor(
         &mut self,
-        ctx: &CanvasRenderingContext2d,
+        ctx: JsHandle,
         cursor: Option<(u16, u16)>,
         cw: f64,
         ch: f64,
@@ -789,14 +785,14 @@ impl TerminalState {
             (DEFAULT_FG, DEFAULT_BG)
         };
         std::mem::swap(&mut fg, &mut bg);
-        ctx.set_fill_style_str(&css_color(bg));
-        ctx.fill_rect(cc as f64 * cw, cr as f64 * ch, cw, ch);
-        ctx.set_fill_style_str(&css_color(fg));
+        ffi::ctx_set_fill_style(ctx, &css_color(bg));
+        ffi::ctx_fill_rect(ctx, cc as f64 * cw, cr as f64 * ch, cw, ch);
+        ffi::ctx_set_fill_style(ctx, &css_color(fg));
         if let Some(c) = cell {
             let s = c.contents();
             if !s.is_empty() {
                 if !draw_graphic_cell(ctx, cc, cr, cw, ch, s, fg) {
-                    let _ = ctx.fill_text(s, cc as f64 * cw, cr as f64 * ch + ch * 0.5);
+                    ffi::ctx_fill_text(ctx, s, cc as f64 * cw, cr as f64 * ch + ch * 0.5);
                 }
             }
         }
@@ -885,13 +881,13 @@ impl TerminalState {
     }
 
     /// Mutable access to the canvas.
-    pub(crate) fn canvas_mut(&mut self) -> &mut web_sys::HtmlCanvasElement {
-        &mut self.canvas
+    pub(crate) fn canvas_handle(&self) -> JsHandle {
+        self.canvas
     }
 
     /// Whether the active renderer is the Canvas 2D path.
-    pub(crate) fn ctx(&self) -> Option<&CanvasRenderingContext2d> {
-        self.ctx.as_ref()
+    pub(crate) fn ctx(&self) -> Option<JsHandle> {
+        self.ctx
     }
 
     /// Set measured cell dimensions (used on resize).

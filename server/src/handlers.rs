@@ -89,13 +89,25 @@ fn pkg_dir() -> String {
     if let Ok(d) = std::env::var("KRUST_PKG_DIR") {
         return d;
     }
-    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        return std::path::Path::new(&manifest)
-            .join("../client/pkg")
-            .display()
-            .to_string();
+    manifest_dir().join("pkg").display().to_string()
+}
+
+/// Directory holding the client's static resources (`krust_runtime.js`).
+///
+/// Defaults to `<crate>/../client/res`; override with `KRUST_RES_DIR`.
+fn res_dir() -> String {
+    if let Ok(d) = std::env::var("KRUST_RES_DIR") {
+        return d;
     }
-    "client/pkg".to_string()
+    manifest_dir().join("res").display().to_string()
+}
+
+fn manifest_dir() -> std::path::PathBuf {
+    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+        std::path::Path::new(&manifest).join("../client")
+    } else {
+        std::path::PathBuf::from("client")
+    }
 }
 
 pub(crate) async fn serve_pkg_file(
@@ -103,6 +115,24 @@ pub(crate) async fn serve_pkg_file(
     content_type: &'static str,
 ) -> Result<([(header::HeaderName, &'static str); 2], Vec<u8>), axum::http::StatusCode> {
     let path = std::path::Path::new(&pkg_dir()).join(file);
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        bytes,
+    ))
+}
+
+/// Serve a static resource from the client `res/` directory.
+pub(crate) async fn serve_res_file(
+    file: &'static str,
+    content_type: &'static str,
+) -> Result<([(header::HeaderName, &'static str); 2], Vec<u8>), axum::http::StatusCode> {
+    let path = std::path::Path::new(&res_dir()).join(file);
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|_| axum::http::StatusCode::NOT_FOUND)?;

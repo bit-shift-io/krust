@@ -29,6 +29,10 @@ async fn main() {
             "/pkg/terminal_client_bg.wasm",
             get(|| handlers::serve_pkg_file("terminal_client_bg.wasm", "application/wasm")),
         )
+        .route(
+            "/krust_runtime.js",
+            get(|| handlers::serve_res_file("krust_runtime.js", "text/javascript; charset=utf-8")),
+        )
         .layer(CorsLayer::permissive());
     let app = app.with_state(state);
 

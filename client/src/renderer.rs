@@ -22,12 +22,30 @@
 //   cursor: fg = original bg, bg = original fg (block cursor)
 
 use ab_glyph::{Font, FontRef, Glyph, Point, PxScale};
-use js_sys::Float32Array;
-use wasm_bindgen::prelude::*;
-use web_sys::{
-    WebGl2RenderingContext, WebGlBuffer, WebGlProgram, WebGlShader, WebGlTexture,
-    WebGlUniformLocation,
-};
+
+use crate::ffi::{self, JsHandle};
+
+// --- WebGL2 constants (the "krust" JS runtime mirrors the browser values) ---
+const VERTEX_SHADER_KIND: u32 = 0x8B31;
+const FRAGMENT_SHADER_KIND: u32 = 0x8B30;
+const COMPILE_STATUS: u32 = 0x8B81;
+const LINK_STATUS: u32 = 0x8B82;
+const ARRAY_BUFFER: u32 = 0x8892;
+const STATIC_DRAW: u32 = 0x88E4;
+const DYNAMIC_DRAW: u32 = 0x88E8;
+const FLOAT: u32 = 0x1406;
+const TEXTURE0: u32 = 0x84C0;
+const TEXTURE_2D: u32 = 0x0DE1;
+const TEXTURE_MIN_FILTER: u32 = 0x2801;
+const TEXTURE_MAG_FILTER: u32 = 0x2800;
+const TEXTURE_WRAP_S: u32 = 0x2802;
+const TEXTURE_WRAP_T: u32 = 0x2803;
+const NEAREST: i32 = 0x2600;
+const CLAMP_TO_EDGE: i32 = 0x812F;
+const ALPHA: u32 = 0x1906;
+const UNSIGNED_BYTE: u32 = 0x1401;
+const COLOR_BUFFER_BIT: u32 = 0x4000;
+const TRIANGLE_STRIP: u32 = 0x0005;
 
 const ATLAS_PADDING: u32 = 2;
 const FIRST_ASCII: char = ' ';
@@ -97,7 +115,7 @@ void main() {
 "#;
 
 pub struct GlyphAtlas {
-    pub texture: WebGlTexture,
+    pub texture: JsHandle,
     pub atlas_width: u32,
     pub atlas_height: u32,
     pub glyph_width: u32,
@@ -107,7 +125,7 @@ pub struct GlyphAtlas {
 
 impl GlyphAtlas {
     pub fn new(
-        ctx: &WebGl2RenderingContext,
+        gl: JsHandle,
         font: &FontRef,
         cell_w: f64,
         cell_h: f64,
@@ -147,7 +165,7 @@ impl GlyphAtlas {
         // the text pass paints a flat foreground color instead of a glyph.
         data[((atlas_h - 1) * atlas_w + (atlas_w - 1)) as usize] = 255;
 
-        let texture = Self::upload_texture(ctx, &data, atlas_w, atlas_h)?;
+        let texture = Self::upload_texture(gl, &data, atlas_w, atlas_h)?;
 
         Ok(GlyphAtlas {
             texture,
@@ -187,30 +205,33 @@ impl GlyphAtlas {
     }
 
     fn upload_texture(
-        ctx: &WebGl2RenderingContext,
+        gl: JsHandle,
         data: &[u8],
         width: u32,
         height: u32,
-    ) -> Result<WebGlTexture, String> {
-        let texture = ctx.create_texture().ok_or("create_texture")?;
-        ctx.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&texture));
-        ctx.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_MIN_FILTER, WebGl2RenderingContext::NEAREST as i32);
-        ctx.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_MAG_FILTER, WebGl2RenderingContext::NEAREST as i32);
-        ctx.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_WRAP_S, WebGl2RenderingContext::CLAMP_TO_EDGE as i32);
-        ctx.tex_parameteri(WebGl2RenderingContext::TEXTURE_2D, WebGl2RenderingContext::TEXTURE_WRAP_T, WebGl2RenderingContext::CLAMP_TO_EDGE as i32);
+    ) -> Result<JsHandle, String> {
+        let texture = ffi::gl_create_texture(gl);
+        if texture == 0 {
+            return Err("create_texture".to_string());
+        }
+        ffi::gl_bind_texture(gl, TEXTURE_2D, texture);
+        ffi::gl_tex_parameteri(gl, TEXTURE_2D, TEXTURE_MIN_FILTER, NEAREST);
+        ffi::gl_tex_parameteri(gl, TEXTURE_2D, TEXTURE_MAG_FILTER, NEAREST);
+        ffi::gl_tex_parameteri(gl, TEXTURE_2D, TEXTURE_WRAP_S, CLAMP_TO_EDGE);
+        ffi::gl_tex_parameteri(gl, TEXTURE_2D, TEXTURE_WRAP_T, CLAMP_TO_EDGE);
 
-        ctx.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
-            WebGl2RenderingContext::TEXTURE_2D,
+        ffi::gl_tex_image_2d_alpha(
+            gl,
+            TEXTURE_2D,
             0,
-            WebGl2RenderingContext::ALPHA as i32,
+            ALPHA as i32,
             width as i32,
             height as i32,
             0,
-            WebGl2RenderingContext::ALPHA,
-            WebGl2RenderingContext::UNSIGNED_BYTE,
-            Some(data),
-        )
-        .map_err(|e| format!("tex_image_2d failed: {:?}", e))?;
+            ALPHA,
+            UNSIGNED_BYTE,
+            data,
+        );
         Ok(texture)
     }
 
@@ -228,14 +249,14 @@ impl GlyphAtlas {
 
     pub fn rebuild(
         &mut self,
-        ctx: &WebGl2RenderingContext,
+        gl: JsHandle,
         font: &FontRef,
         cell_w: f64,
         cell_h: f64,
         dpr: f64,
     ) -> Result<(), String> {
-        let new_atlas = Self::new(ctx, font, cell_w, cell_h, dpr)?;
-        ctx.delete_texture(Some(&self.texture));
+        let new_atlas = Self::new(gl, font, cell_w, cell_h, dpr)?;
+        ffi::gl_delete_texture(gl, self.texture);
         self.texture = new_atlas.texture;
         self.atlas_width = new_atlas.atlas_width;
         self.atlas_height = new_atlas.atlas_height;
@@ -247,48 +268,37 @@ impl GlyphAtlas {
 }
 
 pub struct GlyphBrush {
-    pub program: WebGlProgram,
-    pub pos_buffer: WebGlBuffer,
-    pub uv_buffer: WebGlBuffer,
-    pub bg_instance_buffer: WebGlBuffer,
-    pub text_instance_buffer: WebGlBuffer,
-    pub resolution_loc: WebGlUniformLocation,
-    pub atlas_loc: WebGlUniformLocation,
-    pub mode_loc: WebGlUniformLocation,
+    pub program: JsHandle,
+    pub pos_buffer: JsHandle,
+    pub uv_buffer: JsHandle,
+    pub bg_instance_buffer: JsHandle,
+    pub text_instance_buffer: JsHandle,
+    pub resolution_loc: JsHandle,
+    pub atlas_loc: JsHandle,
+    pub mode_loc: JsHandle,
 }
 
 impl GlyphBrush {
-    pub fn new(ctx: &WebGl2RenderingContext) -> Result<Self, String> {
-        let program = Self::compile_program(ctx)?;
+    pub fn new(gl: JsHandle) -> Result<Self, String> {
+        let program = Self::compile_program(gl)?;
 
-        let pos_buffer = ctx.create_buffer().ok_or("pos_buffer")?;
-        let uv_buffer = ctx.create_buffer().ok_or("uv_buffer")?;
-        let bg_instance_buffer = ctx.create_buffer().ok_or("bg_instance_buffer")?;
-        let text_instance_buffer = ctx.create_buffer().ok_or("text_instance_buffer")?;
+        let pos_buffer = Self::new_buffer(gl, "pos_buffer")?;
+        let uv_buffer = Self::new_buffer(gl, "uv_buffer")?;
+        let bg_instance_buffer = Self::new_buffer(gl, "bg_instance_buffer")?;
+        let text_instance_buffer = Self::new_buffer(gl, "text_instance_buffer")?;
 
         let quad_verts: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
         let quad_uvs: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
 
-        ctx.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&pos_buffer));
-        ctx.buffer_data_with_array_buffer_view(
-            WebGl2RenderingContext::ARRAY_BUFFER,
-            &Float32Array::from(&quad_verts[..]),
-            WebGl2RenderingContext::STATIC_DRAW,
-        );
+        ffi::gl_bind_buffer(gl, ARRAY_BUFFER, pos_buffer);
+        ffi::gl_buffer_data_f32(gl, ARRAY_BUFFER, &quad_verts, STATIC_DRAW);
 
-        ctx.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&uv_buffer));
-        ctx.buffer_data_with_array_buffer_view(
-            WebGl2RenderingContext::ARRAY_BUFFER,
-            &Float32Array::from(&quad_uvs[..]),
-            WebGl2RenderingContext::STATIC_DRAW,
-        );
+        ffi::gl_bind_buffer(gl, ARRAY_BUFFER, uv_buffer);
+        ffi::gl_buffer_data_f32(gl, ARRAY_BUFFER, &quad_uvs, STATIC_DRAW);
 
-        let resolution_loc = ctx.get_uniform_location(&program, "u_resolution")
-            .ok_or("u_resolution")?;
-        let atlas_loc = ctx.get_uniform_location(&program, "u_atlas")
-            .ok_or("u_atlas")?;
-        let mode_loc = ctx.get_uniform_location(&program, "u_mode")
-            .ok_or("u_mode")?;
+        let resolution_loc = Self::new_uniform(gl, program, "u_resolution")?;
+        let atlas_loc = Self::new_uniform(gl, program, "u_atlas")?;
+        let mode_loc = Self::new_uniform(gl, program, "u_mode")?;
 
         Ok(GlyphBrush {
             program,
@@ -302,28 +312,52 @@ impl GlyphBrush {
         })
     }
 
-    fn compile_program(ctx: &WebGl2RenderingContext) -> Result<WebGlProgram, String> {
-        let vs = Self::compile_shader(ctx, WebGl2RenderingContext::VERTEX_SHADER, VERTEX_SHADER)?;
-        let fs = Self::compile_shader(ctx, WebGl2RenderingContext::FRAGMENT_SHADER, FRAGMENT_SHADER)?;
-        let program = ctx.create_program().ok_or("create_program")?;
-        ctx.attach_shader(&program, &vs);
-        ctx.attach_shader(&program, &fs);
-        ctx.link_program(&program);
-        let linked = ctx.get_program_parameter(&program, WebGl2RenderingContext::LINK_STATUS).as_bool().unwrap_or(false);
-        if !linked {
-            let log = ctx.get_program_info_log(&program).unwrap_or_default();
+    fn new_buffer(gl: JsHandle, name: &str) -> Result<JsHandle, String> {
+        let buf = ffi::gl_create_buffer(gl);
+        if buf == 0 {
+            return Err(name.to_string());
+        }
+        Ok(buf)
+    }
+
+    fn new_uniform(gl: JsHandle, program: JsHandle, name: &str) -> Result<JsHandle, String> {
+        let loc = ffi::gl_get_uniform_location(gl, program, name);
+        if loc == 0 {
+            return Err(name.to_string());
+        }
+        Ok(loc)
+    }
+
+    fn compile_program(gl: JsHandle) -> Result<JsHandle, String> {
+        let vs = Self::compile_shader(gl, VERTEX_SHADER_KIND, VERTEX_SHADER)?;
+        let fs = Self::compile_shader(gl, FRAGMENT_SHADER_KIND, FRAGMENT_SHADER)?;
+        let program = ffi::gl_create_program(gl);
+        if program == 0 {
+            return Err("create_program".to_string());
+        }
+        ffi::gl_attach_shader(gl, program, vs);
+        ffi::gl_attach_shader(gl, program, fs);
+        ffi::gl_link_program(gl, program);
+        if ffi::gl_get_program_parameter(gl, program, LINK_STATUS) == 0 {
+            let mut log = vec![0u8; 4096];
+            let n = ffi::gl_get_program_info_log(gl, program, &mut log);
+            let log = String::from_utf8_lossy(&log[..n]);
             return Err(format!("link_program failed: {}", log));
         }
         Ok(program)
     }
 
-    fn compile_shader(ctx: &WebGl2RenderingContext, kind: u32, source: &str) -> Result<WebGlShader, String> {
-        let shader = ctx.create_shader(kind).ok_or("create_shader")?;
-        ctx.shader_source(&shader, source);
-        ctx.compile_shader(&shader);
-        let compiled = ctx.get_shader_parameter(&shader, WebGl2RenderingContext::COMPILE_STATUS).as_bool().unwrap_or(false);
-        if !compiled {
-            let log = ctx.get_shader_info_log(&shader).unwrap_or_default();
+    fn compile_shader(gl: JsHandle, kind: u32, source: &str) -> Result<JsHandle, String> {
+        let shader = ffi::gl_create_shader(gl, kind);
+        if shader == 0 {
+            return Err("create_shader".to_string());
+        }
+        ffi::gl_shader_source(gl, shader, source);
+        ffi::gl_compile_shader(gl, shader);
+        if ffi::gl_get_shader_parameter(gl, shader, COMPILE_STATUS) == 0 {
+            let mut log = vec![0u8; 4096];
+            let n = ffi::gl_get_shader_info_log(gl, shader, &mut log);
+            let log = String::from_utf8_lossy(&log[..n]);
             return Err(format!("compile_shader failed: {}", log));
         }
         Ok(shader)
@@ -407,7 +441,7 @@ fn graphic_rects(
 }
 
 pub struct WebGL2Renderer {
-    pub ctx: WebGl2RenderingContext,
+    pub ctx: JsHandle,
     pub atlas: GlyphAtlas,
     pub brush: GlyphBrush,
     pub cell_w: u32,
@@ -428,25 +462,30 @@ impl WebGL2Renderer {
         dpr: f64,
         font_bytes: &[u8],
     ) -> Result<Self, String> {
-        let canvas = web_sys::window()
-            .and_then(|w| w.document())
-            .and_then(|d| d.get_element_by_id(canvas_id))
-            .and_then(|el| el.dyn_into::<web_sys::HtmlCanvasElement>().ok())
-            .ok_or_else(|| format!("canvas '#{}' not found", canvas_id))?;
+        let win = ffi::window();
+        if win == 0 {
+            return Err("window unavailable".to_string());
+        }
+        let doc = ffi::window_document(win);
+        if doc == 0 {
+            return Err("document unavailable".to_string());
+        }
+        let canvas = ffi::document_get_element_by_id(doc, canvas_id);
+        if canvas == 0 {
+            return Err(format!("canvas '#{}' not found", canvas_id));
+        }
 
-        let gl = canvas
-            .get_context("webgl2")
-            .map_err(|e| format!("get_context(webgl2): {:?}", e))?
-            .ok_or_else(|| "webgl2 context unavailable".to_string())?
-            .dyn_into::<WebGl2RenderingContext>()
-            .map_err(|_| "webgl2 cast failed".to_string())?;
+        let gl = ffi::canvas_get_webgl2(canvas);
+        if gl == 0 {
+            return Err("webgl2 context unavailable".to_string());
+        }
 
         let font_ref = FontRef::try_from_slice(font_bytes)
             .map_err(|e| format!("font load failed: {:?}", e))?;
         let font_check = font_ref.clone();
 
-        let atlas = GlyphAtlas::new(&gl, &font_check, cell_w, cell_h, dpr)?;
-        let brush = GlyphBrush::new(&gl)?;
+        let atlas = GlyphAtlas::new(gl, &font_check, cell_w, cell_h, dpr)?;
+        let brush = GlyphBrush::new(gl)?;
 
         Ok(WebGL2Renderer {
             ctx: gl,
@@ -466,7 +505,7 @@ impl WebGL2Renderer {
             .map_err(|e| format!("font reload failed: {:?}", e))?;
         let css_w = self.cell_w as f64 / self.dpr;
         let css_h = self.cell_h as f64 / self.dpr;
-        self.atlas.rebuild(&self.ctx, &font, css_w, css_h, self.dpr)
+        self.atlas.rebuild(self.ctx, &font, css_w, css_h, self.dpr)
     }
 
     pub fn render(
@@ -483,25 +522,26 @@ impl WebGL2Renderer {
         let rows = rrows as u32;
         let cols = rcols as u32;
 
-        let gl = &self.ctx;
+        let gl = self.ctx;
         let width = cols * self.cell_w;
         let height = rows * self.cell_h;
 
-        gl.viewport(0, 0, width as i32, height as i32);
-        gl.clear_color(
+        ffi::gl_viewport(gl, 0, 0, width as i32, height as i32);
+        ffi::gl_clear_color(
+            gl,
             ((default_bg >> 16) & 0xff) as f32 / 255.0,
             ((default_bg >> 8) & 0xff) as f32 / 255.0,
             ((default_bg) & 0xff) as f32 / 255.0,
             1.0,
         );
-        gl.clear(WebGl2RenderingContext::COLOR_BUFFER_BIT);
+        ffi::gl_clear(gl, COLOR_BUFFER_BIT);
 
-        gl.use_program(Some(&self.brush.program));
-        gl.uniform2f(Some(&self.brush.resolution_loc), width as f32, height as f32);
+        ffi::gl_use_program(gl, self.brush.program);
+        ffi::gl_uniform2f(gl, self.brush.resolution_loc, width as f32, height as f32);
 
-        gl.active_texture(WebGl2RenderingContext::TEXTURE0);
-        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&self.atlas.texture));
-        gl.uniform1i(Some(&self.brush.atlas_loc), 0);
+        ffi::gl_active_texture(gl, TEXTURE0);
+        ffi::gl_bind_texture(gl, TEXTURE_2D, self.atlas.texture);
+        ffi::gl_uniform1i(gl, self.brush.atlas_loc, 0);
 
         let (bg_instances, text_instances) = Self::build_instances(
             rows, cols, self.cell_w, self.cell_h, &self.atlas, screen,
@@ -511,99 +551,81 @@ impl WebGL2Renderer {
         let bg_count = bg_instances.len() / INSTANCE_FLOATS;
         let text_count = text_instances.len() / INSTANCE_FLOATS;
 
-        let pos_attr = gl.get_attrib_location(&self.brush.program, "a_position") as u32;
-        let tex_attr = gl.get_attrib_location(&self.brush.program, "a_texcoord") as u32;
-        let off_attr = gl.get_attrib_location(&self.brush.program, "a_offset") as u32;
-        let size_attr = gl.get_attrib_location(&self.brush.program, "a_size") as u32;
-        let uv_attr = gl.get_attrib_location(&self.brush.program, "a_uv") as u32;
-        let fg_attr = gl.get_attrib_location(&self.brush.program, "a_fg") as u32;
-        let bg_attr = gl.get_attrib_location(&self.brush.program, "a_bg") as u32;
-        let sel_attr = gl.get_attrib_location(&self.brush.program, "a_sel") as u32;
-        let cur_attr = gl.get_attrib_location(&self.brush.program, "a_cur") as u32;
+        let pos_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_position") as u32;
+        let tex_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_texcoord") as u32;
+        let off_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_offset") as u32;
+        let size_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_size") as u32;
+        let uv_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_uv") as u32;
+        let fg_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_fg") as u32;
+        let bg_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_bg") as u32;
+        let sel_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_sel") as u32;
+        let cur_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_cur") as u32;
 
         // Per-vertex attributes (shared across all instances)
-        gl.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&self.brush.pos_buffer));
-        gl.enable_vertex_attrib_array(pos_attr);
-        gl.vertex_attrib_pointer_with_i32(pos_attr, 2, WebGl2RenderingContext::FLOAT, false, 0, 0);
+        ffi::gl_bind_buffer(gl, ARRAY_BUFFER, self.brush.pos_buffer);
+        ffi::gl_enable_vertex_attrib_array(gl, pos_attr);
+        ffi::gl_vertex_attrib_pointer(gl, pos_attr, 2, FLOAT, false, 0, 0);
 
-        gl.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&self.brush.uv_buffer));
-        gl.enable_vertex_attrib_array(tex_attr);
-        gl.vertex_attrib_pointer_with_i32(tex_attr, 2, WebGl2RenderingContext::FLOAT, false, 0, 0);
+        ffi::gl_bind_buffer(gl, ARRAY_BUFFER, self.brush.uv_buffer);
+        ffi::gl_enable_vertex_attrib_array(gl, tex_attr);
+        ffi::gl_vertex_attrib_pointer(gl, tex_attr, 2, FLOAT, false, 0, 0);
 
         // Points the per-instance attributes at `buffer`. Called once per pass;
         // attribute pointers are stored per-attribute at pointer-set time, so
         // re-pointing with a different buffer bound switches the source.
-        let bind_instances = |gl: &WebGl2RenderingContext, buffer: &WebGlBuffer| {
-            gl.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(buffer));
+        let bind_instances = |gl: JsHandle, buffer: JsHandle| {
+            ffi::gl_bind_buffer(gl, ARRAY_BUFFER, buffer);
 
-            gl.enable_vertex_attrib_array(off_attr);
-            gl.vertex_attrib_pointer_with_i32(off_attr, 2, WebGl2RenderingContext::FLOAT, false, INSTANCE_STRIDE, 0);
-            gl.vertex_attrib_divisor(off_attr, 1);
+            ffi::gl_enable_vertex_attrib_array(gl, off_attr);
+            ffi::gl_vertex_attrib_pointer(gl, off_attr, 2, FLOAT, false, INSTANCE_STRIDE, 0);
+            ffi::gl_vertex_attrib_divisor(gl, off_attr, 1);
 
-            gl.enable_vertex_attrib_array(size_attr);
-            gl.vertex_attrib_pointer_with_i32(size_attr, 2, WebGl2RenderingContext::FLOAT, false, INSTANCE_STRIDE, 8);
-            gl.vertex_attrib_divisor(size_attr, 1);
+            ffi::gl_enable_vertex_attrib_array(gl, size_attr);
+            ffi::gl_vertex_attrib_pointer(gl, size_attr, 2, FLOAT, false, INSTANCE_STRIDE, 8);
+            ffi::gl_vertex_attrib_divisor(gl, size_attr, 1);
 
-            gl.enable_vertex_attrib_array(uv_attr);
-            gl.vertex_attrib_pointer_with_i32(uv_attr, 4, WebGl2RenderingContext::FLOAT, false, INSTANCE_STRIDE, 16);
-            gl.vertex_attrib_divisor(uv_attr, 1);
+            ffi::gl_enable_vertex_attrib_array(gl, uv_attr);
+            ffi::gl_vertex_attrib_pointer(gl, uv_attr, 4, FLOAT, false, INSTANCE_STRIDE, 16);
+            ffi::gl_vertex_attrib_divisor(gl, uv_attr, 1);
 
-            gl.enable_vertex_attrib_array(fg_attr);
-            gl.vertex_attrib_pointer_with_i32(fg_attr, 3, WebGl2RenderingContext::FLOAT, false, INSTANCE_STRIDE, 32);
-            gl.vertex_attrib_divisor(fg_attr, 1);
+            ffi::gl_enable_vertex_attrib_array(gl, fg_attr);
+            ffi::gl_vertex_attrib_pointer(gl, fg_attr, 3, FLOAT, false, INSTANCE_STRIDE, 32);
+            ffi::gl_vertex_attrib_divisor(gl, fg_attr, 1);
 
-            gl.enable_vertex_attrib_array(bg_attr);
-            gl.vertex_attrib_pointer_with_i32(bg_attr, 3, WebGl2RenderingContext::FLOAT, false, INSTANCE_STRIDE, 44);
-            gl.vertex_attrib_divisor(bg_attr, 1);
+            ffi::gl_enable_vertex_attrib_array(gl, bg_attr);
+            ffi::gl_vertex_attrib_pointer(gl, bg_attr, 3, FLOAT, false, INSTANCE_STRIDE, 44);
+            ffi::gl_vertex_attrib_divisor(gl, bg_attr, 1);
 
-            gl.enable_vertex_attrib_array(sel_attr);
-            gl.vertex_attrib_pointer_with_i32(sel_attr, 1, WebGl2RenderingContext::FLOAT, false, INSTANCE_STRIDE, 56);
-            gl.vertex_attrib_divisor(sel_attr, 1);
+            ffi::gl_enable_vertex_attrib_array(gl, sel_attr);
+            ffi::gl_vertex_attrib_pointer(gl, sel_attr, 1, FLOAT, false, INSTANCE_STRIDE, 56);
+            ffi::gl_vertex_attrib_divisor(gl, sel_attr, 1);
 
-            gl.enable_vertex_attrib_array(cur_attr);
-            gl.vertex_attrib_pointer_with_i32(cur_attr, 1, WebGl2RenderingContext::FLOAT, false, INSTANCE_STRIDE, 60);
-            gl.vertex_attrib_divisor(cur_attr, 1);
+            ffi::gl_enable_vertex_attrib_array(gl, cur_attr);
+            ffi::gl_vertex_attrib_pointer(gl, cur_attr, 1, FLOAT, false, INSTANCE_STRIDE, 60);
+            ffi::gl_vertex_attrib_divisor(gl, cur_attr, 1);
         };
 
         // --- Pass 1: Background rects (mode = 0) ---
-        gl.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&self.brush.bg_instance_buffer));
-        gl.buffer_data_with_array_buffer_view(
-            WebGl2RenderingContext::ARRAY_BUFFER,
-            &Float32Array::from(&bg_instances[..]),
-            WebGl2RenderingContext::DYNAMIC_DRAW,
-        );
-        gl.uniform1f(Some(&self.brush.mode_loc), 0.0);
-        bind_instances(gl, &self.brush.bg_instance_buffer);
-        gl.draw_arrays_instanced(
-            WebGl2RenderingContext::TRIANGLE_STRIP,
-            0,
-            4,
-            bg_count as i32,
-        );
+        ffi::gl_bind_buffer(gl, ARRAY_BUFFER, self.brush.bg_instance_buffer);
+        ffi::gl_buffer_data_f32(gl, ARRAY_BUFFER, &bg_instances, DYNAMIC_DRAW);
+        ffi::gl_uniform1f(gl, self.brush.mode_loc, 0.0);
+        bind_instances(gl, self.brush.bg_instance_buffer);
+        ffi::gl_draw_arrays_instanced(gl, TRIANGLE_STRIP, 0, 4, bg_count as i32);
 
         // --- Pass 2: Text (mode = 1) ---
-        gl.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&self.brush.text_instance_buffer));
-        gl.buffer_data_with_array_buffer_view(
-            WebGl2RenderingContext::ARRAY_BUFFER,
-            &Float32Array::from(&text_instances[..]),
-            WebGl2RenderingContext::DYNAMIC_DRAW,
-        );
-        gl.uniform1f(Some(&self.brush.mode_loc), 1.0);
-        bind_instances(gl, &self.brush.text_instance_buffer);
-        gl.draw_arrays_instanced(
-            WebGl2RenderingContext::TRIANGLE_STRIP,
-            0,
-            4,
-            text_count as i32,
-        );
+        ffi::gl_bind_buffer(gl, ARRAY_BUFFER, self.brush.text_instance_buffer);
+        ffi::gl_buffer_data_f32(gl, ARRAY_BUFFER, &text_instances, DYNAMIC_DRAW);
+        ffi::gl_uniform1f(gl, self.brush.mode_loc, 1.0);
+        bind_instances(gl, self.brush.text_instance_buffer);
+        ffi::gl_draw_arrays_instanced(gl, TRIANGLE_STRIP, 0, 4, text_count as i32);
 
-        gl.disable_vertex_attrib_array(off_attr);
-        gl.disable_vertex_attrib_array(size_attr);
-        gl.disable_vertex_attrib_array(uv_attr);
-        gl.disable_vertex_attrib_array(fg_attr);
-        gl.disable_vertex_attrib_array(bg_attr);
-        gl.disable_vertex_attrib_array(sel_attr);
-        gl.disable_vertex_attrib_array(cur_attr);
+        ffi::gl_disable_vertex_attrib_array(gl, off_attr);
+        ffi::gl_disable_vertex_attrib_array(gl, size_attr);
+        ffi::gl_disable_vertex_attrib_array(gl, uv_attr);
+        ffi::gl_disable_vertex_attrib_array(gl, fg_attr);
+        ffi::gl_disable_vertex_attrib_array(gl, bg_attr);
+        ffi::gl_disable_vertex_attrib_array(gl, sel_attr);
+        ffi::gl_disable_vertex_attrib_array(gl, cur_attr);
 
         Ok(())
     }

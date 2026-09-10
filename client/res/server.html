@@ -20,30 +20,36 @@
     <div id="sel-layer" contenteditable="false"></div>
     <div id="scrollbar"><div id="scrollbar-thumb"></div></div>
     <div id="status">connecting...</div>
+    <script src="/krust_runtime.js"></script>
     <script type="module">
-        // Load raw WASM module directly via WebAssembly JS API
+        // Load raw WASM module directly via WebAssembly JS API. The import
+        // object is provided by krust_runtime.js (the hand-written "krust"
+        // FFI module); no wasm-bindgen glue is involved.
         const wasm = await WebAssembly.instantiateStreaming(
-            fetch('/pkg/terminal_client_bg.wasm')
+            fetch('/pkg/terminal_client_bg.wasm'),
+            window.KRUST_RUNTIME.imports
         );
+        window.KRUST_RUNTIME.install(wasm.instance.exports.memory);
         const { init, process_bytes, query_replies, handle_resize, repaint,
                 key_to_bytes, set_selection, selected_text, clear_selection,
                 scroll, scroll_to, scroll_to_bottom, scroll_to_top,
                 scroll_offset, scrollback_len, version,
                 free_memory, free_string, free_result, alloc, dealloc } = wasm.instance.exports;
 
-        // WASM memory reference for reading strings/bytes returned from exports
-        const wasmMem = new Uint8Array(wasm.instance.exports.memory.buffer);
+        // WASM memory. Views are constructed fresh from mem.buffer on every
+        // use because the buffer detaches when WASM memory grows.
+        const mem = wasm.instance.exports.memory;
 
         // Read a (ptr, len) pair from WASM memory and return a JS string
         function readString(ptr, len) {
-            const bytes = new Uint8Array(wasmMem.buffer, ptr, len);
+            const bytes = new Uint8Array(mem.buffer, ptr, len);
             const s = new TextDecoder().decode(bytes);
             return s;
         }
 
         // Read a (ptr, len) pair from WASM memory and return a Uint8Array copy
         function readBytesCopy(ptr, len) {
-            const bytes = new Uint8Array(wasmMem.buffer, ptr, len);
+            const bytes = new Uint8Array(mem.buffer, ptr, len);
             return new Uint8Array(bytes); // copy
         }
 
@@ -53,8 +59,9 @@
         // For bytes, data is a Uint8Array copy and freeFn should free the bytes memory
         function exportBoxedPair(ptr) {
             // ptr points to Box<[u32; 2]>
-            const dataPtr = wasmMem[ptr] | (wasmMem[ptr + 1] << 8) | (wasmMem[ptr + 2] << 16) | (wasmMem[ptr + 3] << 24);
-            const dataLen = wasmMem[ptr + 4] | (wasmMem[ptr + 5] << 8) | (wasmMem[ptr + 6] << 16) | (wasmMem[ptr + 7] << 24);
+            const view = new Uint8Array(mem.buffer, ptr, 8);
+            const dataPtr = view[0] | (view[1] << 8) | (view[2] << 16) | (view[3] << 24);
+            const dataLen = view[4] | (view[5] << 8) | (view[6] << 16) | (view[7] << 24);
             return { dataPtr, dataLen, boxPtr: ptr };
         }
 
@@ -319,7 +326,7 @@
         // Read init result: init returns a pointer to [u32; 2] containing (json_ptr, json_len)
         const canvasIdBytes = new TextEncoder().encode('terminal-canvas');
         const canvasIdPtr = alloc(canvasIdBytes.length);
-        const wasmBuf = new Uint8Array(wasmMem.buffer, canvasIdPtr, canvasIdBytes.length);
+        const wasmBuf = new Uint8Array(mem.buffer, canvasIdPtr, canvasIdBytes.length);
         wasmBuf.set(canvasIdBytes);
         const boxPtr = init(canvasIdPtr, canvasIdBytes.length);
         dealloc(canvasIdPtr, canvasIdBytes.length);
@@ -358,7 +365,7 @@
                 const t = performance.now();
                 const sub = chunk.subarray(off, Math.min(off + 1024, chunk.length));
                 const subPtr = alloc(sub.length);
-                new Uint8Array(wasmMem.buffer, subPtr, sub.length).set(sub);
+                new Uint8Array(mem.buffer, subPtr, sub.length).set(sub);
                 const summaryPtr = process_bytes(subPtr, sub.length);
                 dealloc(subPtr, sub.length);
                 if (summaryPtr !== 0) free_result(summaryPtr);
@@ -396,7 +403,7 @@
                 bytesIn += ev.data.byteLength;
                 const byteLen = ev.data.byteLength;
                 const bytePtr = alloc(byteLen);
-                const wasmBuf = new Uint8Array(wasmMem.buffer, bytePtr, byteLen);
+                const wasmBuf = new Uint8Array(mem.buffer, bytePtr, byteLen);
                 wasmBuf.set(ev.data);
                 const boxPtr = query_replies(bytePtr, byteLen);
                 dealloc(bytePtr, byteLen);
@@ -411,7 +418,7 @@
                 if (params.get('benchskip') !== '1') {
                     const inData = new Uint8Array(ev.data);
                     const inPtr = alloc(inData.length);
-                    new Uint8Array(wasmMem.buffer, inPtr, inData.length).set(inData);
+                    new Uint8Array(mem.buffer, inPtr, inData.length).set(inData);
                     const summaryPtr = process_bytes(inPtr, inData.length);
                     dealloc(inPtr, inData.length);
                     if (summaryPtr !== 0) free_result(summaryPtr);
@@ -510,7 +517,7 @@
             // Map key to PTY bytes
             const keyBytes = new TextEncoder().encode(e.key);
             const keyPtr = alloc(keyBytes.length);
-            const wasmKeyBuf = new Uint8Array(wasmMem.buffer, keyPtr, keyBytes.length);
+            const wasmKeyBuf = new Uint8Array(mem.buffer, keyPtr, keyBytes.length);
             wasmKeyBuf.set(keyBytes);
             const bytesPtr = key_to_bytes(keyPtr, keyBytes.length, e.ctrlKey, e.altKey, e.shiftKey, e.metaKey);
             dealloc(keyPtr, keyBytes.length);

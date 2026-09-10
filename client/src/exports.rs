@@ -7,6 +7,7 @@
 use std::ffi::CString;
 use std::os::raw::c_char;
 
+use crate::ffi;
 use crate::input::map_key;
 use crate::measure::measure_cell_dimensions;
 use crate::query::collect_query_replies;
@@ -158,20 +159,17 @@ pub extern "C" fn handle_resize(width: i32, height: i32) {
         let state = guard.as_mut().ok_or(());
         if let Ok(s) = state {
             let (cw, ch) = if let Some(ctx) = s.ctx() {
-                let _ = ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+                ffi::ctx_set_transform(ctx, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
                 measure_cell_dimensions(ctx)
             } else {
                 (s.cell_width, s.cell_height)
             };
             s.set_cell_dims(cw, ch);
-            let dpr = web_sys::window()
-                .map(|w| w.device_pixel_ratio())
-                .unwrap_or(1.0)
-                .max(1.0);
+            let dpr = ffi::window_dpr(ffi::window());
             let phys_w = (width as f64) * dpr;
             let phys_h = (height as f64) * dpr;
-            let _ = s.canvas_mut().set_width(phys_w as u32);
-            let _ = s.canvas_mut().set_height(phys_h as u32);
+            ffi::canvas_set_width(s.canvas_handle(), phys_w as u32);
+            ffi::canvas_set_height(s.canvas_handle(), phys_h as u32);
             let cols = ((width as f64) / cw).floor() as u16;
             let rows = ((height as f64) / ch).floor() as u16;
             let cols = cols.max(2);

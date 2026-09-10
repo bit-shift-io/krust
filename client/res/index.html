@@ -14,8 +14,8 @@
 </head>
 <body>
     <canvas id="terminal-canvas" width="800" height="600" tabindex="0"></canvas>
-    <img src="/res/slow.png" style="display:none">
     <div id="status">loading...</div>
+    <script src="./krust_runtime.js"></script>
     <script type="module">
          import ping from './ping.js';
          const status = document.getElementById('status');
@@ -42,15 +42,16 @@
             }, 4000);
         }
 
-        // Load raw WASM module directly
+        // Load raw WASM module directly, with the "krust" FFI import module
         const wasmResp = await fetch('../pkg/terminal_client_bg.wasm');
         const wasmBytes = await wasmResp.arrayBuffer();
-        const wasm = await WebAssembly.instantiate(wasmBytes);
+        const wasm = await WebAssembly.instantiate(wasmBytes, window.KRUST_RUNTIME.imports);
+        window.KRUST_RUNTIME.install(wasm.instance.exports.memory);
         const { init, process_bytes, handle_resize, handle_click, version, alloc, dealloc, free_result, free_string } = wasm.instance.exports;
-        const wasmMem = new Uint8Array(wasm.instance.exports.memory.buffer);
+        const mem = wasm.instance.exports.memory;
 
         function readString(ptr, len) {
-            return new TextDecoder().decode(new Uint8Array(wasmMem.buffer, ptr, len));
+            return new TextDecoder().decode(new Uint8Array(mem.buffer, ptr, len));
         }
 
         try {
@@ -58,12 +59,13 @@
             // Initialize terminal
             const canvasIdBytes = new TextEncoder().encode('terminal-canvas');
             const canvasIdPtr = alloc(canvasIdBytes.length);
-            new Uint8Array(wasmMem.buffer, canvasIdPtr, canvasIdBytes.length).set(canvasIdBytes);
+            new Uint8Array(mem.buffer, canvasIdPtr, canvasIdBytes.length).set(canvasIdBytes);
             const boxPtr = init(canvasIdPtr, canvasIdBytes.length);
             dealloc(canvasIdPtr, canvasIdBytes.length);
             if (boxPtr === 0) throw new Error('init returned null');
-            const verBytes = wasmMem[boxPtr] | (wasmMem[boxPtr+1]<<8) | (wasmMem[boxPtr+2]<<16) | (wasmMem[boxPtr+3]<<24);
-            const verLen = wasmMem[boxPtr+4] | (wasmMem[boxPtr+5]<<8) | (wasmMem[boxPtr+6]<<16) | (wasmMem[boxPtr+7]<<24);
+            const boxView = new Uint8Array(mem.buffer, boxPtr, 8);
+            const verBytes = boxView[0] | (boxView[1]<<8) | (boxView[2]<<16) | (boxView[3]<<24);
+            const verLen = boxView[4] | (boxView[5]<<8) | (boxView[6]<<16) | (boxView[7]<<24);
             const ver = readString(verBytes, verLen);
             free_string(verBytes);
             free_result(boxPtr);
@@ -78,7 +80,7 @@
             canvas.style.pointerEvents = 'auto';
             const testBytes = new TextEncoder().encode('Hello World\x1b[31m red\x1b[0m');
             const testPtr = alloc(testBytes.length);
-            new Uint8Array(wasmMem.buffer, testPtr, testBytes.length).set(testBytes);
+            new Uint8Array(mem.buffer, testPtr, testBytes.length).set(testBytes);
             const summaryPtr = process_bytes(testPtr, testBytes.length);
             dealloc(testPtr, testBytes.length);
             if (summaryPtr !== 0) free_result(summaryPtr);

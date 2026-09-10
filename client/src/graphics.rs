@@ -6,8 +6,7 @@
 // seams between adjacent block and border cells. Geometry covers the cell
 // exactly (plus a small epsilon bleed) so grids and borders tile seamlessly.
 
-use web_sys::CanvasRenderingContext2d;
-
+use crate::ffi::{self, JsHandle};
 use crate::measure::css_color;
 
 /// Overdraw amount (device px) for graphic cells, hiding anti-aliasing seams.
@@ -153,7 +152,7 @@ pub(crate) fn box_geometry(c: char) -> Option<(BarSide, StemSide, LineWeight)> {
 /// Paint a graphic glyph (block element or box-drawing) as geometry covering
 /// its cell. Returns `true` when handled (caller skips the font path).
 pub(crate) fn draw_graphic_cell(
-    ctx: &CanvasRenderingContext2d,
+    ctx: JsHandle,
     col: u16,
     row: u16,
     cw: f64,
@@ -170,20 +169,19 @@ pub(crate) fn draw_graphic_cell(
         let w = (fx1 - fx0) * cw + GRAPHIC_EPS * 2.0;
         let h = (fy1 - fy0) * ch + GRAPHIC_EPS * 2.0;
         if alpha < 1.0 {
-            ctx.set_global_alpha(alpha);
+            ffi::ctx_set_global_alpha(ctx, alpha);
         }
-        ctx.set_fill_style_str(&css_color(color));
-        ctx.fill_rect(x, y, w, h);
+        ffi::ctx_set_fill_style(ctx, &css_color(color));
+        ffi::ctx_fill_rect(ctx, x, y, w, h);
         if alpha < 1.0 {
-            ctx.set_global_alpha(1.0);
+            ffi::ctx_set_global_alpha(ctx, 1.0);
         }
         return true;
     }
     let Some((bar, stem, weight)) = box_geometry(c) else {
         return false;
     };
-    let color = css_color(color);
-    ctx.set_fill_style_str(&color);
+    ffi::ctx_set_fill_style(ctx, &css_color(color));
     draw_box_lines(ctx, col, row, cw, ch, bar, stem, weight);
     true
 }
@@ -197,7 +195,7 @@ pub(crate) fn box_line_width(weight: LineWeight) -> (f64, f64) {
 }
 
 fn draw_box_lines(
-    ctx: &CanvasRenderingContext2d,
+    ctx: JsHandle,
     col: u16,
     row: u16,
     cw: f64,
@@ -220,7 +218,7 @@ fn draw_box_lines(
                 StemSide::Down => (cy - t * 0.5 - GRAPHIC_EPS, (row as f64 + 1.0) * ch - (cy - t * 0.5 - GRAPHIC_EPS) + GRAPHIC_EPS),
                 _ => unreachable!(),
             };
-            ctx.fill_rect(x, y, t, h);
+            ffi::ctx_fill_rect(ctx, x, y, t, h);
         }
         if bar != BarSide::None {
             let y = cy + off - t * 0.5;
@@ -230,7 +228,7 @@ fn draw_box_lines(
                 BarSide::Right => (cx - t * 0.5 - GRAPHIC_EPS, (col as f64 + 1.0) * cw - (cx - t * 0.5 - GRAPHIC_EPS) + GRAPHIC_EPS),
                 _ => unreachable!(),
             };
-            ctx.fill_rect(x, y, w, t);
+            ffi::ctx_fill_rect(ctx, x, y, w, t);
         }
     }
 }

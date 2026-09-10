@@ -14,6 +14,7 @@
 
 mod color;
 mod exports;
+mod ffi;
 mod graphics;
 mod input;
 mod measure;

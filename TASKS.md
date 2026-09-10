@@ -156,14 +156,50 @@ const { init, process_bytes, ... } = wasm.instance.exports;
 
 ---
 
+## Phase 6: Fully-Raw FFI (krust module) — drop web-sys/js-sys
+
+### 6.1 Replace web-sys/js-sys usage with raw `krust` imports
+
+**Status**: Completed
+
+**Changes**:
+- `client/src/ffi.rs` — `#[link(wasm_import_module = "krust")] extern "C"`
+  block (~60 imports) covering window/document/element/canvas/2D-context/WebGL2
+  with `i32` (`JsHandle`) object handles; safe `&str`/slice wrappers.
+- `measure.rs`, `graphics.rs`, `state.rs`, `renderer.rs`, `exports.rs` all
+  re-pointed at `ffi` (WebGL consts inlined; context copied by handle).
+- `client/Cargo.toml` deps now only `vt100`, `serde_json`, `ab_glyph`.
+- `client/res/krust_runtime.js` — `window.KRUST_RUNTIME` with `.imports`
+  (the `krust` import object, handle registry, 0 = null) and
+  `.install(memory)` (must be called right after instantiation).
+- `server.html` / `index.html` / `render-test.html` load the raw module with
+  `WebAssembly.instantiate*(bytes, window.KRUST_RUNTIME.imports)` then call
+  `install(instance.exports.memory)`.
+- Server now serves `/krust_runtime.js` from `client/res/`.
+
+**Verification**:
+- `cargo build -p terminal-client --lib` and `cargo test -p terminal-client --lib`
+  (38 host tests) pass on native.
+- Release wasm regenerated at `client/pkg/terminal_client_bg.wasm`; wasm dump
+  confirms 24 exports, all imports from module `krust`.
+- `client/res/render-check.sh` (headless Chromium pixel regression) passes.
+- `client/res/smoke-test.sh` (headless Firefox screenshot, green status bar)
+  passes.
+
+---
+
 ## Verification Checklist
 
 - [x] `cargo build --release` completes without network hang
 - [x] `client/pkg/terminal_client_bg.wasm` is generated
 - [x] No `terminal_client.js` generated (raw WASM only)
+- [x] No `wasm-bindgen`/`web-sys`/`js-sys` in `client/Cargo.toml`
+- [x] All wasm imports come from the `krust` module (FFI runtime)
 - [x] Terminal initializes in browser (no runtime errors)
 - [x] WebSocket connection works
 - [x] All exported functions callable from JS
 - [x] UI interactions (click, scroll, paste) work
 - [x] Terminal output renders correctly
+- [x] `render-check.sh` passes in headless Chromium
+- [x] `smoke-test.sh` passes in headless Firefox
 - [x] No console errors in browser
