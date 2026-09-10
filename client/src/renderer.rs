@@ -364,15 +364,12 @@ impl GlyphBrush {
     }
 }
 
-/// Split a default fg/bg color into (fr,fg,fb, br,bg,bb) as unit floats.
-fn default_colors(default_fg: u32, default_bg: u32) -> (f32, f32, f32, f32, f32, f32) {
+/// Decompose a packed RGB u32 into (r, g, b) unit floats.
+fn rgb_to_floats(rgb: u32) -> (f32, f32, f32) {
     (
-        ((default_fg >> 16) & 0xff) as f32 / 255.0,
-        ((default_fg >> 8) & 0xff) as f32 / 255.0,
-        (default_fg & 0xff) as f32 / 255.0,
-        ((default_bg >> 16) & 0xff) as f32 / 255.0,
-        ((default_bg >> 8) & 0xff) as f32 / 255.0,
-        (default_bg & 0xff) as f32 / 255.0,
+        ((rgb >> 16) & 0xff) as f32 / 255.0,
+        ((rgb >> 8) & 0xff) as f32 / 255.0,
+        (rgb & 0xff) as f32 / 255.0,
     )
 }
 
@@ -527,13 +524,8 @@ impl WebGL2Renderer {
         let height = rows * self.cell_h;
 
         ffi::gl_viewport(gl, 0, 0, width as i32, height as i32);
-        ffi::gl_clear_color(
-            gl,
-            ((default_bg >> 16) & 0xff) as f32 / 255.0,
-            ((default_bg >> 8) & 0xff) as f32 / 255.0,
-            ((default_bg) & 0xff) as f32 / 255.0,
-            1.0,
-        );
+        let (cr, cg, cb) = rgb_to_floats(default_bg);
+        ffi::gl_clear_color(gl, cr, cg, cb, 1.0);
         ffi::gl_clear(gl, COLOR_BUFFER_BIT);
 
         ffi::gl_use_program(gl, self.brush.program);
@@ -676,19 +668,18 @@ impl WebGL2Renderer {
                         if let Some(cell) = screen.cell(r as u16, c as u16) {
                             let fg_rgb = crate::color::cell_fg_rgb(&cell, default_fg);
                             let bg_rgb = crate::color::color_to_rgb(cell.bgcolor(), default_bg);
-                            (
-                                ((fg_rgb >> 16) & 0xff) as f32 / 255.0,
-                                ((fg_rgb >> 8) & 0xff) as f32 / 255.0,
-                                (fg_rgb & 0xff) as f32 / 255.0,
-                                ((bg_rgb >> 16) & 0xff) as f32 / 255.0,
-                                ((bg_rgb >> 8) & 0xff) as f32 / 255.0,
-                                (bg_rgb & 0xff) as f32 / 255.0,
-                            )
+                            let (fr, fg, fb) = rgb_to_floats(fg_rgb);
+                            let (br, bg, bb) = rgb_to_floats(bg_rgb);
+                            (fr, fg, fb, br, bg, bb)
                         } else {
-                            default_colors(default_fg, default_bg)
+                            let (fr, fg, fb) = rgb_to_floats(default_fg);
+                            let (br, bg, bb) = rgb_to_floats(default_bg);
+                            (fr, fg, fb, br, bg, bb)
                         }
                     } else {
-                        default_colors(default_fg, default_bg)
+                        let (fr, fg, fb) = rgb_to_floats(default_fg);
+                        let (br, bg, bb) = rgb_to_floats(default_bg);
+                        (fr, fg, fb, br, bg, bb)
                     };
 
                 // Apply visual overrides (cursor takes priority over selection)

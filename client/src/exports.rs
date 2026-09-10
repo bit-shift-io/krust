@@ -31,6 +31,17 @@ fn write_bytes_to_wasm(bytes: Vec<u8>) -> (*mut u8, usize) {
     (ptr, len)
 }
 
+/// Helper: wrap a (ptr, len) pair into the boxed struct returned by WASM exports.
+fn return_pair(ptr: *mut u8, len: usize) -> *mut u8 {
+    let boxed = Box::new([ptr as u32, len as u32]);
+    Box::into_raw(boxed) as *mut u8
+}
+
+/// Helper: return a null (0, 0) pair for error/empty results.
+fn return_null_pair() -> *mut u8 {
+    return_pair(std::ptr::null_mut(), 0)
+}
+
 /// Initialize the terminal module and receive terminal config JSON.
 ///
 /// # Parameters
@@ -39,7 +50,12 @@ fn write_bytes_to_wasm(bytes: Vec<u8>) -> (*mut u8, usize) {
 ///
 /// Returns a JSON string pointer/len pair (caller must free).
 #[no_mangle]
-pub extern "C" fn init(canvas_id_ptr: *const u8, canvas_id_len: usize) -> *mut u8 {
+pub extern "C" fn init(
+    canvas_id_ptr: *const u8,
+    canvas_id_len: usize,
+    cached_ptr: *const u8,
+    cached_len: usize,
+) -> *mut u8 {
     if canvas_id_ptr.is_null() || canvas_id_len == 0 {
         return write_string_to_wasm("".to_string()).0 as *mut u8;
     }
@@ -49,7 +65,24 @@ pub extern "C" fn init(canvas_id_ptr: *const u8, canvas_id_len: usize) -> *mut u
             .to_string()
     };
 
-    let term_state = TerminalState::new(&canvas_id)
+    // Parse optional cached cell dimensions JSON (e.g. {"w":8.0,"h":18.0}).
+    let cached = if !cached_ptr.is_null() && cached_len > 0 {
+        let json_str = unsafe {
+            std::str::from_utf8(std::slice::from_raw_parts(cached_ptr, cached_len))
+                .unwrap_or("")
+        };
+        serde_json::from_str::<serde_json::Value>(json_str)
+            .ok()
+            .and_then(|v| {
+                let w = v.get("w")?.as_f64()?;
+                let h = v.get("h")?.as_f64()?;
+                Some((w, h))
+            })
+    } else {
+        None
+    };
+
+    let term_state = TerminalState::new(&canvas_id, cached)
         .unwrap_or_else(|_| panic!("terminal init failed"));
 
     let state_json = serde_json::json!({
@@ -63,9 +96,7 @@ pub extern "C" fn init(canvas_id_ptr: *const u8, canvas_id_len: usize) -> *mut u
 
 TERM_STATE.with(|s| *s.borrow_mut() = Some(term_state));
      let (ptr, len) = write_string_to_wasm(state_json);
-     // Actually return ptr and len as a struct-like pair via heap allocation
-     let boxed = Box::new([ptr as u32, len as u32]);
-     Box::into_raw(boxed) as *mut u8
+     return_pair(ptr as *mut u8, len)
 }
 
 /// Process incoming ANSI bytes from the WebSocket.
@@ -99,13 +130,9 @@ pub extern "C" fn process_bytes(bytes_ptr: *const u8, bytes_len: usize) -> *mut 
     match result {
         Ok(json) => {
             let (ptr, len) = write_string_to_wasm(json);
-            let boxed = Box::new([ptr as u32, len as u32]);
-            Box::into_raw(boxed) as *mut u8
+            return_pair(ptr as *mut u8, len)
         }
-        Err(_) => {
-            let boxed = Box::new([0u32, 0u32]);
-            Box::into_raw(boxed) as *mut u8
-        }
+        Err(_) => return_null_pair(),
     }
 }
 
@@ -129,13 +156,9 @@ pub extern "C" fn query_replies(bytes_ptr: *const u8, bytes_len: usize) -> *mut 
     match result {
         Ok(replies) => {
             let (ptr, len) = write_bytes_to_wasm(replies);
-            let boxed = Box::new([ptr as u32, len as u32]);
-            Box::into_raw(boxed) as *mut u8
+            return_pair(ptr, len)
         }
-        Err(_) => {
-            let boxed = Box::new([0u32, 0u32]);
-            Box::into_raw(boxed) as *mut u8
-        }
+        Err(_) => return_null_pair(),
     }
 }
 
@@ -194,8 +217,7 @@ pub extern "C" fn handle_resize(width: i32, height: i32) {
 pub extern "C" fn version() -> *mut u8 {
     let s = "krust-terminal 0.3.0";
     let (ptr, len) = write_string_to_wasm(s.to_string());
-    let boxed = Box::new([ptr as u32, len as u32]);
-    Box::into_raw(boxed) as *mut u8
+    return_pair(ptr as *mut u8, len)
 }
 
 /// Get the selection mode.
@@ -209,8 +231,7 @@ pub extern "C" fn selection_mode() -> *mut u8 {
         }
     });
     let (ptr, len) = write_string_to_wasm(s);
-    let boxed = Box::new([ptr as u32, len as u32]);
-    Box::into_raw(boxed) as *mut u8
+    return_pair(ptr as *mut u8, len)
 }
 
 /// Get the selected text.
@@ -227,8 +248,7 @@ pub extern "C" fn selected_text() -> *mut u8 {
         }
     });
     let (ptr, len) = write_string_to_wasm(s);
-    let boxed = Box::new([ptr as u32, len as u32]);
-    Box::into_raw(boxed) as *mut u8
+    return_pair(ptr as *mut u8, len)
 }
 
 /// Record a text selection between two grid coordinates.
@@ -270,8 +290,7 @@ pub extern "C" fn handle_click(x: i32, y: i32) -> *mut u8 {
         }
     });
     let (ptr, len) = write_string_to_wasm(s);
-    let boxed = Box::new([ptr as u32, len as u32]);
-    Box::into_raw(boxed) as *mut u8
+    return_pair(ptr as *mut u8, len)
 }
 
 /// Scroll the terminal view by `delta` lines.
@@ -370,8 +389,7 @@ pub extern "C" fn key_to_bytes(
     };
     let bytes = map_key(&key, ctrl, alt, shift, meta);
     let (ptr, len) = write_bytes_to_wasm(bytes);
-    let boxed = Box::new([ptr as u32, len as u32]);
-    Box::into_raw(boxed) as *mut u8
+    return_pair(ptr, len)
 }
 
 /// Free memory allocated by an exported function.

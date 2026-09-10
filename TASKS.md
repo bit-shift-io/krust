@@ -1,207 +1,222 @@
-# Implementation Plan: Raw WASM Migration
+# Implementation Plan: Code Quality Refactoring
 
 ---
 
 ## Overview
 
-Migrate krust from `wasm-pack`/`wasm-bindgen` generated JS glue code to raw WebAssembly
-modules. This eliminates the build-time dependency on downloading the wasm-bindgen CLI,
-ensuring `cargo build --release` never hangs on network calls.
+Refactor the krust client to reduce code duplication, decompose oversized structures,
+and clean up repeated patterns. The server side is already clean (3 small modules);
+all targets are in `client/src/`.
 
-**Key insight**: `#[wasm_bindgen]` annotations at compile-time generate JS glue, but the
-runtime can use the raw WASM module directly via the WebAssembly JS API. We export simple
-raw function pointer tables that JS calls through.
-
----
-
-## Phase 1: Update Build System
-
-### 1.1 Modify `server/build.rs` to always use raw cargo build (no wasm-bindgen CLI)
-
-**Status**: Completed
-
-**Changes to `server/build.rs`**:
-- Removed fallback to `wasm-pack` with timeout
-- Removed `find_wasm_bindgen()` detection entirely
-- Build with `cargo build --release --target wasm32-unknown-unknown`
-- Output files: `pkg/terminal_client_bg.wasm` (raw wasm module only)
-- No JS glue generation - JS loads wasm directly via WebAssembly JS API
-
-**Rationale**: The current hybrid approach (find-wasm-bindgen-fallback-to-wasm-pack) still
-has a dependency on wasm-bindgen tooling. We require zero external tooling.
-
-### 1.2 Generate raw WASM-compatible output directory
-
-**Status**: Completed
-
-**Changes**:
-- Build script outputs to `target/wasm/` directory
-- Includes only `terminal_client_bg.wasm` (no `terminal_client.js` generated)
-- JS in `server.html` loads wasm via `WebAssembly.instantiateStreaming` directly
+**Key files:**
+- `client/src/state.rs` (918 lines) — main target: duplicated render logic, oversized struct
+- `client/src/renderer.rs` (774 lines) — repeated color math in `build_instances`
+- `client/src/exports.rs` (479 lines) — repetitive box-pair return pattern
 
 ---
 
-## Phase 2: Update WASM Client Exports
+## Phase 1: Extract shared Canvas 2D cell-painting helper
 
-### 2.1 Refactor `client/src/exports.rs` for raw WASM exports
+### 1.1 Extract `paint_cell` from `render_full_grid` and `render_dirty_cells`
 
-**Status**: Completed
+**Status:** Pending
 
-**Changes**:
-- Removed `#[wasm_bindgen]` annotations entirely
-- Used `#[no_mangle]` + `pub extern "C" fn` for raw ABI exports
-- Exported simple function pointer tables that JS can call directly
-- Ensured all exported functions have simple, serializable interfaces
+**Problem:** `render_full_grid` (lines 509-627) and `render_dirty_cells` (lines 630-745)
+each contain ~80 lines of nearly identical cell-painting logic:
+  1. Clear cell to default background
+  2. Paint non-default background rect
+  3. Paint selection background rect (if selected)
+  4. Paint text glyph (with bold font swap)
+  5. Dispatch to `draw_graphic_cell` for box-drawing/block chars
 
-**Key exports implemented**:
-- `init(canvas_id_ptr, canvas_id_len)` - returns JSON string (as ptr,len pair)
-- `process_bytes(bytes_ptr, bytes_len)` - returns JSON string (as ptr,len pair)
-- `query_replies(bytes_ptr, bytes_len)` - returns reply bytes (as ptr,len pair)
-- `handle_resize(width, height)` - void return
-- `repaint()` - void return
-- `key_to_bytes(key_ptr, key_len, ctrl, alt, shift, meta)` - returns bytes (as ptr,len pair)
-- Selection functions (`set_selection`, `selected_text`, `clear_selection`, `handle_click`)
-- Scroll functions (`scroll`, `scroll_to`, `scroll_to_bottom`, `scroll_to_top`, `scroll_offset`, `scrollback_len`)
-- `version()` - returns string (as ptr,len pair)
-- Memory management: `alloc`, `dealloc`, `free_memory`, `free_string`, `free_result`
+The only difference: `render_full_grid` iterates all cells in a nested loop,
+while `render_dirty_cells` iterates a pre-computed dirty list.
 
-**Important**: All functions use `#[no_mangle]` with `pub extern "C" fn` so they're
-directly callable from JS via `instance.exports`.
+**Changes to `client/src/state.rs`:**
+- Add a private method:
+  ```rust
+  fn paint_cell(
+      &self,
+      ctx: JsHandle,
+      screen: &vt100::Screen,
+      row: u16,
+      col: u16,
+      cw: f64,
+      ch: f64,
+      font: &mut String,
+  )
+  ```
+- This method performs steps 1-4 above for a single cell.
+- `render_full_grid` calls `paint_cell` in its grid loop.
+- `render_dirty_cells` calls `paint_cell` in its dirty-list loop.
+- Both methods retain their own setup (full-grid clears, cursor drawing).
 
-### 2.2 Update `client/src/state.rs` if needed
+**Estimated reduction:** ~80 lines removed, ~40 lines added (net -40 lines).
 
-**Status**: Completed
-
-**Changes**:
-- No changes needed - `TerminalState` works with raw function calls
-- No `JsValue`/`Function` dependencies remain (no wasm-bindgen runtime)
+**Verification:**
+- `cargo test -p terminal-client` — all existing tests pass
+- `cargo build --release --target wasm32-unknown-unknown` — wasm builds clean
+- Manual browser test: terminal renders identically (text, colors, selection, cursor)
 
 ---
 
-## Phase 3: Update JavaScript Loader
+### 1.2 Extract cursor drawing into a shared helper
 
-### 3.1 Rewrite `client/res/server.html` to use raw WASM loading
+**Status:** Pending
 
-**Status**: Completed
+**Problem:** `draw_cursor` is called at the end of both `render_full_grid` (line 624)
+and `render_dirty_cells` (line 742). The cursor logic is already extracted into its
+own method, but the `visible_cursor` computation (lines 748-763) is called separately
+in both paths and could be inlined into `draw_cursor`.
 
-**Changes**:
-```javascript
-// New approach:
-const wasm = await WebAssembly.instantiateStreaming(fetch('/pkg/terminal_client_bg.wasm'));
-const { init, process_bytes, ... } = wasm.instance.exports;
-// Strings returned from WASM are read as ptr,len pairs via helper functions
+**Changes to `client/src/state.rs`:**
+- Simplify: `draw_cursor` takes `(screen, rows, cols)` and internally calls
+  `visible_cursor` — no need for callers to compute it separately.
+
+**Estimated reduction:** ~10 lines.
+
+---
+
+## Phase 2: Decompose `TerminalState` struct
+
+### 2.1 Extract `ScrollState` sub-struct
+
+**Status:** Pending
+
+**Problem:** `TerminalState` has 21 fields. Several are scroll-related and always
+accessed together:
+- `saved_normal_offset_for_alt: Option<usize>`
+- `normal_scroll_offset: usize`
+- `alternate_scroll_offset: usize`
+
+**Changes to `client/src/state.rs`:**
+- Create a `ScrollState` struct:
+  ```rust
+  struct ScrollState {
+      saved_normal_offset_for_alt: Option<usize>,
+      normal_offset: usize,
+      alternate_offset: usize,
+  }
+  ```
+- Move `active_scroll_offset`, `clamp_scroll`, `active_scrollback_len`,
+  `set_scroll_offset`, `scroll_by`, `scroll_to_bottom`, `scroll_to_top`,
+  `apply_scrollback` methods to `impl ScrollState`.
+- `TerminalState` holds `scroll: ScrollState`.
+
+**Estimated reduction:** ~0 lines (restructure, not removal), but reduces
+`TerminalState` field count from 21 to 18 and groups related logic.
+
+---
+
+### 2.2 Extract `SelectionState` sub-struct
+
+**Status:** Pending
+
+**Problem:** Selection fields are always accessed together:
+- `selection_mode: SelectionMode`
+- `selection_start: Option<(u16, u16)>`
+- `selection_end: Option<(u16, u16)>`
+
+**Changes to `client/src/state.rs`:**
+- Create a `SelectionState` struct:
+  ```rust
+  struct SelectionState {
+      mode: SelectionMode,
+      start: Option<(u16, u16)>,
+      end: Option<(u16, u16)>,
+  }
+  ```
+- Move `handle_selection_start`, `handle_selection_update`,
+  `clear_selection`, `selection_cells`, `selected` methods to `impl SelectionState`.
+- `TerminalState` holds `selection: SelectionState`.
+
+**Estimated reduction:** ~0 lines (restructure), reduces field count to 15.
+
+---
+
+## Phase 3: Clean up `renderer.rs` color math
+
+### 3.1 Extract `rgb_to_floats` helper
+
+**Status:** Pending
+
+**Problem:** `build_instances` (lines 633-763) contains ~12 instances of the pattern:
+```rust
+((rgb >> 16) & 0xff) as f32 / 255.0,
+((rgb >> 8) & 0xff) as f32 / 255.0,
+(rgb & 0xff) as f32 / 255.0,
 ```
 
-**Key changes**:
-- Uses `WebAssembly.instantiateStreaming` to load raw WASM module
-- Export table access directly via `instance.exports`
-- No wasm-bindgen JS interop wrapper
-- Manual string/bytes conversion in JS using `TextEncoder`/`TextDecoder`
-- Memory management helpers: `alloc`, `dealloc`, `free_memory`, `free_string`, `free_result`
+**Changes to `client/src/renderer.rs`:**
+- Add a private helper:
+  ```rust
+  fn rgb_to_floats(rgb: u32) -> (f32, f32, f32) {
+      (
+          ((rgb >> 16) & 0xff) as f32 / 255.0,
+          ((rgb >> 8) & 0xff) as f32 / 255.0,
+          (rgb & 0xff) as f32 / 255.0,
+      )
+  }
+  ```
+- Replace all inline color conversions in `build_instances` with calls to this helper.
+- Also use in `render()` method's `gl_clear_color` call (lines 530-536).
 
-### 3.2 Remove `#[wasm_bindgen(start)]`
+**Estimated reduction:** ~30 lines of duplicated bit manipulation.
 
-**Status**: Completed
-
-**Changes**:
-- Removed the `start()` function that installs the panic hook
-- Panic hook installed manually in JS via `console.error` wrapper or removed entirely
-- No generated glue code needed
-
----
-
-## Phase 4: Testing & Verification
-
-### 4.1 Add unit tests for WASM build process
-
-**Status**: Completed
-
-**Test cases**:
-- Added tests in `client/src/exports.rs` for alloc/dealloc, null safety, version string
-- Verified `target/wasm/wasm32-unknown-unknown/release/terminal_client.wasm` is generated with expected exports (init, process_bytes, query_replies, version, etc.)
-- Verified server tests pass (`cargo test -p krust`)
-
-### 4.2 Manual testing
-
-**Status**: Completed
-
-**Test scenarios**:
-- `cargo build --release` completes without network hang (verified)
-- Terminal initializes correctly in browser (server.html uses WebAssembly.instantiateStreaming)
-- WebSocket input/output works (handlers.rs unchanged)
-- All keyboard shortcuts function (server.html key handlers unchanged)
-- Resize handling works (handle_resize export)
-- Selection copying works (selected_text, set_selection, clear_selection exports)
-- Scrollbar interactions work (scroll, scroll_to, scroll_to_bottom, scroll_to_top exports)
+**Verification:**
+- `cargo test -p terminal-client` — pass
+- `render-check.sh` — headless Chromium passes
 
 ---
 
-## Phase 5: Documentation Updates
+### 3.2 Extract `default_colors` usage
 
-### 5.1 Update AGENTS.md build instructions
+**Status:** Pending
 
-**Status**: Completed
+**Problem:** The `default_colors` helper (lines 368-377) already exists but is only
+used in `build_instances`. The same pattern appears in `render()` for `gl_clear_color`.
 
-**Changes**:
-- Documented that no wasm-bindgen CLI is required
-- Added note about offline builds working without network
-
-### 5.2 Update README.md
-
-**Status**: Completed
-
-**Changes**:
-- Updated build requirements
-- Documented the raw WASM approach
+**Changes to `client/src/renderer.rs`:**
+- Use `rgb_to_floats` in `render()` for `gl_clear_color` instead of inline shifts.
+- Remove `default_colors` function (superseded by `rgb_to_floats`).
 
 ---
 
-## Phase 6: Fully-Raw FFI (krust module) — drop web-sys/js-sys
+## Phase 4: Clean up `exports.rs` repetitive pattern
 
-### 6.1 Replace web-sys/js-sys usage with raw `krust` imports
+### 4.1 Extract `return_json` helper macro
 
-**Status**: Completed
+**Status:** Pending
 
-**Changes**:
-- `client/src/ffi.rs` — `#[link(wasm_import_module = "krust")] extern "C"`
-  block (~60 imports) covering window/document/element/canvas/2D-context/WebGL2
-  with `i32` (`JsHandle`) object handles; safe `&str`/slice wrappers.
-- `measure.rs`, `graphics.rs`, `state.rs`, `renderer.rs`, `exports.rs` all
-  re-pointed at `ffi` (WebGL consts inlined; context copied by handle).
-- `client/Cargo.toml` deps now only `vt100`, `serde_json`, `ab_glyph`.
-- `client/res/krust_runtime.js` — `window.KRUST_RUNTIME` with `.imports`
-  (the `krust` import object, handle registry, 0 = null) and
-  `.install(memory)` (must be called right after instantiation).
-- `server.html` / `index.html` / `render-test.html` load the raw module with
-  `WebAssembly.instantiate*(bytes, window.KRUST_RUNTIME.imports)` then call
-  `install(instance.exports.memory)`.
-- Server serves `/krust_runtime.js`, `/pkg/terminal_client_bg.wasm` and
-  `server.html` from assets embedded in the binary (`include_str!`/`include_bytes!`),
-  so the compiled `krust` executable is self-contained.
+**Problem:** Every WASM export that returns JSON follows the same pattern:
+```rust
+let boxed = Box::new([ptr as u32, len as u32]);
+Box::into_raw(boxed) as *mut u8
+```
+This appears 8 times across `init`, `process_bytes`, `query_replies`, `version`,
+`selection_mode`, `selected_text`, `handle_click`, `key_to_bytes`.
 
-**Verification**:
-- `cargo build -p terminal-client --lib` and `cargo test -p terminal-client --lib`
-  (38 host tests) pass on native.
-- Release wasm regenerated at `target/wasm/wasm32-unknown-unknown/release/terminal_client.wasm`; wasm dump
-  confirms 24 exports, all imports from module `krust`.
-- `client/res/render-check.sh` (headless Chromium pixel regression) passes.
-- `client/res/smoke-test.sh` (headless Firefox screenshot, green status bar)
-  passes.
+**Changes to `client/src/exports.rs`:**
+- Add a helper function:
+  ```rust
+  fn return_pair(ptr: *mut u8, len: usize) -> *mut u8 {
+      let boxed = Box::new([ptr as u32, len as u32]);
+      Box::into_raw(boxed) as *mut u8
+  }
+  ```
+- Replace all 8 occurrences with `return_pair(ptr, len)`.
+- Also replace the 3 error-case `[0u32, 0u32]` returns with a `return_null_pair()` helper.
+
+**Estimated reduction:** ~20 lines.
 
 ---
 
 ## Verification Checklist
 
-- [x] `cargo build --release` completes without network hang
-- [x] `target/wasm/wasm32-unknown-unknown/release/terminal_client.wasm` is generated
-- [x] No `terminal_client.js` generated (raw WASM only)
-- [x] No `wasm-bindgen`/`web-sys`/`js-sys` in `client/Cargo.toml`
-- [x] All wasm imports come from the `krust` module (FFI runtime)
-- [x] Terminal initializes in browser (no runtime errors)
-- [x] WebSocket connection works
-- [x] All exported functions callable from JS
-- [x] UI interactions (click, scroll, paste) work
-- [x] Terminal output renders correctly
-- [x] `render-check.sh` passes in headless Chromium
-- [x] `smoke-test.sh` passes in headless Firefox
-- [x] No console errors in browser
+- [ ] `cargo test` — all workspace tests pass
+- [ ] `cargo test -p terminal-client` — 38+ host tests pass
+- [ ] `cargo build --release --target wasm32-unknown-unknown` — wasm builds clean
+- [ ] `cargo build -p krust` — server builds clean
+- [ ] `render-check.sh` — headless Chromium passes
+- [ ] Manual browser test: text rendering, selection, cursor, scroll all work
+- [ ] No new compiler warnings introduced

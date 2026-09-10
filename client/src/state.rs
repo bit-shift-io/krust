@@ -65,6 +65,92 @@ pub(crate) fn normalize_save_restore(bytes: &[u8], carry: &mut Vec<u8>) -> Vec<u
     out
 }
 
+/// Scroll-related state, grouped for clarity.
+struct ScrollState {
+    /// Normal screen scrollback offset saved when entering alternate screen
+    saved_normal_offset_for_alt: Option<usize>,
+    /// Scrollback view offset for the normal screen (0 = at bottom, >0 = scrolled up)
+    normal_offset: usize,
+    /// Scrollback view offset for the alternate screen (typically always 0)
+    alternate_offset: usize,
+}
+
+impl ScrollState {
+    fn new() -> Self {
+        Self {
+            saved_normal_offset_for_alt: None,
+            normal_offset: 0,
+            alternate_offset: 0,
+        }
+    }
+
+    fn offset(&self, alternate: bool) -> usize {
+        if alternate {
+            self.alternate_offset
+        } else {
+            self.normal_offset
+        }
+    }
+
+    fn set_offset(&mut self, alternate: bool, offset: usize) {
+        if alternate {
+            self.alternate_offset = offset;
+        } else {
+            self.normal_offset = offset;
+        }
+    }
+}
+
+/// Selection-related state, grouped for clarity.
+struct SelectionState {
+    /// Selection mode
+    mode: SelectionMode,
+    /// Text selection start cell
+    start: Option<(u16, u16)>,
+    /// Text selection end cell
+    end: Option<(u16, u16)>,
+}
+
+impl SelectionState {
+    fn new() -> Self {
+        Self {
+            mode: SelectionMode::None,
+            start: None,
+            end: None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.start = None;
+        self.end = None;
+        self.mode = SelectionMode::None;
+    }
+
+    fn is_selected(&self, row: u16, col: u16) -> bool {
+        match (self.start, self.end) {
+            (Some(a), Some(b)) => cell_is_selected(a, b, row, col),
+            _ => false,
+        }
+    }
+
+    fn cells(&self, cols: u16) -> Vec<(u16, u16)> {
+        let (Some(a), Some(b)) = (self.start, self.end) else {
+            return Vec::new();
+        };
+        let ((sr, sc), (er, ec)) = normalized_bounds(a, b);
+        let cols = cols.max(1);
+        let mut cells = Vec::new();
+        for row in sr..=er {
+            let c0 = if row == sr { sc } else { 0 };
+            let c1 = if row == er { ec.min(cols - 1) } else { cols - 1 };
+            for col in c0..=c1 {
+                cells.push((row, col));
+            }
+        }
+        cells
+    }
+}
+
 /// Terminal state fields.
 ///
 /// Holds the vt100 parser, the active renderer (Canvas 2D default, WebGL2
@@ -88,18 +174,10 @@ pub(crate) struct TerminalState {
     pub(crate) cell_width: f64,
     /// Measured cell height in CSS pixels
     pub(crate) cell_height: f64,
-    /// Selection mode
-    selection_mode: SelectionMode,
-    /// Normal screen scrollback offset saved when entering alternate screen
-    saved_normal_offset_for_alt: Option<usize>,
-    /// Text selection start cell
-    selection_start: Option<(u16, u16)>,
-    /// Text selection end cell
-    selection_end: Option<(u16, u16)>,
-    /// Scrollback view offset for the normal screen (0 = normal screen at bottom, >0 = scrolled up)
-    normal_scroll_offset: usize,
-    /// Scrollback view offset for the alternate screen (typically always 0)
-    alternate_scroll_offset: usize,
+    /// Scroll-related state
+    scroll: ScrollState,
+    /// Selection-related state
+    selection: SelectionState,
     /// Previous screen state, used to diff against the current screen after
     /// each `process_bytes` batch to find cells that changed.
     prev_screen: Option<vt100::Screen>,
@@ -125,7 +203,7 @@ impl TerminalState {
     ///
     /// # Parameters
     /// * `canvas_id` - HTML canvas element ID
-    pub(crate) fn new(canvas_id: &str) -> Result<Self, String> {
+    pub(crate) fn new(canvas_id: &str, cached: Option<(f64, f64)>) -> Result<Self, String> {
         let parser = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
 
         let win = ffi::window();
@@ -142,10 +220,12 @@ impl TerminalState {
         // Try Canvas 2D first; fall back to WebGL2
         let dpr = ffi::window_dpr(win);
 
-        // Measure cell dims via a scratch canvas so the real terminal canvas is
-        // never given a context before the primary renderer is chosen (a canvas
-        // only supports one context type).
-        let (cell_width, cell_height) = measure_cell_dimensions_scratch()
+        // Use cached cell dims when available (avoids scratch canvas measurement
+        // on repeat visits). Fall back to a scratch canvas measurement, then to
+        // sensible defaults.
+        let (cell_width, cell_height) = cached
+            .filter(|(w, h)| *w > 0.0 && *h > 0.0)
+            .or_else(|| measure_cell_dimensions_scratch())
             .unwrap_or((14.0, 20.0));
 
         // Canvas 2D primary path. Text rendering is currently unreliable under
@@ -198,12 +278,8 @@ impl TerminalState {
             cols,
             cell_width,
             cell_height,
-            selection_mode: SelectionMode::None,
-            saved_normal_offset_for_alt: None,
-            selection_start: None,
-            selection_end: None,
-            normal_scroll_offset: 0,
-            alternate_scroll_offset: 0,
+            scroll: ScrollState::new(),
+            selection: SelectionState::new(),
             prev_screen: None,
             dirty_cells: Vec::new(),
             full_redraw: true,
@@ -231,11 +307,11 @@ impl TerminalState {
         let screen_after = self.parser.screen().alternate_screen();
 
         if !screen_before && screen_after {
-            self.saved_normal_offset_for_alt = Some(self.normal_scroll_offset);
-            self.parser.screen_mut().set_scrollback(self.normal_scroll_offset);
+            self.scroll.saved_normal_offset_for_alt = Some(self.scroll.normal_offset);
+            self.parser.screen_mut().set_scrollback(self.scroll.normal_offset);
         } else if screen_before && !screen_after {
-            if let Some(saved) = self.saved_normal_offset_for_alt.take() {
-                self.normal_scroll_offset = saved;
+            if let Some(saved) = self.scroll.saved_normal_offset_for_alt.take() {
+                self.scroll.normal_offset = saved;
                 self.parser.screen_mut().set_scrollback(saved);
             }
         }
@@ -316,11 +392,7 @@ impl TerminalState {
     /// Returns the scroll offset for the currently active screen.
     fn active_scroll_offset(&self) -> usize {
         let screen = self.parser.screen();
-        if screen.alternate_screen() {
-            self.alternate_scroll_offset
-        } else {
-            self.normal_scroll_offset
-        }
+        self.scroll.offset(screen.alternate_screen())
     }
 
     /// Clamp the current scroll offset to the actual scrollback bounds.
@@ -329,21 +401,13 @@ impl TerminalState {
         let cur = self.active_scroll_offset();
         if cur > max {
             let screen = self.parser.screen();
-            if screen.alternate_screen() {
-                self.alternate_scroll_offset = max;
-            } else {
-                self.normal_scroll_offset = max;
-            }
+            self.scroll.set_offset(screen.alternate_screen(), max);
         }
     }
 
     /// Returns the scrollback length for the currently active screen.
     fn active_scrollback_len(&mut self) -> usize {
-        let offset = if self.parser.screen().alternate_screen() {
-            self.alternate_scroll_offset
-        } else {
-            self.normal_scroll_offset
-        };
+        let offset = self.active_scroll_offset();
         let screen = self.parser.screen_mut();
         screen.set_scrollback(usize::MAX);
         let max = screen.scrollback();
@@ -366,13 +430,8 @@ impl TerminalState {
         let current = self.active_scroll_offset();
         if current != offset {
             self.clear_selection();
-            // Update the appropriate offset
             let screen = self.parser.screen();
-            if screen.alternate_screen() {
-                self.alternate_scroll_offset = offset;
-            } else {
-                self.normal_scroll_offset = offset;
-            }
+            self.scroll.set_offset(screen.alternate_screen(), offset);
             self.clamp_scroll();
         }
         self.apply_scrollback();
@@ -403,17 +462,13 @@ impl TerminalState {
     /// currently active screen.
     fn apply_scrollback(&mut self) {
         let screen_alt = self.parser.screen().alternate_screen();
-        let offset = if screen_alt {
-            self.alternate_scroll_offset
-        } else {
-            self.normal_scroll_offset
-        };
+        let offset = self.scroll.offset(screen_alt);
         let old_offset = self.parser.screen().scrollback();
         if old_offset != offset {
             ffi::console_log(&format!(
                 "APPLY_SCROLLBACK: screen_alt={} old_off={} new_off={} normal={} alt={}",
                 screen_alt, old_offset, offset,
-                self.normal_scroll_offset, self.alternate_scroll_offset
+                self.scroll.normal_offset, self.scroll.alternate_offset
             ));
             self.parser.screen_mut().set_scrollback(offset);
         }
@@ -453,20 +508,7 @@ impl TerminalState {
     /// the row, intermediate rows are selected in full, and the last row runs
     /// from column 0 to the end column.
     fn selection_cells(&self) -> Vec<(u16, u16)> {
-        let (Some(a), Some(b)) = (self.selection_start, self.selection_end) else {
-            return Vec::new();
-        };
-        let ((sr, sc), (er, ec)) = normalized_bounds(a, b);
-        let cols = self.cols.max(1);
-        let mut cells = Vec::new();
-        for row in sr..=er {
-            let c0 = if row == sr { sc } else { 0 };
-            let c1 = if row == er { ec.min(cols - 1) } else { cols - 1 };
-            for col in c0..=c1 {
-                cells.push((row, col));
-            }
-        }
-        cells
+        self.selection.cells(self.cols)
     }
 
     /// Draw the current parser screen with native Canvas 2D text.
@@ -520,7 +562,7 @@ impl TerminalState {
         let css_w = ffi::canvas_width(self.canvas) as f64 / dpr;
         let css_h = ffi::canvas_height(self.canvas) as f64 / dpr;
 
-        // 1. Clear to default background
+        // Clear to default background
         ffi::ctx_set_fill_style(ctx, &css_color(DEFAULT_BG));
         ffi::ctx_fill_rect(ctx, 0.0, 0.0, css_w.max(1.0), css_h.max(1.0));
         ffi::ctx_set_text_baseline(ctx, "middle");
@@ -528,98 +570,14 @@ impl TerminalState {
         let mut font = FONT_STACK.to_string();
         ffi::ctx_set_font(ctx, &font);
 
-        // 2. Background rects for cells with non-default background
+        // Paint each cell
         for row in 0..rows {
             for col in 0..cols {
-                let bg = if row < prows && col < pcols {
-                    match screen.cell(row, col) {
-                        Some(c) => color_to_rgb(c.bgcolor(), DEFAULT_BG),
-                        _ => DEFAULT_BG,
-                    }
-                } else {
-                    DEFAULT_BG
-                };
-                if bg != DEFAULT_BG && !self.selected(row, col) {
-                    ffi::ctx_set_fill_style(ctx, &css_color(bg));
-                    ffi::ctx_fill_rect(
-                        ctx,
-                        col as f64 * cw,
-                        row as f64 * ch,
-                        cw,
-                        ch,
-                    );
-                }
+                self.paint_cell(ctx, screen, row, col, cw, ch, prows, pcols, &mut font);
             }
         }
 
-        // 3. Draw selection background rects BEFORE text
-        for row in 0..rows {
-            for col in 0..cols {
-                if self.selected(row, col) {
-                    let (fg0, bg0) = if row < prows && col < pcols {
-                        match screen.cell(row, col) {
-                            Some(c) => (
-                                cell_fg_rgb(&c, DEFAULT_FG),
-                                color_to_rgb(c.bgcolor(), DEFAULT_BG),
-                            ),
-                            _ => (DEFAULT_FG, DEFAULT_BG),
-                        }
-                    } else {
-                        (DEFAULT_FG, DEFAULT_BG)
-                    };
-                    let (mut fg, mut bg) = (fg0, bg0);
-                    std::mem::swap(&mut fg, &mut bg);
-                    ffi::ctx_set_fill_style(ctx, &css_color(bg));
-                    ffi::ctx_fill_rect(
-                        ctx,
-                        col as f64 * cw - CELL_EPSILON,
-                        row as f64 * ch - CELL_EPSILON,
-                        cw + CELL_EPSILON * 2.0,
-                        ch + CELL_EPSILON * 2.0,
-                    );
-                }
-            }
-        }
-
-        // 4. Draw all text on top of selection
-        const SELECTION_FG: u32 = 0x000000;
-        for row in 0..rows {
-            for col in 0..cols {
-                let (fg, text) = if row < prows && col < pcols {
-                    match screen.cell(row, col) {
-                        Some(c) if !c.contents().is_empty() => (
-                            cell_fg_rgb(&c, DEFAULT_FG),
-                            Some((c.contents().to_string(), c.bold())),
-                        ),
-                        _ => (DEFAULT_FG, None),
-                    }
-                } else {
-                    (DEFAULT_FG, None)
-                };
-                if let Some((s, bold)) = text {
-                    let draw_fg = if self.selected(row, col) { SELECTION_FG } else { fg };
-                    if draw_fg != DEFAULT_BG {
-                        if draw_graphic_cell(ctx, col, row, cw, ch, &s, draw_fg) {
-                            continue;
-                        }
-                        let want = if bold { FONT_STACK_BOLD } else { FONT_STACK };
-                        if font != want {
-                            font = want.to_string();
-                            ffi::ctx_set_font(ctx, &font);
-                        }
-                        ffi::ctx_set_fill_style(ctx, &css_color(draw_fg));
-                        ffi::ctx_fill_text(
-                            ctx,
-                            &s,
-                            col as f64 * cw,
-                            row as f64 * ch + ch * 0.5,
-                        );
-                    }
-                }
-            }
-        }
-
-// 5. Cursor: background then text (hidden when scrolled into history)
+        // Cursor: background then text (hidden when scrolled into history)
         let cur = self.visible_cursor(screen, rows, cols);
         let cursor_pos = self.draw_cursor(ctx, cur, cw, ch)?;
         self.prev_cursor = cursor_pos;
@@ -642,13 +600,11 @@ impl TerminalState {
         let css_w = ffi::canvas_width(self.canvas) as f64 / dpr;
         let css_h = ffi::canvas_height(self.canvas) as f64 / dpr;
 
-        // Clear the entire canvas to default background so no stale
-        // pixels leak between cells (sub-pixel gaps, cursor highlights, etc.).
+        // Clear entire canvas to default background
         ffi::ctx_set_fill_style(ctx, &css_color(DEFAULT_BG));
         ffi::ctx_fill_rect(ctx, 0.0, 0.0, css_w.max(1.0), css_h.max(1.0));
 
-        // Cells to repaint: everything marked dirty, plus the current and
-        // previous cursor cells (cursor highlight must follow the cursor).
+        // Cells to repaint: everything marked dirty, plus current and previous cursor cells
         let cur = self.visible_cursor(screen, rows, cols);
         if let Some(c) = cur {
             dirty.push(c);
@@ -666,78 +622,10 @@ impl TerminalState {
         ffi::ctx_set_font(ctx, &font);
 
         for &(row, col) in dirty.iter() {
-            // Full-cell base repaint in default background clears any stale
-            // glyph or highlight left by the previous frame.
-            ffi::ctx_set_fill_style(ctx, &css_color(DEFAULT_BG));
-            ffi::ctx_fill_rect(ctx, col as f64 * cw, row as f64 * ch, cw, ch);
-
-            let cell = if row < prows && col < pcols {
-                screen.cell(row, col)
-            } else {
-                None
-            };
-            let selected = self.selected(row, col);
-
-            // 2. Background if non-default.
-            let bg = match cell {
-                Some(c) => color_to_rgb(c.bgcolor(), DEFAULT_BG),
-                _ => DEFAULT_BG,
-            };
-            if bg != DEFAULT_BG && !selected {
-                ffi::ctx_set_fill_style(ctx, &css_color(bg));
-                ffi::ctx_fill_rect(ctx, col as f64 * cw, row as f64 * ch, cw, ch);
-            }
-
-            // 3. Selection background BEFORE text.
-            if selected {
-                let (fg0, bg0) = match cell {
-                    Some(c) => (
-                        cell_fg_rgb(&c, DEFAULT_FG),
-                        color_to_rgb(c.bgcolor(), DEFAULT_BG),
-                    ),
-                    _ => (DEFAULT_FG, DEFAULT_BG),
-                };
-                let (mut fg, mut bg) = (fg0, bg0);
-                std::mem::swap(&mut fg, &mut bg);
-                ffi::ctx_set_fill_style(ctx, &css_color(bg));
-                ffi::ctx_fill_rect(
-                    ctx,
-                    col as f64 * cw - CELL_EPSILON,
-                    row as f64 * ch - CELL_EPSILON,
-                    cw + CELL_EPSILON * 2.0,
-                    ch + CELL_EPSILON * 2.0,
-                );
-            }
-
-            // 4. Text.
-            if let Some(c) = cell {
-                let s = c.contents();
-                if !s.is_empty() {
-                    const SELECTION_FG: u32 = 0x000000;
-                    let fg = cell_fg_rgb(&c, DEFAULT_FG);
-                    let draw_fg = if selected { SELECTION_FG } else { fg };
-                    if draw_fg != DEFAULT_BG {
-                        if draw_graphic_cell(ctx, col, row, cw, ch, s, draw_fg) {
-                            continue;
-                        }
-                        let want = if c.bold() { FONT_STACK_BOLD } else { FONT_STACK };
-                        if font != want {
-                            font = want.to_string();
-                            ffi::ctx_set_font(ctx, &font);
-                        }
-                        ffi::ctx_set_fill_style(ctx, &css_color(draw_fg));
-                        ffi::ctx_fill_text(
-                            ctx,
-                            s,
-                            col as f64 * cw,
-                            row as f64 * ch + ch * 0.5,
-                        );
-                    }
-                }
-            }
+            self.paint_cell(ctx, screen, row, col, cw, ch, prows, pcols, &mut font);
         }
 
-        // 5. Cursor drawn last, on top of the regular cell content.
+        // Cursor drawn last, on top of the regular cell content.
         let cur = self.visible_cursor(screen, rows, cols);
         let cursor_pos = self.draw_cursor(ctx, cur, cw, ch)?;
         self.prev_cursor = cursor_pos;
@@ -746,11 +634,7 @@ impl TerminalState {
 
     /// The cursor cell to render, or `None` when scrolled into history.
     fn visible_cursor(&self, screen: &vt100::Screen, rows: u16, cols: u16) -> Option<(u16, u16)> {
-        let active_offset = if screen.alternate_screen() {
-            self.alternate_scroll_offset
-        } else {
-            self.normal_scroll_offset
-        };
+        let active_offset = self.scroll.offset(screen.alternate_screen());
         if active_offset != 0 {
             return None;
         }
@@ -807,10 +691,91 @@ impl TerminalState {
     /// Whether the given cell lies inside the active line-based (text-flow)
     /// selection (normalized so the anchor can be above/below the end).
     fn selected(&self, row: u16, col: u16) -> bool {
-        let (Some(a), Some(b)) = (self.selection_start, self.selection_end) else {
-            return false;
+        self.selection.is_selected(row, col)
+    }
+
+    /// Paint a single cell: clear to default bg, paint non-default bg,
+    /// paint selection bg, and draw text glyph.
+    fn paint_cell(
+        &self,
+        ctx: JsHandle,
+        screen: &vt100::Screen,
+        row: u16,
+        col: u16,
+        cw: f64,
+        ch: f64,
+        prows: u16,
+        pcols: u16,
+        font: &mut String,
+    ) {
+        // 1. Clear cell to default background
+        ffi::ctx_set_fill_style(ctx, &css_color(DEFAULT_BG));
+        ffi::ctx_fill_rect(ctx, col as f64 * cw, row as f64 * ch, cw, ch);
+
+        let cell = if row < prows && col < pcols {
+            screen.cell(row, col)
+        } else {
+            None
         };
-        cell_is_selected(a, b, row, col)
+        let selected = self.selected(row, col);
+
+        // 2. Non-default background rect
+        let bg = match cell {
+            Some(c) => color_to_rgb(c.bgcolor(), DEFAULT_BG),
+            _ => DEFAULT_BG,
+        };
+        if bg != DEFAULT_BG && !selected {
+            ffi::ctx_set_fill_style(ctx, &css_color(bg));
+            ffi::ctx_fill_rect(ctx, col as f64 * cw, row as f64 * ch, cw, ch);
+        }
+
+        // 3. Selection background rect (before text)
+        if selected {
+            let (fg0, bg0) = match cell {
+                Some(c) => (
+                    cell_fg_rgb(&c, DEFAULT_FG),
+                    color_to_rgb(c.bgcolor(), DEFAULT_BG),
+                ),
+                _ => (DEFAULT_FG, DEFAULT_BG),
+            };
+            let (mut fg, mut bg) = (fg0, bg0);
+            std::mem::swap(&mut fg, &mut bg);
+            ffi::ctx_set_fill_style(ctx, &css_color(bg));
+            ffi::ctx_fill_rect(
+                ctx,
+                col as f64 * cw - CELL_EPSILON,
+                row as f64 * ch - CELL_EPSILON,
+                cw + CELL_EPSILON * 2.0,
+                ch + CELL_EPSILON * 2.0,
+            );
+        }
+
+        // 4. Text glyph
+        if let Some(c) = cell {
+            let s = c.contents();
+            if !s.is_empty() {
+                const SELECTION_FG: u32 = 0x000000;
+                let fg = cell_fg_rgb(&c, DEFAULT_FG);
+                let draw_fg = if selected { SELECTION_FG } else { fg };
+                if draw_fg != DEFAULT_BG {
+                    if draw_graphic_cell(ctx, col, row, cw, ch, s, draw_fg) {
+                        return;
+                    }
+                    let want = if c.bold() { FONT_STACK_BOLD } else { FONT_STACK };
+                    if font.as_str() != want {
+                        *font = want.to_string();
+                        ffi::ctx_set_font(ctx, font);
+                    }
+                    ffi::ctx_set_fill_style(ctx, &css_color(draw_fg));
+                    ffi::ctx_fill_text(
+                        ctx,
+                        s,
+                        col as f64 * cw,
+                        row as f64 * ch + ch * 0.5,
+                    );
+                }
+            }
+        }
     }
 
     /// Trigger resize callback
@@ -819,33 +784,31 @@ impl TerminalState {
 
     /// Handle selection start
     pub(crate) fn handle_selection_start(&mut self, row: u16, col: u16) {
-        self.selection_mode = SelectionMode::Line;
-        self.selection_start = Some((row, col));
-        self.selection_end = None;
+        self.selection.mode = SelectionMode::Line;
+        self.selection.start = Some((row, col));
+        self.selection.end = None;
         self.mark_all_dirty();
     }
 
     /// Handle selection update
     pub(crate) fn handle_selection_update(&mut self, row: u16, col: u16) {
-        if let Some(ref mut end) = self.selection_end {
+        if let Some(ref mut end) = self.selection.end {
             if *end != (row, col) {
                 *end = (row, col);
                 self.mark_all_dirty();
             }
-        } else if let Some(ref _start) = self.selection_start {
-            self.selection_end = Some((row, col));
+        } else if self.selection.start.is_some() {
+            self.selection.end = Some((row, col));
             self.mark_all_dirty();
         }
     }
 
     /// Clear the active selection (reset both anchor and end to None)
     pub(crate) fn clear_selection(&mut self) {
-        if self.selection_start.is_some() || self.selection_end.is_some() {
+        if self.selection.start.is_some() || self.selection.end.is_some() {
             self.mark_all_dirty();
         }
-        self.selection_start = None;
-        self.selection_end = None;
-        self.selection_mode = SelectionMode::None;
+        self.selection.clear();
     }
 
     /// Get the canvas ID
@@ -865,17 +828,17 @@ impl TerminalState {
 
     /// Access the selection start.
     pub(crate) fn selection_start(&self) -> Option<(u16, u16)> {
-        self.selection_start
+        self.selection.start
     }
 
     /// Access the selection end.
     pub(crate) fn selection_end(&self) -> Option<(u16, u16)> {
-        self.selection_end
+        self.selection.end
     }
 
     /// Access the selection mode.
     pub(crate) fn selection_mode(&self) -> SelectionMode {
-        self.selection_mode
+        self.selection.mode
     }
 
     /// Mutable access to the WebGL renderer for resize handling.

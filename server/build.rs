@@ -36,7 +36,13 @@ fn main() {
         if let Err(e) = build_raw_wasm(&manifest_dir, &client_dir) {
             eprintln!("cargo:warning=krust: wasm build failed: {}", e);
             eprintln!("cargo:warning=krust: re-run with KRUST_SKIP_WASM_BUILD=1");
+            return;
         }
+        // Shrink the wasm binary with wasm-opt if available (20-40% smaller).
+        // Silently skipped when wasm-opt is not on PATH.
+        let _ = std::process::Command::new("wasm-opt")
+            .args(["-Oz", wasm_out.to_str().unwrap()])
+            .status();
     }
 }
 

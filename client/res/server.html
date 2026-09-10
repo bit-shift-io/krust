@@ -116,6 +116,20 @@
             newUrl.searchParams.delete('session');
             window.history.replaceState({}, '', newUrl);
         }
+
+        function buildWsUrl(path) {
+            const wsParams = new URLSearchParams({ s: sid });
+            if (startDir) wsParams.set('dir', startDir);
+            return path + '?' + wsParams.toString();
+        }
+
+        let ws = null;
+
+        // Open WebSocket early — parallel with WASM compilation.
+        // sendResize() is gated on wasmReady + ws.readyState, so it fires
+        // automatically once both are up.
+        connectPrimary(buildWsUrl('/ws'));
+
         function extractTitle(bytes) {
             let out = null;
             let i = 0;
@@ -189,11 +203,11 @@
             }, 4000);
         }
 
-        let ws = null;
         let cellW = 8;
         let cellH = 18;
         let gridCols = 80;
         let gridRows = 24;
+        let wasmReady = false;
         let selAnchor = null;
         let selDragging = false;
         let selMoved = false;
@@ -255,10 +269,11 @@
         }
 
         function sendResize() {
+            if (!wasmReady || !ws || ws.readyState !== 1) return;
             const cols = Math.max(2, Math.floor(window.innerWidth / cellW));
             const rows = Math.max(1, Math.floor(window.innerHeight / cellH));
             const msg = { type: 'Resize', cols, rows, pixel_width: window.innerWidth, pixel_height: window.innerHeight };
-            if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
+            ws.send(JSON.stringify(msg));
         }
 
         function cellFromPoint(px, py) {
@@ -321,11 +336,32 @@
         }
 
         // Read init result: init returns a pointer to [u32; 2] containing (json_ptr, json_len)
+        const dpr = Math.min(3, window.devicePixelRatio || 1);
+        const cacheKey = 'krust_cells_dpr';
+        let cachedDims = null;
+        try {
+            const raw = sessionStorage.getItem(cacheKey);
+            if (raw) {
+                const c = JSON.parse(raw);
+                if (c.dpr === dpr && c.w > 0 && c.h > 0) cachedDims = { w: c.w, h: c.h };
+            }
+        } catch (_) {}
+
         const canvasIdBytes = new TextEncoder().encode('terminal-canvas');
         const canvasIdPtr = alloc(canvasIdBytes.length);
         const wasmBuf = new Uint8Array(mem.buffer, canvasIdPtr, canvasIdBytes.length);
         wasmBuf.set(canvasIdBytes);
-        const boxPtr = init(canvasIdPtr, canvasIdBytes.length);
+        let cachedPtr = 0, cachedLen = 0;
+        let cachedJson = '';
+        if (cachedDims) {
+            cachedJson = JSON.stringify(cachedDims);
+            const cjBytes = new TextEncoder().encode(cachedJson);
+            cachedPtr = alloc(cjBytes.length);
+            new Uint8Array(mem.buffer, cachedPtr, cjBytes.length).set(cjBytes);
+            cachedLen = cjBytes.length;
+        }
+        const boxPtr = init(canvasIdPtr, canvasIdBytes.length, cachedPtr, cachedLen);
+        if (cachedPtr) dealloc(cachedPtr, cachedLen);
         dealloc(canvasIdPtr, canvasIdBytes.length);
         if (boxPtr === 0) {
             gridCols = 80;
@@ -342,12 +378,18 @@
             gridRows = cfg.rows || 24;
             cellW = Math.max(1, cfg.cell_width || 8);
             cellH = Math.max(1, cfg.cell_height || 18);
+            // Cache cell dimensions for next visit (skip expensive scratch measurement)
+            try {
+                sessionStorage.setItem(cacheKey, JSON.stringify({ dpr, w: cellW, h: cellH }));
+            } catch (_) {}
         }
 
         fit();
         updateScrollbar();
         window.addEventListener('resize', () => { fit(); sendResize(); });
         showStatus('krust terminal');
+        wasmReady = true;
+        sendResize(); // fire if ws is already connected
 
         const proto = location.protocol === 'https:' ? 'wss' : 'ws';
         const st = params.get('selftest');
@@ -438,7 +480,6 @@
                 setTimeout(() => connectPrimary(url), delay);
             };
         }
-        connectPrimary(buildWsUrl('/ws'));
 
         window.addEventListener('keydown', (e) => {
             const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
@@ -549,12 +590,6 @@
             e.preventDefault();
             sendPaste(text);
         });
-
-        function buildWsUrl(path) {
-            const wsParams = new URLSearchParams({ s: sid });
-            if (startDir) wsParams.set('dir', startDir);
-            return path + '?' + wsParams.toString();
-        }
 
         window.addEventListener('mousedown', (e) => {
             if (e.button !== 0) return;
