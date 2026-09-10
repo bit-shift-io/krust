@@ -8,8 +8,6 @@
         html, body { margin: 0; height: 100%; background: #2b2b2b; user-select: none; -webkit-user-select: none; overflow: hidden; }
         canvas { display: block; width: 100%; height: 100%; background: #2b2b2b; touch-action: none; }
         #status { position: fixed; top: 8px; right: 8px; z-index: 10; font: 12px monospace; color: #f0f0f0; background: rgba(0,0,0,0.7); padding: 4px 8px; opacity: 1; transition: opacity 0.5s ease-in-out; }
-        #sel-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 5; pointer-events: none; opacity: 0; touch-action: none; }
-        body.selecting #sel-layer { pointer-events: auto; opacity: 0.01; }
         #scrollbar { position: fixed; top: 0; right: 0; width: 10px; height: 100%; z-index: 8; background: rgba(255,255,255,0.06); opacity: 0; transition: opacity 0.2s ease-in-out; }
         #scrollbar:hover, body.scrolling #scrollbar { opacity: 1; }
         #scrollbar-thumb { position: absolute; left: 1px; right: 1px; border-radius: 4px; background: rgba(255,255,255,0.4); }
@@ -17,7 +15,6 @@
 </head>
 <body>
     <canvas id="terminal-canvas"></canvas>
-    <div id="sel-layer" contenteditable="false"></div>
     <div id="scrollbar"><div id="scrollbar-thumb"></div></div>
     <div id="status">connecting...</div>
     <script src="/krust_runtime.js"></script>
@@ -401,10 +398,11 @@
             };
             ws.onmessage = (ev) => {
                 bytesIn += ev.data.byteLength;
-                const byteLen = ev.data.byteLength;
+                const inData = new Uint8Array(ev.data);
+                const byteLen = inData.length;
                 const bytePtr = alloc(byteLen);
                 const wasmBuf = new Uint8Array(mem.buffer, bytePtr, byteLen);
-                wasmBuf.set(ev.data);
+                wasmBuf.set(inData);
                 const boxPtr = query_replies(bytePtr, byteLen);
                 dealloc(bytePtr, byteLen);
                 if (boxPtr !== 0) {
@@ -416,7 +414,6 @@
                 }
                 const t0 = performance.now();
                 if (params.get('benchskip') !== '1') {
-                    const inData = new Uint8Array(ev.data);
                     const inPtr = alloc(inData.length);
                     new Uint8Array(mem.buffer, inPtr, inData.length).set(inData);
                     const summaryPtr = process_bytes(inPtr, inData.length);
@@ -471,16 +468,14 @@
             }
 
             if (modifier && e.key.toLowerCase() === 'c' && !e.altKey) {
-                if (e.shiftKey) return false;
-                if (ws && ws.readyState === 1) {
-                    const selLayer = document.getElementById('sel-layer');
-                    const selection = selLayer ? selLayer.innerText : '';
-                    if (selection.trim()) {
-                        navigator.clipboard.writeText(selection).then(() => {
-                            selLayer.innerHTML = '';
-                        });
-                        return;
-                    }
+                if (e.shiftKey) return;
+                const text = callStringExport(selected_text);
+                if (text) {
+                    e.preventDefault();
+                    navigator.clipboard.writeText(text).then(() => {
+                        showStatus('copied ' + text.length + ' chars');
+                    });
+                    return;
                 }
             }
 
@@ -552,7 +547,6 @@
         window.addEventListener('paste', (e) => {
             const text = e.clipboardData ? e.clipboardData.getData('text') : '';
             e.preventDefault();
-            document.getElementById('sel-layer').innerHTML = '';
             sendPaste(text);
         });
 

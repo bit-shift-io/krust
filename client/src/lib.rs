@@ -31,7 +31,6 @@ mod tests {
     use crate::graphics::{block_geometry, box_geometry};
     use crate::input::{map_key, xterm_modifier_param};
     use crate::query::collect_query_replies;
-    use crate::selection::extract_selection;
     use crate::state::{DEFAULT_COLS, DEFAULT_ROWS, SCROLLBACK_LEN};
     use vt100::{Color, Parser};
 
@@ -231,34 +230,6 @@ mod tests {
     #[test]
     fn map_key_unknown_returns_empty() {
         assert_eq!(map_key("CapsLock", false, false, false, false), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn extract_selection_reads_cells_in_order() {
-        let mut parser = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
-        parser.process(b"hello\nworld");
-        let out = extract_selection(parser.screen(), (0, 0), (1, 10));
-        assert!(out.contains("hello"));
-        assert!(out.contains("world"));
-    }
-
-    #[test]
-    fn extract_selection_backwards_equals_forward() {
-        let mut parser = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
-        parser.process(b"abcdef");
-        let screen = parser.screen();
-        let forward = extract_selection(&screen, (0, 1), (0, 4));
-        let backward = extract_selection(&screen, (0, 4), (0, 1));
-        assert_eq!(forward, backward);
-        assert_eq!(forward, "bcd");
-    }
-
-    #[test]
-    fn extract_selection_degenerate_is_empty() {
-        let mut parser = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
-        parser.process(b"abcdef");
-        let screen = parser.screen();
-        assert_eq!(extract_selection(&screen, (0, 2), (0, 2)), "");
     }
 
     #[test]

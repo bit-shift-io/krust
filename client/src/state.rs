@@ -14,7 +14,7 @@ use crate::measure::{
     css_color, measure_cell_dimensions_scratch, CELL_EPSILON, FONT_STACK, FONT_STACK_BOLD,
 };
 use crate::renderer;
-use crate::selection::SelectionMode;
+use crate::selection::{cell_is_selected, normalized_bounds, SelectionMode};
 
 pub(crate) const DEFAULT_ROWS: u16 = 24;
 pub(crate) const DEFAULT_COLS: u16 = 80;
@@ -448,16 +448,21 @@ impl TerminalState {
         self.render_canvas2d()
     }
 
-    /// Build the list of selected cells in the active selection rectangle.
+    /// Build the list of cells in the active line-based (text-flow)
+    /// selection. The anchor row runs from the anchor column to the end of
+    /// the row, intermediate rows are selected in full, and the last row runs
+    /// from column 0 to the end column.
     fn selection_cells(&self) -> Vec<(u16, u16)> {
         let (Some(a), Some(b)) = (self.selection_start, self.selection_end) else {
             return Vec::new();
         };
-        let (a_r, a_c) = (a.0.min(b.0), a.1.min(b.1));
-        let (b_r, b_c) = (a.0.max(b.0), a.1.max(b.1));
+        let ((sr, sc), (er, ec)) = normalized_bounds(a, b);
+        let cols = self.cols.max(1);
         let mut cells = Vec::new();
-        for row in a_r..=b_r {
-            for col in a_c..=b_c {
+        for row in sr..=er {
+            let c0 = if row == sr { sc } else { 0 };
+            let c1 = if row == er { ec.min(cols - 1) } else { cols - 1 };
+            for col in c0..=c1 {
                 cells.push((row, col));
             }
         }
@@ -799,15 +804,13 @@ impl TerminalState {
         Ok(Some((cr, cc)))
     }
 
-    /// Whether the given cell lies inside the active selection rectangle
-    /// (normalized so the anchor can be above/below the current end).
+    /// Whether the given cell lies inside the active line-based (text-flow)
+    /// selection (normalized so the anchor can be above/below the end).
     fn selected(&self, row: u16, col: u16) -> bool {
         let (Some(a), Some(b)) = (self.selection_start, self.selection_end) else {
             return false;
         };
-        let (a_r, a_c) = (a.0.min(b.0), a.1.min(b.1));
-        let (b_r, b_c) = (a.0.max(b.0), a.1.max(b.1));
-        (a_r..=b_r).contains(&row) && (a_c..=b_c).contains(&col)
+        cell_is_selected(a, b, row, col)
     }
 
     /// Trigger resize callback
@@ -816,7 +819,7 @@ impl TerminalState {
 
     /// Handle selection start
     pub(crate) fn handle_selection_start(&mut self, row: u16, col: u16) {
-        self.selection_mode = SelectionMode::Linear;
+        self.selection_mode = SelectionMode::Line;
         self.selection_start = Some((row, col));
         self.selection_end = None;
         self.mark_all_dirty();
