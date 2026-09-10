@@ -198,6 +198,12 @@ pub(crate) struct TerminalState {
     csi_su_carry: Vec<u8>,
 }
 
+/// Renderer selection override, set from JS before `init()` via
+/// `set_renderer_mode`. 0 = auto (WebGL2 first, Canvas 2D fallback),
+/// 1 = force WebGL2 (error if unavailable), 2 = force Canvas 2D.
+pub static RENDERER_MODE: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+
 impl TerminalState {
     /// Create a new terminal state with a Canvas 2D rendering context
     ///
@@ -229,22 +235,41 @@ impl TerminalState {
             .unwrap_or((14.0, 20.0));
 
         // Try WebGL2 first for GPU-accelerated rendering; fall back to Canvas 2D.
+        // `?r=gl`/`?r=2d` (via set_renderer_mode) force one renderer for A/B
+        // comparison: mode 1 fails hard when WebGL2 is unavailable; mode 2
+        // skips WebGL2 entirely.
+        let mode = RENDERER_MODE.load(std::sync::atomic::Ordering::Relaxed);
         let mut webgl = None;
-        if let Ok(w) = renderer::WebGL2Renderer::new(
-            canvas_id,
-            cell_width,
-            cell_height,
-            DEFAULT_ROWS,
-            DEFAULT_COLS,
-            dpr,
-            renderer::EMBEDDED_FONT,
-        ) {
-            ffi::console_log("KRUST: WebGL2 renderer initialized");
-            webgl = Some(w);
+        if mode != 2 {
+            match renderer::WebGL2Renderer::new(
+                canvas_id,
+                cell_width,
+                cell_height,
+                DEFAULT_ROWS,
+                DEFAULT_COLS,
+                dpr,
+                renderer::EMBEDDED_FONT,
+            ) {
+                Ok(w) => {
+                    ffi::console_log(if mode == 1 {
+                        "KRUST: WebGL2 renderer initialized (forced r=gl)"
+                    } else {
+                        "KRUST: WebGL2 renderer initialized"
+                    });
+                    webgl = Some(w);
+                }
+                Err(e) => {
+                    if mode == 1 {
+                        return Err(format!("r=gl: WebGL2 unavailable: {}", e));
+                    }
+                    ffi::console_log("KRUST: WebGL2 unavailable, falling back to Canvas 2D");
+                }
+            }
         } else {
-            ffi::console_log("KRUST: WebGL2 unavailable, falling back to Canvas 2D");
+            ffi::console_log("KRUST: forced Canvas 2D renderer (r=2d)");
         }
-        // Canvas 2D fallback: only when WebGL2 could not be obtained.
+        // Canvas 2D fallback: only when WebGL2 could not be obtained (or was
+        // skipped by the forced-2D mode).
         let ctx = if webgl.is_none() {
             let c = ffi::canvas_get_2d(canvas);
             (c != 0).then_some(c)

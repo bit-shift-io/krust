@@ -27,7 +27,7 @@
             window.KRUST_RUNTIME.imports
         );
         window.KRUST_RUNTIME.install(wasm.instance.exports.memory);
-        const { init, process_bytes, query_replies, handle_resize, repaint,
+        const { init, set_renderer_mode, process_bytes, query_replies, handle_resize, repaint,
                 key_to_bytes, set_selection, selected_text, clear_selection,
                 scroll, scroll_to, scroll_to_bottom, scroll_to_top,
                 scroll_offset, scrollback_len, version,
@@ -208,6 +208,7 @@
         let gridCols = 80;
         let gridRows = 24;
         let wasmReady = false;
+        let wsQueue = [];
         let selAnchor = null;
         let selDragging = false;
         let selMoved = false;
@@ -347,6 +348,9 @@
             }
         } catch (_) {}
 
+        const rParam = params.get('r');
+        set_renderer_mode(rParam === 'gl' ? 1 : rParam === '2d' ? 2 : 0);
+
         const canvasIdBytes = new TextEncoder().encode('terminal-canvas');
         const canvasIdPtr = alloc(canvasIdBytes.length);
         const wasmBuf = new Uint8Array(mem.buffer, canvasIdPtr, canvasIdBytes.length);
@@ -390,6 +394,12 @@
         showStatus('krust terminal');
         wasmReady = true;
         sendResize(); // fire if ws is already connected
+        // Frames that arrived before init() completed (the WebSocket opens
+        // before the wasm module is ready, so the first history-replay burst
+        // can race init) were queued instead of being fed to process_bytes.
+        // Flush them now that the terminal state exists.
+        for (let i = 0; i < wsQueue.length; i++) handleWsData({ data: wsQueue[i] });
+        wsQueue = [];
 
         const proto = location.protocol === 'https:' ? 'wss' : 'ws';
         const st = params.get('selftest');
@@ -424,7 +434,7 @@
                 if (params.get('echo') === '1') {
                     ws.send(new TextEncoder().encode('echo K_RUST_WIRED\r'));
                 }
-                sendResize();
+                try { sendResize(); } catch (_) {} // no-op during early TDZ (pre-init)
                 const p = params.get('paste');
                 if (p) {
                     const unit = 'X'.repeat(1024) + '\n';
@@ -439,6 +449,18 @@
                 }
             };
             ws.onmessage = (ev) => {
+                if (!wasmReady) {
+                    // init() not called yet (the WebSocket opens before the
+                    // wasm module is ready) — hold the frame and feed it after
+                    // the terminal state exists, or the first history-replay
+                    // burst would be dropped and the prompt would never paint.
+                    wsQueue.push(ev.data);
+                    return;
+                }
+                handleWsData(ev);
+            };
+
+            function handleWsData(ev) {
                 bytesIn += ev.data.byteLength;
                 const inData = new Uint8Array(ev.data);
                 const byteLen = inData.length;
@@ -466,12 +488,12 @@
                 benchSample(performance.now() - t0);
                 curScroll = scroll_offset();
                 updateScrollbar();
-                const title = extractTitle(new Uint8Array(ev.data));
+                const title = extractTitle(inData);
                 if (title) {
                     lastTitle = title + ' | terminal';
                     document.title = lastTitle;
                 }
-            };
+            }
             ws.onerror = () => { showStatus('ws error'); };
             ws.onclose = () => {
                 showStatus('ws closed');

@@ -38,6 +38,17 @@ Second round of fixes (all verified):
   and a browser-level assertion (a `g` row reaches the bottom of its cell and
   `_` sits in the bottom band; `render-check.sh` reports `descender_ink: 150,
   underscore_ink: 140`).
+- **Glyph horizontal spacing (advance scale):** the atlas rasterized every
+  glyph at an em equal to the cell *height* (~18px), whose Hack advance
+  (~0.606em ≈ 11px) was wider than the 8px cell — wide glyphs touched the next
+  cell and narrow glyphs left uneven gaps. Glyphs are now rasterized at the em
+  where Hack's advance equals one *cell width* (`em = glyph_w / h_advance`,
+  ≈13.2px for an 8px cell), reproducing the Canvas 2D monospace invariant
+  (every character advances exactly one cell width), with the baseline
+  re-derived from that scale. Verified: `render-check.sh` still green
+  (`text min_ink_per_cell: 15`, `orient top 180/bottom 0`,
+  `baseline descender 70/underscore 80` at the smaller glyph size). Compare
+  WebGL2 vs Canvas 2D visually with `?r=gl` / `?r=2d`.
 - **Slow first load — investigated, root cause NOT in krust.** Symptoms: only
   the *first* page load waits ~10-20s for the shell prompt; refreshes are
   instant (the session and its shell persist). Measurements: raw PTY spawn of
@@ -52,6 +63,10 @@ Second round of fixes (all verified):
   the normal launch path. No code change was kept for this (a boot-time
   pre-warm + stable default session id experiment worked around it but was
   reverted on request).
+- **Renderer override (`?r=`):** `set_renderer_mode()` accepts 0 = auto
+  (WebGL2 first, Canvas 2D fallback), 1 = `?r=gl` (force WebGL2, fail hard if
+  unavailable), 2 = `?r=2d` (force Canvas 2D). Wired into `server.html` and
+  `render-test.html` for A/B comparison of the two renderers.
 - `render-test.html` now reports per-stage boot timing (`timing.fetch_ms`,
   `instantiate_ms`, `init_ms`, `resize_ms`, `feed_ms`, `repaint_ms`,
   `readback` total) — headless total is ~11 ms, dominated by the wasm fetch.

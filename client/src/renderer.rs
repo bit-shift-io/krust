@@ -134,17 +134,46 @@ impl GlyphAtlas {
         let glyph_w = (cell_w * dpr).ceil() as u32;
         let glyph_h = (cell_h * dpr).ceil() as u32;
 
+        // Scale the font so a glyph's *advance width* equals exactly one cell
+        // width (`glyph_w` device px). Scaling em-height to the cell HEIGHT
+        // instead makes Hack's ~0.606em advance wider than the 8px cell, so
+        // glyph ink overflows the slot edge: wide glyphs touch the next cell
+        // while narrow ones leave a visible gap. Painting every glyph at a
+        // common advance == cell width reproduces the Canvas 2D renderer,
+        // whose monospace system font advances exactly one cell per char.
+        // For an 8px cell that is an ~13.2px em sitting inside the 18px slot.
+let h_adv1 = {
+                let scaled = font.as_scaled(PxScale::from(1.0));
+                scaled.h_advance(font.glyph_id(' '))
+            };
+        let em = if h_adv1.is_finite() && h_adv1 > 0.0 {
+            (glyph_w as f32 / h_adv1).max(1.0)
+        } else {
+            glyph_h as f32
+        };
+
         // Row (from the top of the atlas slot) where glyphs' text baseline
-        // lands. Everything vertical is derived from this one number, so every
+        // lands, derived from the same `em` the glyphs are rasterized at.
+        // Everything vertical is derived from this one number, so every
         // glyph shares a baseline instead of being top-aligned to its own
         // bounding box (which would park each glyph's baseline at a different
         // height). Hack has ascent+descent == em and line_gap == 0, so the
         // full glyph extents fit the slot with no clipping.
+        //
+        // The baseline centers the em box (ascent..descent) inside the
+        // glyph_h slot, mirroring the Canvas 2D reference renderer, which
+        // paints with `textBaseline: "middle"` (em box centered in the cell).
+        // Parking the baseline at the cell top instead shifts the whole glyph
+        // line ~5px upward relative to the 2D path, which the gl-vs-2d visual
+        // comparison reads as "gl text is out of alignment".
         let baseline = {
-            let scaled = font.as_scaled(PxScale::from(glyph_h as f32));
+            let scaled = font.as_scaled(PxScale::from(em));
             let asc = scaled.ascent();
             if asc.is_finite() && asc > 0.0 {
-                (asc.round() as i32).clamp(0, glyph_h as i32 - 1)
+                (((glyph_h as f32 - em) / 2.0 + asc)
+                    .round()
+                    as i32)
+                    .clamp(0, glyph_h as i32 - 1)
             } else {
                 (glyph_h as i32) / 2
             }
@@ -167,7 +196,7 @@ impl GlyphAtlas {
             let x = col * (glyph_w + ATLAS_PADDING);
             let y = row * (glyph_h + ATLAS_PADDING);
 
-            Self::rasterize_glyph(font, ch, glyph_w, glyph_h, baseline, &mut data, x, y, atlas_w);
+            Self::rasterize_glyph(font, ch, glyph_w, glyph_h, em, baseline, &mut data, x, y, atlas_w);
 
             let u0 = x as f32 / atlas_w as f32;
             let v0 = y as f32 / atlas_h as f32;
@@ -196,21 +225,21 @@ impl GlyphAtlas {
         })
     }
 
-    fn rasterize_glyph(
+fn rasterize_glyph(
         font: &FontRef,
         ch: char,
         glyph_w: u32,
         glyph_h: u32,
+        em: f32,
         baseline: i32,
         data: &mut [u8],
         x: u32,
         y: u32,
         stride: u32,
     ) {
-        let id = font.glyph_id(ch);
         let glyph = Glyph {
-            id,
-            scale: PxScale::from(glyph_h as f32),
+            id: font.glyph_id(ch),
+            scale: PxScale::from(em),
             position: Point { x: 0.0, y: 0.0 },
         };
         if let Some(outlined) = font.outline_glyph(glyph) {
@@ -803,18 +832,38 @@ mod tests {
         FontRef::try_from_slice(EMBEDDED_FONT).unwrap()
     }
 
-    /// Rasterize `ch` into a `slot_h x slot_h` scratch slot at the given
-    /// `baseline` (slot row of the text baseline) and return the ink bounding
-    /// box in slot rows, matching `GlyphAtlas::rasterize_glyph` semantics.
-    fn ink_bounds(ch: char, slot_h: u32, baseline: i32) -> (i32, i32) {
+    /// Mirror the production em/baseline derivation: rasterize at the em where
+    /// the font's advance equals one `glyph_w` cell, so every character advances
+    /// exactly one cell (the Canvas 2D monospace invariant).
+    fn em_and_baseline(f: &FontRef, glyph_w: u32, glyph_h: u32) -> (f32, i32) {
+        let adv1 = f.as_scaled(PxScale::from(1.0)).h_advance(f.glyph_id(' '));
+        let em = if adv1.is_finite() && adv1 > 0.0 {
+            (glyph_w as f32 / adv1).max(1.0)
+        } else {
+            glyph_h as f32
+        };
+        let asc = f.as_scaled(PxScale::from(em)).ascent();
+        let baseline = if asc.is_finite() && asc > 0.0 {
+            ((((glyph_h as f32 - em) / 2.0 + asc).round() as i32))
+            .clamp(0, glyph_h as i32 - 1)
+        } else {
+            (glyph_h / 2) as i32
+        };
+        (em, baseline)
+    }
+
+    /// Rasterize `ch` into a `glyph_w x glyph_h` scratch slot using the
+    /// production scale and return the ink bounding box in slot rows.
+    fn ink_bounds(ch: char, glyph_w: u32, glyph_h: u32) -> (i32, i32) {
         let f = font();
-        let mut slot = vec![0u8; (slot_h * slot_h) as usize];
-        GlyphAtlas::rasterize_glyph(&f, ch, slot_h, slot_h, baseline, &mut slot, 0, 0, slot_h);
-        let mut top = slot_h as i32;
+        let (em, baseline) = em_and_baseline(&f, glyph_w, glyph_h);
+        let mut slot = vec![0u8; (glyph_w * glyph_h) as usize];
+        GlyphAtlas::rasterize_glyph(&f, ch, glyph_w, glyph_h, em, baseline, &mut slot, 0, 0, glyph_w);
+        let mut top = glyph_h as i32;
         let mut bottom = -1i32;
-        for r in 0..slot_h {
-            for c in 0..slot_h {
-                if slot[(r * slot_h + c) as usize] > 20 {
+        for r in 0..glyph_h {
+            for c in 0..glyph_w {
+                if slot[(r * glyph_w + c) as usize] > 20 {
                     top = top.min(r as i32);
                     bottom = r as i32;
                 }
@@ -826,29 +875,29 @@ mod tests {
     #[test]
     fn all_ascii_glyphs_share_one_baseline_row() {
         let f = font();
-        let slot_h: u32 = 18;
-        let expected = 14; // round(Hack ascent 14.35) at 18px em
+        let (glyph_w, glyph_h): (u32, u32) = (8, 18); // production config
+        let (em, baseline) = em_and_baseline(&f, glyph_w, glyph_h);
         for ch in ['x', 'T', 'g', 'M', 'l', 'p', '|', ',', '_', '"', '^', '`'] {
-            let (top, bottom) = ink_bounds(ch, slot_h, expected);
+            let (top, bottom) = ink_bounds(ch, glyph_w, glyph_h);
             assert!(
-                top >= 0 && bottom >= top && bottom <= slot_h as i32 - 1,
+                top >= 0 && bottom >= top && bottom <= glyph_h as i32 - 1,
                 "'{}' out of slot: top={} bottom={}",
                 ch,
                 top,
                 bottom
             );
             // Same baseline as every other glyph: the box top of a glyph whose
-            // box min.y is `my` must sit at `expected + min.y` exactly.
+            // box min.y is `my` must sit at `baseline + min.y` exactly.
             let glyph = Glyph {
                 id: f.glyph_id(ch),
-                scale: PxScale::from(slot_h as f32),
+                scale: PxScale::from(em),
                 position: Point { x: 0.0, y: 0.0 },
             };
             if let Some(ol) = f.outline_glyph(glyph) {
                 let min_y = ol.px_bounds().min.y as i32;
                 assert_eq!(
                     top,
-                    expected + min_y,
+                    baseline + min_y,
                     "'{}' not aligned to shared baseline",
                     ch
                 );
@@ -861,38 +910,44 @@ mod tests {
         // x-height/cap-height glyphs end exactly at the baseline row, so their
         // last ink row is `baseline - 1`. Descenders (`g`/`p`/`|`) must extend
         // below the baseline instead of sharing the box-top alignment.
-        let b = 14;
+        let (glyph_w, glyph_h): (u32, u32) = (8, 18);
+        let (_em, baseline) = em_and_baseline(&font(), glyph_w, glyph_h);
         for ch in ['x', 'T', 'M'] {
-            let (top, bottom) = ink_bounds(ch, 18, b);
-            assert_eq!(bottom, b - 1, "'{}' should end at the baseline", ch);
+            let (top, bottom) = ink_bounds(ch, glyph_w, glyph_h);
+            assert_eq!(bottom, baseline - 1, "'{}' should end at the baseline", ch);
             assert!(top > 0, "'{}' should sit above the baseline", ch);
         }
         for ch in ['g', 'p', '|', 'y'] {
-            let (_top, bottom) = ink_bounds(ch, 18, b);
-            assert!(bottom > b, "'{}' should descend below the baseline", ch);
+            let (_top, bottom) = ink_bounds(ch, glyph_w, glyph_h);
+            assert!(bottom > baseline, "'{}' should descend below the baseline", ch);
         }
     }
 
     #[test]
     fn underscore_renders_below_the_baseline() {
-        // '_' is entirely below the baseline; making it render near the bottom
-        // of the cell (rather than glued to the cell top) is what baseline
-        // placement buys us.
-        let (top, bottom) = ink_bounds('_', 18, 14);
-        assert!(top >= 13 && bottom <= 17, "underscore rows [{}, {}]", top, bottom);
+        // '_' is entirely within the descent zone; it must not be glued to the
+        // cell top like every other glyph is not.
+        let (glyph_w, glyph_h): (u32, u32) = (8, 18);
+        let (_em, baseline) = em_and_baseline(&font(), glyph_w, glyph_h);
+        let (top, bottom) = ink_bounds('_', glyph_w, glyph_h);
+        assert!(
+            bottom > baseline && bottom <= glyph_h as i32 - 1,
+            "underscore must descend below the baseline: rows [{}, {}]",
+            top,
+            bottom
+        );
     }
 
     #[test]
     fn baseline_hydrates_at_other_sizes() {
         let f = font();
-        let slot_h: u32 = 36; // dpr=2
-        let asc = f.as_scaled(PxScale::from(slot_h as f32)).ascent();
-        let expected = asc.round() as i32;
-        let (t_top, t_bottom) = ink_bounds('T', slot_h, expected);
-        let (g_top, g_bottom) = ink_bounds('g', slot_h, expected);
-        assert_eq!(t_bottom, expected - 1);
+        let (glyph_w, glyph_h): (u32, u32) = (16, 36); // dpr=2
+        let (_em, baseline) = em_and_baseline(&f, glyph_w, glyph_h);
+        let (t_top, t_bottom) = ink_bounds('T', glyph_w, glyph_h);
+        let (_g_top, g_bottom) = ink_bounds('g', glyph_w, glyph_h);
+        assert_eq!(t_bottom, baseline - 1);
         assert!(t_top >= 0);
-        assert!(g_bottom >= expected, "g must descend below baseline");
-        assert!(g_bottom <= slot_h as i32 - 1);
+        assert!(g_bottom >= baseline, "g must descend below baseline");
+        assert!(g_bottom <= glyph_h as i32 - 1);
     }
 }

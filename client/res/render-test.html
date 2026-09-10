@@ -24,7 +24,7 @@
         );
         window.KRUST_RUNTIME.install(wasm.instance.exports.memory);
         const tInst = performance.now();
-        const { init, process_bytes, repaint, handle_resize, version,
+        const { init, set_renderer_mode, process_bytes, repaint, handle_resize, version,
                 alloc, dealloc, free_memory, free_string, free_result } = wasm.instance.exports;
         const mem = wasm.instance.exports.memory;
 
@@ -65,6 +65,7 @@
             push('T'.repeat(10) + '\r\n');
             push('g'.repeat(10) + '\r\n');
             push('_'.repeat(10) + '\r\n');
+            push('x'.repeat(10) + '\r\n');
             const len = parts.reduce((n, p) => n + p.length, 0);
             const joined = new Uint8Array(len);
             let off = 0;
@@ -109,6 +110,9 @@
         }
 
         async function run() {
+            const params = new URLSearchParams(location.search);
+            const r = params.get('r');
+            set_renderer_mode(r === 'gl' ? 1 : r === '2d' ? 2 : 0);
             const canvasIdBytes = new TextEncoder().encode('terminal-canvas');
             const canvasIdPtr = alloc(canvasIdBytes.length);
             new Uint8Array(mem.buffer, canvasIdPtr, canvasIdBytes.length).set(canvasIdBytes);
@@ -247,12 +251,37 @@
             }
             const baselineOk = descInk > 0 && usInk > 0;
 
+            // Vertical ink extents (top/bottom rows within the cell) for one
+            // glyph per probe row. render-check.sh compares these across the
+            // gl and 2d renderers to verify text sits at the same height in
+            // both (the "gl is out of alignment" report was gl glyphs parked
+            // at the cell top instead of vertically centered like the 2D path).
+            function glyphExtent(rowIdx, colCount) {
+                const y0 = yoff + rowIdx * ch, y1 = y0 + ch;
+                let top = -1, bottom = -1;
+                for (let y = y0; y < y1; y++) {
+                    let ink = false;
+                    for (let x = 0; x < R(colCount * cw); x++) {
+                        if (isBright(x, y)) { ink = true; break; }
+                    }
+                    if (ink) { if (top < 0) top = y - y0; bottom = y - y0; }
+                }
+                return { top, bottom };
+            }
+            const align = {
+                T: glyphExtent(17, 10),
+                g: glyphExtent(18, 10),
+                _: glyphExtent(19, 10),
+                x: glyphExtent(20, 10),
+            };
+
             const res = {
                 metrics: { cell_width: cw, cell_height: ch, yoff, grid_rows: rows },
                 colors: { bright_blue_pixels: brightBlue, dark_blue_pixels: darkBlue },
                 text: { min_ink_per_cell: textMinInk, cells_with_ink: textCellsWithInk },
                 orient: { top_band_ink: topInk, bottom_band_ink: bottomInk },
                 baseline: { descender_ink: descInk, underscore_ink: usInk },
+                align: align,
                 timing: {
                     fetch_ms: Math.round(tInst - tStart),
                     instantiate_ms: Math.round(tInit - tInst),

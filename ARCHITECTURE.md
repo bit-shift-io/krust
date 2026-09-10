@@ -129,9 +129,15 @@ input frames accepted as an alternative input path:
   one context type, so the WebGL2 attempt can never be poisoned by an earlier
   2D context). WebGL2 is currently the **default** (`WebGL2Renderer::new()` is
   tried first); Canvas 2D is only used as a fallback when WebGL2 cannot be
-  obtained. On init it logs `KRUST: WebGL2 renderer initialized` or
-  `KRUST: WebGL2 unavailable, falling back to Canvas 2D`. Exactly one renderer
-  is active.
+obtained. On init it logs `KRUST: WebGL2 renderer initialized` or
+   `KRUST: WebGL2 unavailable, falling back to Canvas 2D`. Exactly one renderer
+   is active.
+* **Renderer override (`?r=`):** `set_renderer_mode(mode)` (exported by
+  `exports.rs`, sets a module-level static in `state.rs`) is read by
+  `TerminalState::new()` before the context is chosen — `?r=gl` forces WebGL2
+  (init fails if unavailable), `?r=2d` forces Canvas 2D, and the default
+  auto-picks WebGL2-first. Both `server.html` and `render-test.html` wire it
+  from the URL param for A/B comparison of the two renderers.
 * **Rendering:** `render()` dispatches to the active renderer. The WebGL2 path
   builds a per-frame selection cell list from the stored selection rectangle
   and passes (screen, default fg/bg, selection, cursor position) to
@@ -155,11 +161,17 @@ input frames accepted as an alternative input path:
 * **Font atlas (`GlyphAtlas`):** the 128 ASCII glyphs (0x00–0x7F) are
   rasterized at init from `EMBEDDED_FONT` (`client/fonts/Hack-Regular.ttf`,
   shipped via `include_bytes!`). `ab_glyph` handles layout; glyphs land in a
-  WebGL2 texture. All glyphs share a single text **baseline** (placement is
-  offset by the ascent, so descenders hang below the line instead of every
-  glyph being glued to the top of its cell); the atlas UV rows are swapped when
-  uploading so glyphs render upright. The atlas is the alpha source for every
-  text pass; a reserved opaque texel supplies flat fills for graphic cells.
+  WebGL2 texture. Each glyph is rasterized at an em scale derived from the
+  **cell width** (`em = glyph_w / h_advance(1.0)`), so every character
+  advances exactly one cell width — the same monospace invariant the Canvas 2D
+  path gets from its font — instead of an em sized to the cell height (whose
+  wider advance overflowed the slot and made wide glyphs touch the next cell
+  while narrow ones left uneven gaps). All glyphs share a single text
+  **baseline** (placement is offset by the ascent, so descenders hang below
+  the line instead of every glyph being glued to the top of its cell); the
+  atlas UV rows are swapped when uploading so glyphs render upright. The atlas
+  is the alpha source for every text pass; a reserved opaque texel supplies
+  flat fills for graphic cells.
 * **Two-pass instanced drawing (`GlyphBrush`):**
   * Pass 0 (mode 0) — per-cell background rects using a solid 1×1 atlas pixel;
   * Pass 1 (mode 1) — text glyphs sampling atlas alpha.

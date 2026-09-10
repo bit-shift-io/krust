@@ -42,6 +42,14 @@ fn return_null_pair() -> *mut u8 {
     return_pair(std::ptr::null_mut(), 0)
 }
 
+/// Force a renderer before `init()`: 0 = auto (WebGL2 first, Canvas 2D
+/// fallback), 1 = force WebGL2, 2 = force Canvas 2D. Wired from the `?r=gl`
+/// / `?r=2d` URL params for A/B comparison.
+#[no_mangle]
+pub extern "C" fn set_renderer_mode(mode: i32) {
+    crate::state::RENDERER_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Initialize the terminal module and receive terminal config JSON.
 ///
 /// # Parameters
