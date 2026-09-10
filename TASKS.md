@@ -35,7 +35,7 @@ has a dependency on wasm-bindgen tooling. We require zero external tooling.
 **Status**: Completed
 
 **Changes**:
-- Build script outputs to `client/pkg/` directory
+- Build script outputs to `target/wasm/` directory
 - Includes only `terminal_client_bg.wasm` (no `terminal_client.js` generated)
 - JS in `server.html` loads wasm via `WebAssembly.instantiateStreaming` directly
 
@@ -118,7 +118,7 @@ const { init, process_bytes, ... } = wasm.instance.exports;
 
 **Test cases**:
 - Added tests in `client/src/exports.rs` for alloc/dealloc, null safety, version string
-- Verified `client/pkg/terminal_client_bg.wasm` is generated with expected exports (init, process_bytes, query_replies, version, etc.)
+- Verified `target/wasm/wasm32-unknown-unknown/release/terminal_client.wasm` is generated with expected exports (init, process_bytes, query_replies, version, etc.)
 - Verified server tests pass (`cargo test -p krust`)
 
 ### 4.2 Manual testing
@@ -182,7 +182,7 @@ const { init, process_bytes, ... } = wasm.instance.exports;
 **Verification**:
 - `cargo build -p terminal-client --lib` and `cargo test -p terminal-client --lib`
   (38 host tests) pass on native.
-- Release wasm regenerated at `client/pkg/terminal_client_bg.wasm`; wasm dump
+- Release wasm regenerated at `target/wasm/wasm32-unknown-unknown/release/terminal_client.wasm`; wasm dump
   confirms 24 exports, all imports from module `krust`.
 - `client/res/render-check.sh` (headless Chromium pixel regression) passes.
 - `client/res/smoke-test.sh` (headless Firefox screenshot, green status bar)
@@ -193,7 +193,7 @@ const { init, process_bytes, ... } = wasm.instance.exports;
 ## Verification Checklist
 
 - [x] `cargo build --release` completes without network hang
-- [x] `client/pkg/terminal_client_bg.wasm` is generated
+- [x] `target/wasm/wasm32-unknown-unknown/release/terminal_client.wasm` is generated
 - [x] No `terminal_client.js` generated (raw WASM only)
 - [x] No `wasm-bindgen`/`web-sys`/`js-sys` in `client/Cargo.toml`
 - [x] All wasm imports come from the `krust` module (FFI runtime)

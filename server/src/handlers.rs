@@ -19,7 +19,8 @@ use crate::session::{get_or_create_session, pty_size, pty_write, AppState};
 
 const INDEX_HTML: &str = include_str!("../../client/res/server.html");
 const RUNTIME_JS: &str = include_str!("../../client/res/krust_runtime.js");
-const TERMINAL_WASM: &[u8] = include_bytes!("../../client/pkg/terminal_client_bg.wasm");
+const TERMINAL_WASM: &[u8] =
+    include_bytes!("../../target/wasm/wasm32-unknown-unknown/release/terminal_client.wasm");
 
 /// Wrap raw PTY bytes as a single binary WebSocket frame.
 pub(crate) fn binary_frame(bytes: Vec<u8>) -> Message {

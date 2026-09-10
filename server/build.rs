@@ -2,17 +2,19 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Build the WASM client (`client/pkg`) so a plain `cargo build` produces a
+/// Build the WASM client (`target/wasm/`) so a plain `cargo build` produces a
 /// deployable binary without a separate `wasm-pack build` stage.
 ///
-/// The check is idempotent: wasm client only runs when `client/pkg` is missing
+/// The check is idempotent: wasm client only runs when `target/wasm/` is missing
 /// or older than the client sources. Set `KRUST_SKIP_WASM_BUILD=1` to bypass
-/// (useful for offline/CI builds that pass a prebuilt pkg).
+/// (useful for offline/CI builds that pass a prebuilt wasm).
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let client_dir = manifest_dir.join("..").join("client");
 
-    let pkg_wasm = client_dir.join("pkg").join("terminal_client_bg.wasm");
+    let workspace_root = manifest_dir.parent().unwrap();
+    let wasm_out = workspace_root
+        .join("target/wasm/wasm32-unknown-unknown/release/terminal_client.wasm");
 
     for entry in walk_rs(&client_dir.join("src")) {
         println!("cargo:rerun-if-changed={}", entry.display());
@@ -23,17 +25,14 @@ fn main() {
             client_dir.join("res").join(res).display()
         );
     }
-    println!(
-        "cargo:rerun-if-changed={}",
-        client_dir.join("pkg").join("terminal_client_bg.wasm").display()
-    );
+    println!("cargo:rerun-if-changed={}", wasm_out.display());
 
     if env::var("KRUST_SKIP_WASM_BUILD").is_ok() {
         println!("cargo:warning=krust: KRUST_SKIP_WASM_BUILD set, skipping wasm client build");
         return;
     }
 
-    if !pkg_wasm.exists() || is_stale(&pkg_wasm, &client_dir) {
+    if !wasm_out.exists() || is_stale(&wasm_out, &client_dir) {
         if let Err(e) = build_raw_wasm(&manifest_dir, &client_dir) {
             eprintln!("cargo:warning=krust: wasm build failed: {}", e);
             eprintln!("cargo:warning=krust: re-run with KRUST_SKIP_WASM_BUILD=1");
@@ -43,9 +42,6 @@ fn main() {
 
 /// Build the WASM client directly with cargo to wasm32-unknown-unknown
 fn build_raw_wasm(manifest_dir: &Path, client_dir: &Path) -> Result<(), String> {
-    let pkg_dir = client_dir.join("pkg");
-    std::fs::create_dir_all(&pkg_dir).map_err(|e| format!("failed to create pkg dir: {}", e))?;
-
     // Use a dedicated target dir under target/wasm so this nested cargo
     // invocation does not deadlock on the locks the parent cargo holds.
     let workspace_root = manifest_dir.parent().unwrap();
@@ -63,13 +59,6 @@ fn build_raw_wasm(manifest_dir: &Path, client_dir: &Path) -> Result<(), String> 
             status.code().unwrap_or(-1)
         ));
     }
-
-    let src_wasm = wasm_target_dir
-        .join("wasm32-unknown-unknown")
-        .join("release")
-        .join("terminal_client.wasm");
-    let dst_wasm = pkg_dir.join("terminal_client_bg.wasm");
-    std::fs::copy(src_wasm, dst_wasm).map_err(|e| format!("failed to copy wasm: {}", e))?;
 
     Ok(())
 }

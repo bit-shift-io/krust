@@ -31,9 +31,9 @@ documents (ARCHITECTURE.md, NOTES.md) are stale and should be ignored.
 | `client/src/ffi.rs` | Raw `extern "C"` imports from the `krust` JS module + safe wrappers |
 | `client/res/krust_runtime.js` | Browser-side FFI runtime (`window.KRUST_RUNTIME`); embedded into the server binary (`include_str!` in `handlers.rs`) |
 | `client/res/server.html` | Production HTML served by the server (embedded via `include_str!`) |
-| `client/pkg/terminal_client_bg.wasm` | WASM client; embedded into the server binary (`include_bytes!` in `handlers.rs`) |
+| `target/wasm/wasm32-unknown-unknown/release/terminal_client.wasm` | WASM client; embedded into the server binary (`include_bytes!` in `handlers.rs`) |
 | `client/res/index.html` | Minimal smoke-test HTML |
-| `client/pkg/` | Raw wasm build output (only `terminal_client_bg.wasm` is tracked) |
+| `target/wasm/wasm32-unknown-unknown/release/terminal_client.wasm` | Raw wasm build output |
 | `Cargo.toml` | Workspace manifest (`server`, `client`) |
 | `TASKS.md` | Implementation roadmap |
 | `NOTES.md` | Design rationale and key decisions |
@@ -64,7 +64,7 @@ documents (ARCHITECTURE.md, NOTES.md) are stale and should be ignored.
   routes. The krust server serves cross-origin requests from the Grit
   web UI (running on `localhost:5000`).
 - **Build:** `server/build.rs` runs `cargo build --release --target wasm32-unknown-unknown`
-  into `client/pkg/` (output only `terminal_client_bg.wasm`) when stale,
+  into `target/wasm/` (alongside the main workspace target) when stale,
   so a plain `cargo build`/`cargo run` suffices (skip with
   `KRUST_SKIP_WASM_BUILD=1`). No wasm-bindgen CLI or JS glue is required.
   The server embeds all client assets (`server.html`, `krust_runtime.js`, and

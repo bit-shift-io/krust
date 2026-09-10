@@ -25,7 +25,7 @@ cell grid onto a `<canvas>` — Canvas 2D by default, WebGL2 as fallback.
 * **Rendering:** Canvas 2D primary (WebGL2 two-pass instanced quads behind a
   fallback, currently unused because its text pass doesn't render glyphs yet)
   (text fill + geometry-drawn box/block glyphs)
-* **Build:** `server/build.rs` builds the raw wasm client into `client/pkg/`
+* **Build:** `server/build.rs` builds the raw wasm client into `target/wasm/`
   when stale, so a plain `cargo build` / `cargo run` is sufficient
   (`KRUST_SKIP_WASM_BUILD=1` disables it). All client assets are then embedded
   into the server binary (`server.html`, `krust_runtime.js`, and the wasm), so
