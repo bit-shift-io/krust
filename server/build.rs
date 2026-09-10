@@ -17,9 +17,15 @@ fn main() {
     for entry in walk_rs(&client_dir.join("src")) {
         println!("cargo:rerun-if-changed={}", entry.display());
     }
+    for res in ["server.html", "krust_runtime.js"] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            client_dir.join("res").join(res).display()
+        );
+    }
     println!(
         "cargo:rerun-if-changed={}",
-        client_dir.join("res").join("server.html").display()
+        client_dir.join("pkg").join("terminal_client_bg.wasm").display()
     );
 
     if env::var("KRUST_SKIP_WASM_BUILD").is_ok() {

@@ -25,9 +25,11 @@ cell grid onto a `<canvas>` — Canvas 2D by default, WebGL2 as fallback.
 * **Rendering:** Canvas 2D primary (WebGL2 two-pass instanced quads behind a
   fallback, currently unused because its text pass doesn't render glyphs yet)
   (text fill + geometry-drawn box/block glyphs)
-* **Build:** `server/build.rs` runs `wasm-pack build --target web` when stale,
-  so a plain `cargo build` / `cargo run` is sufficient
-  (`KRUST_SKIP_WASM_BUILD=1` disables it; `KRUST_PKG_DIR` overrides the pkg dir)
+* **Build:** `server/build.rs` builds the raw wasm client into `client/pkg/`
+  when stale, so a plain `cargo build` / `cargo run` is sufficient
+  (`KRUST_SKIP_WASM_BUILD=1` disables it). All client assets are then embedded
+  into the server binary (`server.html`, `krust_runtime.js`, and the wasm), so
+  the compiled `krust` executable is fully self-contained.
 
 ### Core Design Principle: Raw Bytes In, Cell Grid Out
 
@@ -66,9 +68,9 @@ No grid state ever crosses the wire — the parser is the frame delimiter.
 
 ### 3.1 Server (`server/src/main.rs`)
 
-* **Routes:** `/` (serves `server.html`), `/ws` (WebSocket upgrade),
-  `/pkg/terminal_client.js` and `/pkg/terminal_client_bg.wasm` (served from
-  `client/pkg/` at runtime, `no-store`), plus `CorsLayer::permissive()` on all.
+* **Routes:** `/` (serves embedded `server.html`), `/ws` (WebSocket upgrade),
+  `/pkg/terminal_client_bg.wasm` and `/krust_runtime.js` (served from assets
+  embedded in the binary, `no-store`), plus `CorsLayer::permissive()` on all.
 * **Sessions (`Session`):** write end (`Arc<Mutex<Box<dyn Write>>`), PTY master
   (`Box<dyn MasterPty>`), a `broadcast::Sender<Vec<u8>>` (512-capacity ring),
   a shared scrollback `history` buffer, and an `AtomicUsize` connection count.

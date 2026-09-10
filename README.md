@@ -24,12 +24,12 @@ the terminal on a Canvas 2D surface.
 ## Quick Start
 
 ```bash
-# Clone & build (build.rs compiles the WASM client into client/pkg/)
+# Clone & build (build.rs compiles the WASM client into client/pkg/; all assets are then embedded)
 git clone https://github.com/your-username/krust.git
 cd krust
 cargo build --release
 
-# Run
+# Run (single self-contained binary; no other files needed)
 ./target/release/krust
 ```
 
@@ -83,7 +83,8 @@ krust/
 ## Development
 
 ```bash
-# Build & run (build.rs compiles the WASM client into client/pkg/ when stale; no wasm-bindgen CLI needed)
+# Build & run (build.rs compiles the WASM client into client/pkg/ when stale; then
+# server.html, krust_runtime.js and the wasm are embedded into the binary)
 cargo run --release
 
 # Run tests

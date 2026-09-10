@@ -175,7 +175,9 @@ const { init, process_bytes, ... } = wasm.instance.exports;
 - `server.html` / `index.html` / `render-test.html` load the raw module with
   `WebAssembly.instantiate*(bytes, window.KRUST_RUNTIME.imports)` then call
   `install(instance.exports.memory)`.
-- Server now serves `/krust_runtime.js` from `client/res/`.
+- Server serves `/krust_runtime.js`, `/pkg/terminal_client_bg.wasm` and
+  `server.html` from assets embedded in the binary (`include_str!`/`include_bytes!`),
+  so the compiled `krust` executable is self-contained.
 
 **Verification**:
 - `cargo build -p terminal-client --lib` and `cargo test -p terminal-client --lib`

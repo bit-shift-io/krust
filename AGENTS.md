@@ -29,8 +29,9 @@ documents (ARCHITECTURE.md, NOTES.md) are stale and should be ignored.
 | `server/src/main.rs` | Axum router, PTY session management, WebSocket handler, tests |
 | `client/src/lib.rs` | WASM terminal: VT100 parser, Canvas 2D renderer, input mapping, selection, tests |
 | `client/src/ffi.rs` | Raw `extern "C"` imports from the `krust` JS module + safe wrappers |
-| `client/res/krust_runtime.js` | Browser-side FFI runtime (`window.KRUST_RUNTIME`) for the `krust` imports |
-| `client/res/server.html` | Production HTML served by the server (`include_str!`) |
+| `client/res/krust_runtime.js` | Browser-side FFI runtime (`window.KRUST_RUNTIME`); embedded into the server binary (`include_str!` in `handlers.rs`) |
+| `client/res/server.html` | Production HTML served by the server (embedded via `include_str!`) |
+| `client/pkg/terminal_client_bg.wasm` | WASM client; embedded into the server binary (`include_bytes!` in `handlers.rs`) |
 | `client/res/index.html` | Minimal smoke-test HTML |
 | `client/pkg/` | Raw wasm build output (only `terminal_client_bg.wasm` is tracked) |
 | `Cargo.toml` | Workspace manifest (`server`, `client`) |
@@ -66,7 +67,9 @@ documents (ARCHITECTURE.md, NOTES.md) are stale and should be ignored.
   into `client/pkg/` (output only `terminal_client_bg.wasm`) when stale,
   so a plain `cargo build`/`cargo run` suffices (skip with
   `KRUST_SKIP_WASM_BUILD=1`). No wasm-bindgen CLI or JS glue is required.
-  The axum server also serves `/krust_runtime.js` from `client/res/`.
+  The server embeds all client assets (`server.html`, `krust_runtime.js`, and
+  the wasm) into the binary, so a single-compiled `krust` executable is fully
+  self-contained and needs no extra files at install time.
 
 ---
 

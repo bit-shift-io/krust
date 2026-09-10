@@ -18,6 +18,8 @@ use tokio::sync::broadcast;
 use crate::session::{get_or_create_session, pty_size, pty_write, AppState};
 
 const INDEX_HTML: &str = include_str!("../../client/res/server.html");
+const RUNTIME_JS: &str = include_str!("../../client/res/krust_runtime.js");
+const TERMINAL_WASM: &[u8] = include_bytes!("../../client/pkg/terminal_client_bg.wasm");
 
 /// Wrap raw PTY bytes as a single binary WebSocket frame.
 pub(crate) fn binary_frame(bytes: Vec<u8>) -> Message {
@@ -81,68 +83,27 @@ fn index_response(body: &'static str) -> ([(header::HeaderName, &'static str); 2
     )
 }
 
-/// Serve a file from the built WASM package directory at runtime.
-///
-/// The package dir defaults to `<crate>/../client/pkg` (i.e. the
-/// workspace layout); override with `KRUST_PKG_DIR`.
-fn pkg_dir() -> String {
-    if let Ok(d) = std::env::var("KRUST_PKG_DIR") {
-        return d;
-    }
-    manifest_dir().join("pkg").display().to_string()
-}
-
-/// Directory holding the client's static resources (`krust_runtime.js`).
-///
-/// Defaults to `<crate>/../client/res`; override with `KRUST_RES_DIR`.
-fn res_dir() -> String {
-    if let Ok(d) = std::env::var("KRUST_RES_DIR") {
-        return d;
-    }
-    manifest_dir().join("res").display().to_string()
-}
-
-fn manifest_dir() -> std::path::PathBuf {
-    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        std::path::Path::new(&manifest).join("../client")
-    } else {
-        std::path::PathBuf::from("client")
-    }
-}
-
-pub(crate) async fn serve_pkg_file(
-    file: &'static str,
-    content_type: &'static str,
-) -> Result<([(header::HeaderName, &'static str); 2], Vec<u8>), axum::http::StatusCode> {
-    let path = std::path::Path::new(&pkg_dir()).join(file);
-    let bytes = tokio::fs::read(&path)
-        .await
-        .map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
-    Ok((
+/// Serve the built WASM package, embedded directly in the binary so a
+/// single compiled `krust` executable is fully self-contained.
+pub(crate) async fn pkg_wasm() -> ([(header::HeaderName, &'static str); 2], &'static [u8]) {
+    (
         [
-            (header::CONTENT_TYPE, content_type),
+            (header::CONTENT_TYPE, "application/wasm"),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        bytes,
-    ))
+        TERMINAL_WASM,
+    )
 }
 
-/// Serve a static resource from the client `res/` directory.
-pub(crate) async fn serve_res_file(
-    file: &'static str,
-    content_type: &'static str,
-) -> Result<([(header::HeaderName, &'static str); 2], Vec<u8>), axum::http::StatusCode> {
-    let path = std::path::Path::new(&res_dir()).join(file);
-    let bytes = tokio::fs::read(&path)
-        .await
-        .map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
-    Ok((
+/// Serve the `krust` FFI runtime, embedded directly in the binary.
+pub(crate) async fn runtime_js() -> ([(header::HeaderName, &'static str); 2], &'static str) {
+    (
         [
-            (header::CONTENT_TYPE, content_type),
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        bytes,
-    ))
+        RUNTIME_JS,
+    )
 }
 
 pub(crate) async fn ws_handler(
