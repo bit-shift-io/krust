@@ -23,11 +23,17 @@ fn write_string_to_wasm(s: String) -> (*mut c_char, usize) {
 }
 
 /// Helper: write bytes into WASM memory and return (ptr, len).
-fn write_bytes_to_wasm(bytes: Vec<u8>) -> (*mut u8, usize) {
-    let mut vec = bytes;
-    let ptr = vec.as_mut_ptr();
-    let len = vec.len();
-    std::mem::forget(vec);
+///
+/// The JS caller frees returned buffers as `Vec::from_raw_parts(ptr, len, len)`,
+/// i.e. length AND capacity both equal `len`, so the buffer must be shrunk to
+/// its exact length first. Otherwise deallocating with `len` mismatches the
+/// allocation's real capacity and dlmalloc aborts (surface symptom: a bare
+/// "RuntimeError: unreachable executed" on the JS side).
+fn write_bytes_to_wasm(mut bytes: Vec<u8>) -> (*mut u8, usize) {
+    bytes.shrink_to_fit();
+    let len = bytes.len();
+    let ptr = bytes.as_mut_ptr();
+    std::mem::forget(bytes);
     (ptr, len)
 }
 
@@ -61,8 +67,8 @@ pub extern "C" fn set_renderer_mode(mode: i32) {
 pub extern "C" fn init(
     canvas_id_ptr: *const u8,
     canvas_id_len: usize,
-    cached_ptr: *const u8,
-    cached_len: usize,
+    cached_dims_ptr: *const u8,
+    cached_dims_len: usize,
 ) -> *mut u8 {
     if canvas_id_ptr.is_null() || canvas_id_len == 0 {
         return write_string_to_wasm("".to_string()).0 as *mut u8;
@@ -74,9 +80,9 @@ pub extern "C" fn init(
     };
 
     // Parse optional cached cell dimensions JSON (e.g. {"w":8.0,"h":18.0}).
-    let cached = if !cached_ptr.is_null() && cached_len > 0 {
+    let cached = if !cached_dims_ptr.is_null() && cached_dims_len > 0 {
         let json_str = unsafe {
-            std::str::from_utf8(std::slice::from_raw_parts(cached_ptr, cached_len))
+            std::str::from_utf8(std::slice::from_raw_parts(cached_dims_ptr, cached_dims_len))
                 .unwrap_or("")
         };
         serde_json::from_str::<serde_json::Value>(json_str)

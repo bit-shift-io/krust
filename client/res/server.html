@@ -373,7 +373,7 @@
             cellW = 8;
             cellH = 18;
         } else {
-            const { dataPtr, dataLen, box } = exportBoxedPair(boxPtr);
+            const { dataPtr, dataLen, boxPtr: box } = exportBoxedPair(boxPtr);
             const str = readString(dataPtr, dataLen);
             free_string(dataPtr);
             free_result(box);
