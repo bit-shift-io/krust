@@ -34,7 +34,7 @@ fn main() {
     }
 
     if !pkg_wasm.exists() || is_stale(&pkg_wasm, &client_dir) {
-        if let Err(e) = build_raw_wasm(&client_dir) {
+        if let Err(e) = build_raw_wasm(&manifest_dir, &client_dir) {
             eprintln!("cargo:warning=krust: wasm build failed: {}", e);
             eprintln!("cargo:warning=krust: re-run with KRUST_SKIP_WASM_BUILD=1");
         }
@@ -42,13 +42,14 @@ fn main() {
 }
 
 /// Build the WASM client directly with cargo to wasm32-unknown-unknown
-fn build_raw_wasm(client_dir: &Path) -> Result<(), String> {
+fn build_raw_wasm(manifest_dir: &Path, client_dir: &Path) -> Result<(), String> {
     let pkg_dir = client_dir.join("pkg");
     std::fs::create_dir_all(&pkg_dir).map_err(|e| format!("failed to create pkg dir: {}", e))?;
 
-    // Use a dedicated target dir (outside the workspace target/) so this nested
-    // cargo invocation does not deadlock on the locks the parent cargo holds.
-    let wasm_target_dir = client_dir.join(".wasm-target");
+    // Use a dedicated target dir under target/wasm so this nested cargo
+    // invocation does not deadlock on the locks the parent cargo holds.
+    let workspace_root = manifest_dir.parent().unwrap();
+    let wasm_target_dir = workspace_root.join("target").join("wasm");
 
     let status = Command::new("cargo")
         .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
