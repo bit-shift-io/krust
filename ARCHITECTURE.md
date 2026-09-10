@@ -15,16 +15,18 @@
 **Project Goal:** A fast, self-contained web terminal. A Rust server spawns a
 system shell inside a `portable-pty` PTY and streams raw bytes to browser
 clients over WebSocket; a WASM client parses VT100 ANSI bytes and renders the
-cell grid onto a `<canvas>` — Canvas 2D by default, WebGL2 as fallback.
+cell grid onto a `<canvas>` — WebGL2 by default, Canvas 2D as fallback.
 
 ### Key Technology Stack
 * **Server:** Rust, Tokio (`full`), Axum (`ws`), `portable-pty`, `tower-http`
   (permissive CORS), `futures-util`, `serde`/`serde_json`
-* **Client:** Rust compiled to WASM via `wasm-bindgen` (`--target web`),
-  `vt100` parser crate, `web-sys`/`js-sys`, `ab_glyph` (WebGL2 glyph atlas)
-* **Rendering:** Canvas 2D primary (WebGL2 two-pass instanced quads behind a
-  fallback, currently unused because its text pass doesn't render glyphs yet)
-  (text fill + geometry-drawn box/block glyphs)
+* **Client:** Rust compiled to raw WASM (`wasm32-unknown-unknown`, no
+  `wasm-bindgen`/`web-sys`/`js-sys`), `vt100` parser crate, `ab_glyph` (WebGL2
+  glyph atlas); the DOM/Canvas/WebGL2 APIs are reached through a hand-written
+  FFI import module (`krust`) implemented in `client/res/krust_runtime.js`
+* **Rendering:** WebGL2 primary (two-pass instanced quads with a rasterized
+  glyph atlas + geometry-drawn box/block glyphs); Canvas 2D fallback when
+  WebGL2 is unavailable
 * **Build:** `server/build.rs` builds the raw wasm client into `target/wasm/`
   when stale, so a plain `cargo build` / `cargo run` is sufficient
   (`KRUST_SKIP_WASM_BUILD=1` disables it). All client assets are then embedded
@@ -46,20 +48,35 @@ No grid state ever crosses the wire — the parser is the frame delimiter.
 .
 ├── Cargo.toml               # Workspace manifest (server + client)
 ├── server/
-│   ├── build.rs             # wasm-pack build trigger (unless skipped)
-│   └── src/main.rs          # Axum router, PTY sessions, WebSocket handler, tests
+│   ├── build.rs             # raw-wasm build trigger (unless skipped)
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs          # Axum router, PTY sessions, WebSocket handler, tests
+│       └── handlers.rs      # HTTP/WS handlers; embeds server.html, krust_runtime.js, the wasm
 └── client/
-    ├── Cargo.toml           # wasm-bindgen/vt100/web-sys/ab_glyph deps
+    ├── Cargo.toml           # vt100/ab_glyph deps (no wasm-bindgen)
     ├── fonts/
     │   └── Hack-Regular.ttf # Embedded monospace font (include_bytes!)
     ├── src/
-    │   ├── lib.rs           # WASM terminal: parse, render, selection, input, tests
-    │   └── renderer.rs      # WebGL2 glyph-atlas renderer (render dispatched from lib.rs)
-    ├── pkg/                 # wasm-pack build output (served at /pkg/...)
+    │   ├── lib.rs           # Module root + re-exports + tests
+    │   ├── ffi.rs           # Raw `extern "C"` imports from the `krust` JS module
+    │   ├── exports.rs       # `#[no_mangle] pub extern "C"` WASM API surface
+    │   ├── state.rs         # TerminalState: parser, renderer dispatch, Canvas 2D path
+    │   ├── renderer.rs      # WebGL2 glyph-atlas instanced renderer (GlyphAtlas, GlyphBrush)
+    │   ├── graphics.rs      # Shared box-drawing/block-cell geometry (both renderers)
+    │   ├── color.rs         # xterm-256 palette + bold-bright rules
+    │   ├── measure.rs       # Cell dimension measurement on scratch canvases
+    │   ├── input.rs         # Keyboard event → PTY byte mapping
+    │   ├── query.rs         # DA1/DA2/CPR/OSC-11 reply detection
+    │   └── selection.rs     # Selection range + text extraction
+    ├── target/wasm/…        # raw wasm build output (build.rs writes here)
     └── res/
+        ├── krust_runtime.js # Browser FFI runtime (`window.KRUST_RUNTIME`)
         ├── server.html      # Production HTML served at "/" (include_str!)
         ├── index.html       # Minimal smoke-test HTML
-        └── render-check.sh  # Headless-Chromium pixel verification (also render-test.html)
+        ├── render-test.html # Pixel-verification test page
+        ├── render-check.sh  # Headless-Chromium pixel verification
+        └── server.py        # Test HTTP server (mirrors /pkg/ wasm route)
 ```
 
 ---
@@ -96,17 +113,25 @@ input frames accepted as an alternative input path:
 
 **Server → Client:** binary frames (`ArrayBuffer`) of raw PTY output.
 
-### 3.3 WASM Client (`client/src/lib.rs`)
+### 3.3 WASM Client (`client/src/lib.rs` + modules)
 
-* **State model:** single-threaded `thread_local!` `RefCell<Option<TerminalState>>`;
-  public API exported with `#[wasm_bindgen]`.
+* **State model:** single-threaded `thread_local!` `RefCell<Option<TerminalState>>`
+  in `state.rs`; the public API is exported with `#[no_mangle] pub extern "C" fn`
+  in `exports.rs` (raw WASM ABI — strings/bytes cross the boundary as `(ptr, len)`
+  pairs, object handles are `i32`s into the FFI runtime's heap registry).
+* **FFI (`ffi.rs`):** raw `extern "C"` imports from the `krust` JS module —
+  DOM/canvas/WebGL2 operations implemented by `client/res/krust_runtime.js`.
+  Call sites never touch the browser API directly.
 * **`TerminalState`:** holds the `vt100::Parser`, the canvas element + active
   renderer, cached cell dimensions, and the selection range.
 * **Renderer selection:** `TerminalState::new()` measures cell dimensions on a
   **scratch canvas** (never touching the real canvas — a canvas only supports
   one context type, so the WebGL2 attempt can never be poisoned by an earlier
-  2D context). Canvas 2D is currently the **default**; WebGL2 is only used as a
-  fallback when a 2D context cannot be obtained. Exactly one renderer is active.
+  2D context). WebGL2 is currently the **default** (`WebGL2Renderer::new()` is
+  tried first); Canvas 2D is only used as a fallback when WebGL2 cannot be
+  obtained. On init it logs `KRUST: WebGL2 renderer initialized` or
+  `KRUST: WebGL2 unavailable, falling back to Canvas 2D`. Exactly one renderer
+  is active.
 * **Rendering:** `render()` dispatches to the active renderer. The WebGL2 path
   builds a per-frame selection cell list from the stored selection rectangle
   and passes (screen, default fg/bg, selection, cursor position) to
@@ -125,11 +150,16 @@ input frames accepted as an alternative input path:
   (`set_selection`/`selected_text`/`clear_selection`); `key_to_bytes` maps
   keyboard events to PTY byte sequences (arrows, modifiers, home/end, etc.).
 
-### 3.4 WebGL2 Renderer (`client/src/renderer.rs`)
+### 3.4 WebGL2 Renderer (`client/src/renderer.rs`, primary path)
 
-* **Font atlas (`GlyphAtlas`):** the 95 printable ASCII glyphs are rasterized
-  at init from `EMBEDDED_FONT` (`client/fonts/Hack-Regular.ttf`, shipped via
-  `include_bytes!`). `ab_glyph` handles layout; glyphs land in a WebGL2 texture.
+* **Font atlas (`GlyphAtlas`):** the 128 ASCII glyphs (0x00–0x7F) are
+  rasterized at init from `EMBEDDED_FONT` (`client/fonts/Hack-Regular.ttf`,
+  shipped via `include_bytes!`). `ab_glyph` handles layout; glyphs land in a
+  WebGL2 texture. All glyphs share a single text **baseline** (placement is
+  offset by the ascent, so descenders hang below the line instead of every
+  glyph being glued to the top of its cell); the atlas UV rows are swapped when
+  uploading so glyphs render upright. The atlas is the alpha source for every
+  text pass; a reserved opaque texel supplies flat fills for graphic cells.
 * **Two-pass instanced drawing (`GlyphBrush`):**
   * Pass 0 (mode 0) — per-cell background rects using a solid 1×1 atlas pixel;
   * Pass 1 (mode 1) — text glyphs sampling atlas alpha.
@@ -139,6 +169,11 @@ input frames accepted as an alternative input path:
   the cell's fg, matching the Canvas 2D behavior); the cursor is a block that
   swaps fg/bg and takes priority over selection.
 * **Resize:** `rebuild_atlas()` re-rasterizes at the new cell pitch.
+* **Viewport:** the render viewport and `u_resolution` cover the full drawing
+  buffer (`canvas.width`/`canvas.height`); the grid is laid out from pixel
+  origin `(0,0)` (bottom-left), which keeps its position identical to a
+  grid-sized viewport while avoiding Firefox's "Drawing to a destination rect
+  smaller than the viewport rect" warning.
 
 ---
 
@@ -200,11 +235,12 @@ last connection drops
 ### Adding a Control Message
 1. Add a variant to `ClientMessage` in `server/src/main.rs` (serde tag = type).
 2. Dispatch it in `handle_socket`.
-3. Add the corresponding `#[wasm_bindgen]` export in `client/src/lib.rs`.
+3. Add the corresponding `#[no_mangle]` export in `client/src/exports.rs`.
 
 ### Changing Rendering
-1. Canvas 2D geometry lives in `client/src/lib.rs`
-   (`draw_graphic_cell`, `render_canvas2d`).
+1. Canvas 2D geometry lives in `client/src/state.rs` (`render_canvas2d`,
+   `paint_cell`) with shared geometry in `client/src/graphics.rs`
+   (`draw_graphic_cell`, `block_geometry`, `box_geometry`).
 2. WebGL2 atlas/instancing lives in `client/src/renderer.rs`
    (`GlyphAtlas`, `GlyphBrush`, `build_instances`).
 3. Keep both paths behind the `TerminalState { webgl, ctx }` dispatch so the
@@ -215,16 +251,21 @@ last connection drops
 ## 7. Validation & Testing
 
 ```bash
-cargo test                    # all workspace tests (28 client + 11 server)
+cargo test                    # all workspace tests (client + server)
 cargo test -p krust           # server only
-cargo test -p terminal-client # WASM client only (wgpu-free, runs native)
-wasm-pack test client         # WASM-target tests (wasm-bindgen-test)
-cargo check -p terminal-client --target wasm32-unknown-unknown
-cargo build                   # triggers wasm-pack via build.rs unless skipped
+cargo test -p terminal-client # WASM client only (host unit tests, no browser)
+cargo build                   # triggers the raw-wasm build via build.rs
+                             # (skip with KRUST_SKIP_WASM_BUILD=1)
 ```
 
 Server tests use `tower::util::ServiceExt` one-shot HTTP requests; client tests
 live in `#[cfg(test)] mod tests` alongside the code.
+
+Browser verification (headless Chromium) runs via
+`client/res/render-check.sh`, which serves `res/` over a tiny Python HTTP
+server (`res/server.py`) and asserts on read-back pixels in `render-test.html`:
+color fidelity, box/block seamlessness, and per-cell text-glyph ink under
+whichever renderer is active.
 
 ---
 
@@ -233,11 +274,54 @@ live in `#[cfg(test)] mod tests` alongside the code.
 | File | Purpose |
 |---|---|
 | `server/src/main.rs` | Axum router, PTY session management, WS handler, tests |
-| `client/src/lib.rs` | WASM terminal: VT100 parse, Canvas 2D render, selection, input, tests |
-| `client/src/renderer.rs` | WebGL2 glyph-atlas instanced renderer |
+| `server/src/handlers.rs` | HTTP/WS handlers; embeds `server.html`, `krust_runtime.js`, the wasm |
+| `client/src/exports.rs` | `#[no_mangle]` WASM API surface (init, process_bytes, key_to_bytes, resize, selection, …) |
+| `client/src/state.rs` | `TerminalState`: vt100 parser, renderer dispatch, Canvas 2D path |
+| `client/src/renderer.rs` | WebGL2 glyph-atlas instanced renderer (`GlyphAtlas`, `GlyphBrush`) |
+| `client/src/ffi.rs` | Raw `extern "C"` imports from the `krust` JS module (DOM/Canvas/WebGL2) |
+| `client/src/graphics.rs` | Shared box-drawing/block-cell geometry (both renderers) |
+| `client/src/measure.rs` | Cell dimension measurement on scratch canvases |
+| `client/src/color.rs` | xterm-256 palette + bold-bright rules |
+| `client/src/input.rs` | Keyboard event → PTY byte mapping |
+| `client/src/query.rs` | DA1/DA2/CPR/OSC-11 reply detection |
+| `client/src/selection.rs` | Selection range + text extraction |
+| `client/res/krust_runtime.js` | Browser FFI runtime (`window.KRUST_RUNTIME`) |
 | `client/fonts/Hack-Regular.ttf` | Embedded font for the WebGL2 atlas |
 | `client/res/server.html` | Production HTML page (served at `/`) |
-| `client/res/index.html` | Minimal smoke-test page |
+| `client/res/render-check.sh` | Headless-Chromium pixel verification |
+| `client/res/render-test.html` | Pixel-assertion test page |
+
+---
+
+## 9. Known Issues & Open Investigations
+
+### First-load shell prompt delay (unexplained, environment-dependent)
+
+**Symptom:** on a *first* page load the terminal paints background + cursor
+immediately but the shell prompt appears only after ~10-20 s. Reloads are
+instant: the session (and its shell) persist server-side, so a fresh page
+simply replays the scrollback history.
+
+**Investigated (2026-09):** measurements ruled out the obvious candidates —
+raw PTY spawn of `/bin/sh`, `/bin/bash`, `/usr/bin/fish` all emit their first
+bytes in ~21 ms; the `portable-pty` openpty + spawn_command + read path takes
+~2 ms; and the full krust server launched normally renders the prompt in
+~40 ms (7 ms for a second session). A flat ~10 s reproduced *only* when the
+compiled server ran as a subprocess of a python process in the test sandbox;
+env vars, inherited fds, controlling session, and launch intermediary were
+each excluded without changing the ~10 s. The mechanism was never pinned and
+no code defect was found — the delay does not reproduce via a normal launch
+path (terminal, `cargo run`, systemd).
+
+**Why it matters / what to check next:** the symptom is likely an external
+one-time cost at the first PTY fork/exec on the host (e.g. auditd, AppArmor,
+cgroup/IO throttling, or a slow first interactive-shell init). If it reappears,
+repro it with the server under `strace -f -e trace=fork,execve,openat` or
+profile the shell spawn directly, and confirm whether the wait is in the
+server (before first PTY read) or in the shell (before first write). A
+boot-time pre-warm of the default session was tried as a workaround and
+reverted by request; it is the current fallback option if this is ever
+prioritized.
 | `AGENTS.md` | Shared agent context and conventions |
 | `TASKS.md` | Implementation roadmap |
 | `NOTES.md` | Design rationale and decisions |

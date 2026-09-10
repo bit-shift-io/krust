@@ -183,7 +183,8 @@ window.KRUST_RUNTIME = (function () {
       getObject(gl).disableVertexAttribArray(index);
     },
     krust_gl_vertex_attrib_pointer: (gl, index, size, type, normalized, stride, offset) => {
-      getObject(gl).vertexAttribPointer(index, size, type, normalized, stride, offset);
+      // offset crosses the WASM ABI as i64 → BigInt; WebGL needs a Number.
+      getObject(gl).vertexAttribPointer(index, size, type, normalized, stride, Number(offset));
     },
     krust_gl_vertex_attrib_divisor: (gl, index, divisor) => {
       getObject(gl).vertexAttribDivisor(index, divisor);

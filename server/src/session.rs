@@ -159,7 +159,6 @@ pub(crate) async fn get_or_create_session(
         history,
         connections: std::sync::atomic::AtomicUsize::new(0),
     });
-
-    sessions.insert(session_id.to_string(), session.clone());
+sessions.insert(session_id.to_string(), session.clone());
     session
 }

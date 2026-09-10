@@ -1,222 +1,197 @@
-# Implementation Plan: Code Quality Refactoring
+# Plan: Finish WebGL2 Port
+
+## Status: COMPLETE
+
+All five tasks are done and verified: `cargo test` (11 server + 46 client
+tests) passes, `cargo build` is clean, and `render-check.sh` is green under
+headless Chromium with the WebGL2 renderer active — the new per-cell text
+assertion reports `min_ink_per_cell: 17, cells_with_ink: 8`.
+
+Two extra fixes were required beyond the original plan:
+- `client/res/krust_runtime.js` `gl_vertex_attrib_pointer`: the `offset`
+  `i64` crosses the WASM ABI as a BigInt; it is now converted with
+  `Number(offset)` before the WebGL call, or `vertexAttribPointer` throws
+  a TypeError and nothing renders.
+- `client/res/server.py` `WASM_PATH`: computed from the script's own
+  location instead of the doc-root argument, because `render-check.sh`
+  starts the server with the doc root at `client/`.
+
+Known limitation (out of scope for this plan): the WebGL2 glyph atlas
+rasterizes all 128 ASCII glyphs (0x00–0x7F). Non-ASCII characters such as
+braille (`⠋⠁⠂…`) still have no atlas entry (`uv_for` → `None`), so they
+render invisible under WebGL2 (the Canvas 2D path falls back to the system
+font).
+
+Post-completion fixes: the atlas UV rows were swapped (glyphs rasterize
+top-down but the screen quad samples v0 at its top edge) so text renders
+upright instead of mirrored across the horizontal axis, and the render viewport
+grew to the full drawing buffer (was `cols*cell_w × rows*cell_h`) to silence
+Firefox's "Drawing to a destination rect smaller than the viewport rect"
+warning; the grid is laid out from pixel origin (0,0) so its position is
+unchanged.
+
+Second round of fixes (all verified):
+- **Glyph baseline alignment:** `GlyphAtlas` was gluing every glyph's bounding
+  box to the top of its atlas slot, so baselines landed at different rows per
+  glyph. All glyphs are now shifted by the font ascent, sharing one text
+  baseline (descenders and `_` hang below it). Verified by new client tests
+  and a browser-level assertion (a `g` row reaches the bottom of its cell and
+  `_` sits in the bottom band; `render-check.sh` reports `descender_ink: 150,
+  underscore_ink: 140`).
+- **Slow first load — investigated, root cause NOT in krust.** Symptoms: only
+  the *first* page load waits ~10-20s for the shell prompt; refreshes are
+  instant (the session and its shell persist). Measurements: raw PTY spawn of
+  `/bin/sh`, `/bin/bash`, and `/usr/bin/fish` — ~21ms each. The `portable-pty`
+  API (openpty + spawn_command + read) — **2ms** for an interactive shell. The
+  full krust server launched normally — **prompt visible in 40ms** (7ms for a
+  second session). Conclusion: not the pty library, not the shell, not krust's
+  spawn code. A flat ~10s appeared only when the compiled server ran as a
+  subprocess of a python process in the test sandbox (excluded env vars,
+  inherited fds, new session, launch intermediary) — an environment-specific
+  artifact that could not be pinned to a mechanism and does not reproduce via
+  the normal launch path. No code change was kept for this (a boot-time
+  pre-warm + stable default session id experiment worked around it but was
+  reverted on request).
+- `render-test.html` now reports per-stage boot timing (`timing.fetch_ms`,
+  `instantiate_ms`, `init_ms`, `resize_ms`, `feed_ms`, `repaint_ms`,
+  `readback` total) — headless total is ~11 ms, dominated by the wasm fetch.
 
 ---
 
-## Overview
+## Context
 
-Refactor the krust client to reduce code duplication, decompose oversized structures,
-and clean up repeated patterns. The server side is already clean (3 small modules);
-all targets are in `client/src/`.
-
-**Key files:**
-- `client/src/state.rs` (918 lines) — main target: duplicated render logic, oversized struct
-- `client/src/renderer.rs` (774 lines) — repeated color math in `build_instances`
-- `client/src/exports.rs` (479 lines) — repetitive box-pair return pattern
-
----
-
-## Phase 1: Extract shared Canvas 2D cell-painting helper
-
-### 1.1 Extract `paint_cell` from `render_full_grid` and `render_dirty_cells`
-
-**Status:** Pending
-
-**Problem:** `render_full_grid` (lines 509-627) and `render_dirty_cells` (lines 630-745)
-each contain ~80 lines of nearly identical cell-painting logic:
-  1. Clear cell to default background
-  2. Paint non-default background rect
-  3. Paint selection background rect (if selected)
-  4. Paint text glyph (with bold font swap)
-  5. Dispatch to `draw_graphic_cell` for box-drawing/block chars
-
-The only difference: `render_full_grid` iterates all cells in a nested loop,
-while `render_dirty_cells` iterates a pre-computed dirty list.
-
-**Changes to `client/src/state.rs`:**
-- Add a private method:
-  ```rust
-  fn paint_cell(
-      &self,
-      ctx: JsHandle,
-      screen: &vt100::Screen,
-      row: u16,
-      col: u16,
-      cw: f64,
-      ch: f64,
-      font: &mut String,
-  )
-  ```
-- This method performs steps 1-4 above for a single cell.
-- `render_full_grid` calls `paint_cell` in its grid loop.
-- `render_dirty_cells` calls `paint_cell` in its dirty-list loop.
-- Both methods retain their own setup (full-grid clears, cursor drawing).
-
-**Estimated reduction:** ~80 lines removed, ~40 lines added (net -40 lines).
-
-**Verification:**
-- `cargo test -p terminal-client` — all existing tests pass
-- `cargo build --release --target wasm32-unknown-unknown` — wasm builds clean
-- Manual browser test: terminal renders identically (text, colors, selection, cursor)
+The WebGL2 renderer in `client/src/renderer.rs` is architecturally complete
+(765 lines): glyph atlas, two-pass instanced drawing, selection/cursor
+handling, and resize support all exist. Background rendering works —
+headless Chromium tests pass for colors, dash seams, pipe seams, and block
+seams. But the text pass (glyph quads sampling the atlas alpha) never renders
+in the real browser. Three root causes stand between "code exists" and
+"working WebGL2 terminal."
 
 ---
 
-### 1.2 Extract cursor drawing into a shared helper
+## Root Causes
 
-**Status:** Pending
+### A. Initialization order: Canvas 2D always wins
+`state.rs:234` calls `canvas_get_2d(canvas)` first. Since every browser
+supports Canvas 2D, this always succeeds, permanently claiming the canvas
+for 2D. `try_webgl` (`state.rs:236`) is then always `false`, so WebGL2
+is never attempted.
 
-**Problem:** `draw_cursor` is called at the end of both `render_full_grid` (line 624)
-and `render_dirty_cells` (line 742). The cursor logic is already extracted into its
-own method, but the `visible_cursor` computation (lines 748-763) is called separately
-in both paths and could be inlined into `draw_cursor`.
+### B. `render-test.html` loads the wrong WASM binary
+`render-test.html:21` fetches `../pkg/terminal_client_bg.wasm` (the old
+wasm-pack output). The current architecture builds raw WASM to
+`target/wasm/wasm32-unknown-unknown/release/terminal_client.wasm`. The
+test harness never exercises the current renderer code.
 
-**Changes to `client/src/state.rs`:**
-- Simplify: `draw_cursor` takes `(screen, rows, cols)` and internally calls
-  `visible_cursor` — no need for callers to compute it separately.
-
-**Estimated reduction:** ~10 lines.
-
----
-
-## Phase 2: Decompose `TerminalState` struct
-
-### 2.1 Extract `ScrollState` sub-struct
-
-**Status:** Pending
-
-**Problem:** `TerminalState` has 21 fields. Several are scroll-related and always
-accessed together:
-- `saved_normal_offset_for_alt: Option<usize>`
-- `normal_scroll_offset: usize`
-- `alternate_scroll_offset: usize`
-
-**Changes to `client/src/state.rs`:**
-- Create a `ScrollState` struct:
-  ```rust
-  struct ScrollState {
-      saved_normal_offset_for_alt: Option<usize>,
-      normal_offset: usize,
-      alternate_offset: usize,
-  }
-  ```
-- Move `active_scroll_offset`, `clamp_scroll`, `active_scrollback_len`,
-  `set_scroll_offset`, `scroll_by`, `scroll_to_bottom`, `scroll_to_top`,
-  `apply_scrollback` methods to `impl ScrollState`.
-- `TerminalState` holds `scroll: ScrollState`.
-
-**Estimated reduction:** ~0 lines (restructure, not removal), but reduces
-`TerminalState` field count from 21 to 18 and groups related logic.
+### C. `render-test.html` doesn't test text rendering
+The pixel analysis checks: bold blue, dark blue absence, dash seams, pipe
+seams, block seams. None of these verify that ASCII glyphs actually render.
+The text pass could be completely broken and the test would still pass.
 
 ---
 
-### 2.2 Extract `SelectionState` sub-struct
+## Tasks
 
-**Status:** Pending
+### Task 1: Flip renderer initialization — WebGL2 first
+**File:** `client/src/state.rs`
+**Lines:** 220–252
 
-**Problem:** Selection fields are always accessed together:
-- `selection_mode: SelectionMode`
-- `selection_start: Option<(u16, u16)>`
-- `selection_end: Option<(u16, u16)>`
+Change `TerminalState::new()` to try WebGL2 first, fall back to Canvas 2D:
 
-**Changes to `client/src/state.rs`:**
-- Create a `SelectionState` struct:
-  ```rust
-  struct SelectionState {
-      mode: SelectionMode,
-      start: Option<(u16, u16)>,
-      end: Option<(u16, u16)>,
-  }
-  ```
-- Move `handle_selection_start`, `handle_selection_update`,
-  `clear_selection`, `selection_cells`, `selected` methods to `impl SelectionState`.
-- `TerminalState` holds `selection: SelectionState`.
+1. Attempt `WebGL2Renderer::new(...)` first (requires cell dims from
+   `measure_cell_dimensions_scratch()` or cached values — both already work
+   without a 2D context on the real canvas).
+2. If WebGL2 fails, attempt `canvas_get_2d(canvas)` as before.
+3. If both fail, return the existing error.
 
-**Estimated reduction:** ~0 lines (restructure), reduces field count to 15.
+No new FFI needed — scratch canvas measurement already avoids the real
+canvas. The only change is the order of the two branches.
+
+**Verify:** `cargo test -p terminal-client` passes; `cargo build` clean.
 
 ---
 
-## Phase 3: Clean up `renderer.rs` color math
+### Task 2: Update `render-test.html` to load correct WASM
+**File:** `client/res/render-test.html`
+**Line:** 21
 
-### 3.1 Extract `rgb_to_floats` helper
+Change the fetch URL from `../pkg/terminal_client_bg.wasm` to
+`/pkg/terminal_client_bg.wasm` (matching the server route that serves
+the embedded raw WASM from `target/wasm/`). Also update the JS import
+path for `krust_runtime.js` to match the current raw-WASM pattern
+(instead of the wasm-pack pattern).
 
-**Status:** Pending
+**Verify:** `cargo build -p krust && render-check.sh` passes.
 
-**Problem:** `build_instances` (lines 633-763) contains ~12 instances of the pattern:
-```rust
-((rgb >> 16) & 0xff) as f32 / 255.0,
-((rgb >> 8) & 0xff) as f32 / 255.0,
-(rgb & 0xff) as f32 / 255.0,
+---
+
+### Task 3: Add text-rendering assertions to `render-test.html`
+**File:** `client/res/render-test.html`
+
+After the existing dash/pipe/block seam checks, add a **text glyph
+check**:
+
+- Feed content that includes a known ASCII line (e.g. the word
+  `"boldblue"` on row 0, or the spinner chars `⠋⠁⠂`).
+- For each cell in that row, read pixels and verify that at least some
+  pixels differ from the background color (i.e. glyph ink was drawn).
+- Under WebGL2, use `gl.readPixels()` (already in the test); under
+  Canvas 2D, use `getImageData()` (already in the test).
+- Assert: every non-space cell in the text row has at least N pixels
+  brighter than the background threshold.
+
+This ensures the text pass (mode=1, atlas alpha sampling) is actually
+producing visible output.
+
+**Verify:** `render-check.sh` passes with the new assertion.
+
+---
+
+### Task 4: Add debug logging for WebGL2 initialization
+**File:** `client/src/state.rs`
+
+Add a `ffi::console_log` call when WebGL2 is successfully obtained and
+when it fails, so browser DevTools shows which renderer was selected:
+
+```
+KRUST: WebGL2 renderer initialized (cols=80, rows=24, cell=8x18)
+KRUST: WebGL2 unavailable, falling back to Canvas 2D
 ```
 
-**Changes to `client/src/renderer.rs`:**
-- Add a private helper:
-  ```rust
-  fn rgb_to_floats(rgb: u32) -> (f32, f32, f32) {
-      (
-          ((rgb >> 16) & 0xff) as f32 / 255.0,
-          ((rgb >> 8) & 0xff) as f32 / 255.0,
-          (rgb & 0xff) as f32 / 255.0,
-      )
-  }
-  ```
-- Replace all inline color conversions in `build_instances` with calls to this helper.
-- Also use in `render()` method's `gl_clear_color` call (lines 530-536).
+Also log any shader compilation or atlas build errors to the console.
 
-**Estimated reduction:** ~30 lines of duplicated bit manipulation.
-
-**Verification:**
-- `cargo test -p terminal-client` — pass
-- `render-check.sh` — headless Chromium passes
+**Verify:** Browser DevTools console shows the renderer choice on load.
 
 ---
 
-### 3.2 Extract `default_colors` usage
+### Task 5: Update ARCHITECTURE.md for current build system
+**File:** `ARCHITECTURE.md`
 
-**Status:** Pending
-
-**Problem:** The `default_colors` helper (lines 368-377) already exists but is only
-used in `build_instances`. The same pattern appears in `render()` for `gl_clear_color`.
-
-**Changes to `client/src/renderer.rs`:**
-- Use `rgb_to_floats` in `render()` for `gl_clear_color` instead of inline shifts.
-- Remove `default_colors` function (superseded by `rgb_to_floats`).
-
----
-
-## Phase 4: Clean up `exports.rs` repetitive pattern
-
-### 4.1 Extract `return_json` helper macro
-
-**Status:** Pending
-
-**Problem:** Every WASM export that returns JSON follows the same pattern:
-```rust
-let boxed = Box::new([ptr as u32, len as u32]);
-Box::into_raw(boxed) as *mut u8
-```
-This appears 8 times across `init`, `process_bytes`, `query_replies`, `version`,
-`selection_mode`, `selected_text`, `handle_click`, `key_to_bytes`.
-
-**Changes to `client/src/exports.rs`:**
-- Add a helper function:
-  ```rust
-  fn return_pair(ptr: *mut u8, len: usize) -> *mut u8 {
-      let boxed = Box::new([ptr as u32, len as u32]);
-      Box::into_raw(boxed) as *mut u8
-  }
-  ```
-- Replace all 8 occurrences with `return_pair(ptr, len)`.
-- Also replace the 3 error-case `[0u32, 0u32]` returns with a `return_null_pair()` helper.
-
-**Estimated reduction:** ~20 lines.
+- Section 1: Remove `wasm-bindgen` / `web-sys` / `js-sys` from the
+  technology stack. Add raw WASM ABI + hand-rolled FFI.
+- Section 3.3: Update state model description to reflect the new
+  module layout (`state.rs`, `exports.rs`, `ffi.rs`, etc.).
+- Section 7: Remove `wasm-pack test` and `wasm-pack build` commands.
+  Update to `cargo build --release --target wasm32-unknown-unknown`.
+- Section 8: Add missing files (`ffi.rs`, `exports.rs`, `state.rs`,
+  `graphics.rs`, `color.rs`, `measure.rs`, `input.rs`, `query.rs`,
+  `selection.rs`).
 
 ---
 
-## Verification Checklist
+## Verification
 
-- [ ] `cargo test` — all workspace tests pass
-- [ ] `cargo test -p terminal-client` — 38+ host tests pass
-- [ ] `cargo build --release --target wasm32-unknown-unknown` — wasm builds clean
-- [ ] `cargo build -p krust` — server builds clean
-- [ ] `render-check.sh` — headless Chromium passes
-- [ ] Manual browser test: text rendering, selection, cursor, scroll all work
-- [ ] No new compiler warnings introduced
+After all tasks:
+- `cargo test` — all workspace tests pass
+- `cargo test -p terminal-client` — client tests pass
+- `cargo build` — clean build (triggers WASM build via build.rs)
+- `render-check.sh` — headless Chromium passes all checks including
+  the new text glyph assertion
+- Manual browser test: `cargo run`, open `http://localhost:3000`:
+  - Text glyphs render correctly
+  - Box-drawing / block elements tile seamlessly
+  - Selection highlight works
+  - Cursor block renders
+  - Scrollback works
+  - Resize re-renders cleanly

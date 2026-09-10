@@ -21,7 +21,7 @@
 //   selected: fg and bg are swapped
 //   cursor: fg = original bg, bg = original fg (block cursor)
 
-use ab_glyph::{Font, FontRef, Glyph, Point, PxScale};
+use ab_glyph::{Font, FontRef, Glyph, Point, PxScale, ScaleFont};
 
 use crate::ffi::{self, JsHandle};
 
@@ -48,8 +48,8 @@ const COLOR_BUFFER_BIT: u32 = 0x4000;
 const TRIANGLE_STRIP: u32 = 0x0005;
 
 const ATLAS_PADDING: u32 = 2;
-const FIRST_ASCII: char = ' ';
-const LAST_ASCII: char = '~';
+const FIRST_ASCII: char = '\u{0}';
+const LAST_ASCII: char = '\u{7f}';
 const ATLAS_COLS: usize = 16;
 
 /// Embedded monospace font used for glyph rasterization.
@@ -134,6 +134,22 @@ impl GlyphAtlas {
         let glyph_w = (cell_w * dpr).ceil() as u32;
         let glyph_h = (cell_h * dpr).ceil() as u32;
 
+        // Row (from the top of the atlas slot) where glyphs' text baseline
+        // lands. Everything vertical is derived from this one number, so every
+        // glyph shares a baseline instead of being top-aligned to its own
+        // bounding box (which would park each glyph's baseline at a different
+        // height). Hack has ascent+descent == em and line_gap == 0, so the
+        // full glyph extents fit the slot with no clipping.
+        let baseline = {
+            let scaled = font.as_scaled(PxScale::from(glyph_h as f32));
+            let asc = scaled.ascent();
+            if asc.is_finite() && asc > 0.0 {
+                (asc.round() as i32).clamp(0, glyph_h as i32 - 1)
+            } else {
+                (glyph_h as i32) / 2
+            }
+        };
+
         let count = (LAST_ASCII as u32 - FIRST_ASCII as u32 + 1) as usize;
         let cols = ATLAS_COLS as u32;
         let rows = ((count as u32 + cols - 1) / cols) as u32;
@@ -151,13 +167,16 @@ impl GlyphAtlas {
             let x = col * (glyph_w + ATLAS_PADDING);
             let y = row * (glyph_h + ATLAS_PADDING);
 
-            Self::rasterize_glyph(font, ch, glyph_w, glyph_h, &mut data, x, y, atlas_w);
+            Self::rasterize_glyph(font, ch, glyph_w, glyph_h, baseline, &mut data, x, y, atlas_w);
 
             let u0 = x as f32 / atlas_w as f32;
             let v0 = y as f32 / atlas_h as f32;
             let u1 = (x + glyph_w) as f32 / atlas_w as f32;
             let v1 = (y + glyph_h) as f32 / atlas_h as f32;
-            uv_map.push((u0, v0, u1, v1));
+            // Glyphs rasterize top-down into the data array, but the screen quad
+            // samples v0 at its top edge. Swapping the row endpoints mirrors the
+            // sample across the horizontal axis so glyphs render upright.
+            uv_map.push((u0, v1, u1, v0));
         }
 
         // Reserve the bottom-right padding texel as an opaque "solid" sample:
@@ -182,6 +201,7 @@ impl GlyphAtlas {
         ch: char,
         glyph_w: u32,
         glyph_h: u32,
+        baseline: i32,
         data: &mut [u8],
         x: u32,
         y: u32,
@@ -194,10 +214,23 @@ impl GlyphAtlas {
             position: Point { x: 0.0, y: 0.0 },
         };
         if let Some(outlined) = font.outline_glyph(glyph) {
+            let b = outlined.px_bounds();
+            // (gx, gy) are relative to the glyph's own bounding box top-left.
+            // In the glyph's image space the baseline sits at y=0 (the position
+            // component), so a box pixel's image row is `b.min.y + gy`. Shift
+            // every pixel so the baseline lands on the shared `baseline` slot
+            // row; pixels that fall outside the slot are clipped. This is what
+            // aligns all glyphs to one text baseline (rather than pinning each
+            // glyph's box top to the cell top).
+            let box_top = b.min.y as i32;
             outlined.draw(|gx, gy, coverage| {
-                if gx < glyph_w && gy < glyph_h {
+                if gx >= glyph_w {
+                    return;
+                }
+                let slot_row = box_top + gy as i32 + baseline;
+                if slot_row >= 0 && (slot_row as u32) < glyph_h {
                     let px = x + gx;
-                    let py = y + gy;
+                    let py = y + slot_row as u32;
                     data[(py * stride + px) as usize] = (coverage * 255.0) as u8;
                 }
             });
@@ -438,6 +471,8 @@ fn graphic_rects(
 }
 
 pub struct WebGL2Renderer {
+    /// Canvas element backing the GL context, queried for drawing-buffer size.
+    pub canvas: JsHandle,
     pub ctx: JsHandle,
     pub atlas: GlyphAtlas,
     pub brush: GlyphBrush,
@@ -485,6 +520,7 @@ impl WebGL2Renderer {
         let brush = GlyphBrush::new(gl)?;
 
         Ok(WebGL2Renderer {
+            canvas,
             ctx: gl,
             atlas,
             brush,
@@ -520,16 +556,20 @@ impl WebGL2Renderer {
         let cols = rcols as u32;
 
         let gl = self.ctx;
-        let width = cols * self.cell_w;
-        let height = rows * self.cell_h;
+        // Use the full drawing buffer as the viewport so the destination rect
+        // always matches it (avoids Firefox's "Drawing to a destination rect
+        // smaller than the viewport rect" warning). The grid is still laid out
+        // from pixel origin (0,0), so it occupies the bottom-left corner.
+        let buf_w = ffi::canvas_width(self.canvas);
+        let buf_h = ffi::canvas_height(self.canvas);
 
-        ffi::gl_viewport(gl, 0, 0, width as i32, height as i32);
+        ffi::gl_viewport(gl, 0, 0, buf_w as i32, buf_h as i32);
         let (cr, cg, cb) = rgb_to_floats(default_bg);
         ffi::gl_clear_color(gl, cr, cg, cb, 1.0);
         ffi::gl_clear(gl, COLOR_BUFFER_BIT);
 
         ffi::gl_use_program(gl, self.brush.program);
-        ffi::gl_uniform2f(gl, self.brush.resolution_loc, width as f32, height as f32);
+        ffi::gl_uniform2f(gl, self.brush.resolution_loc, buf_w as f32, buf_h as f32);
 
         ffi::gl_active_texture(gl, TEXTURE0);
         ffi::gl_bind_texture(gl, TEXTURE_2D, self.atlas.texture);
@@ -756,10 +796,103 @@ impl WebGL2Renderer {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn atlas_builds_with_48_chars() {
-        if let Ok(font_bytes) = std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf") {
-            assert!(!font_bytes.is_empty());
+    use super::*;
+    use ab_glyph::ScaleFont;
+
+    fn font() -> FontRef<'static> {
+        FontRef::try_from_slice(EMBEDDED_FONT).unwrap()
+    }
+
+    /// Rasterize `ch` into a `slot_h x slot_h` scratch slot at the given
+    /// `baseline` (slot row of the text baseline) and return the ink bounding
+    /// box in slot rows, matching `GlyphAtlas::rasterize_glyph` semantics.
+    fn ink_bounds(ch: char, slot_h: u32, baseline: i32) -> (i32, i32) {
+        let f = font();
+        let mut slot = vec![0u8; (slot_h * slot_h) as usize];
+        GlyphAtlas::rasterize_glyph(&f, ch, slot_h, slot_h, baseline, &mut slot, 0, 0, slot_h);
+        let mut top = slot_h as i32;
+        let mut bottom = -1i32;
+        for r in 0..slot_h {
+            for c in 0..slot_h {
+                if slot[(r * slot_h + c) as usize] > 20 {
+                    top = top.min(r as i32);
+                    bottom = r as i32;
+                }
+            }
         }
+        (top, bottom)
+    }
+
+    #[test]
+    fn all_ascii_glyphs_share_one_baseline_row() {
+        let f = font();
+        let slot_h: u32 = 18;
+        let expected = 14; // round(Hack ascent 14.35) at 18px em
+        for ch in ['x', 'T', 'g', 'M', 'l', 'p', '|', ',', '_', '"', '^', '`'] {
+            let (top, bottom) = ink_bounds(ch, slot_h, expected);
+            assert!(
+                top >= 0 && bottom >= top && bottom <= slot_h as i32 - 1,
+                "'{}' out of slot: top={} bottom={}",
+                ch,
+                top,
+                bottom
+            );
+            // Same baseline as every other glyph: the box top of a glyph whose
+            // box min.y is `my` must sit at `expected + min.y` exactly.
+            let glyph = Glyph {
+                id: f.glyph_id(ch),
+                scale: PxScale::from(slot_h as f32),
+                position: Point { x: 0.0, y: 0.0 },
+            };
+            if let Some(ol) = f.outline_glyph(glyph) {
+                let min_y = ol.px_bounds().min.y as i32;
+                assert_eq!(
+                    top,
+                    expected + min_y,
+                    "'{}' not aligned to shared baseline",
+                    ch
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_descender_glyphs_sit_on_the_baseline() {
+        // x-height/cap-height glyphs end exactly at the baseline row, so their
+        // last ink row is `baseline - 1`. Descenders (`g`/`p`/`|`) must extend
+        // below the baseline instead of sharing the box-top alignment.
+        let b = 14;
+        for ch in ['x', 'T', 'M'] {
+            let (top, bottom) = ink_bounds(ch, 18, b);
+            assert_eq!(bottom, b - 1, "'{}' should end at the baseline", ch);
+            assert!(top > 0, "'{}' should sit above the baseline", ch);
+        }
+        for ch in ['g', 'p', '|', 'y'] {
+            let (_top, bottom) = ink_bounds(ch, 18, b);
+            assert!(bottom > b, "'{}' should descend below the baseline", ch);
+        }
+    }
+
+    #[test]
+    fn underscore_renders_below_the_baseline() {
+        // '_' is entirely below the baseline; making it render near the bottom
+        // of the cell (rather than glued to the cell top) is what baseline
+        // placement buys us.
+        let (top, bottom) = ink_bounds('_', 18, 14);
+        assert!(top >= 13 && bottom <= 17, "underscore rows [{}, {}]", top, bottom);
+    }
+
+    #[test]
+    fn baseline_hydrates_at_other_sizes() {
+        let f = font();
+        let slot_h: u32 = 36; // dpr=2
+        let asc = f.as_scaled(PxScale::from(slot_h as f32)).ascent();
+        let expected = asc.round() as i32;
+        let (t_top, t_bottom) = ink_bounds('T', slot_h, expected);
+        let (g_top, g_bottom) = ink_bounds('g', slot_h, expected);
+        assert_eq!(t_bottom, expected - 1);
+        assert!(t_top >= 0);
+        assert!(g_bottom >= expected, "g must descend below baseline");
+        assert!(g_bottom <= slot_h as i32 - 1);
     }
 }

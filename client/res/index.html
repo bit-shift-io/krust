@@ -43,7 +43,7 @@
         }
 
         // Load raw WASM module directly, with the "krust" FFI import module
-        const wasmResp = await fetch('../pkg/terminal_client_bg.wasm');
+        const wasmResp = await fetch('/pkg/terminal_client_bg.wasm');
         const wasmBytes = await wasmResp.arrayBuffer();
         const wasm = await WebAssembly.instantiate(wasmBytes, window.KRUST_RUNTIME.imports);
         window.KRUST_RUNTIME.install(wasm.instance.exports.memory);

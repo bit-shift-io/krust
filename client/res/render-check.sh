@@ -6,7 +6,9 @@
 #   2. no dark navy (#0000EE) leaks through
 #   3. a ─ row has no horizontal seams
 #   4. a │ column has no vertical seams (cell pitch == painted glyph height)
-# Requires a wasm build (cargo build + wasm-pack build --target web) and
+#   5. a T row renders bar-on-top (glyphs not mirrored across the horizontal axis)
+#   6. a g row reaches the cell bottom and an _ row sits there too (baseline alignment)
+# Requires a wasm build (cargo build at the repo root) and
 # chromium. Skips gracefully (exit 0) when chromium is unavailable.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -50,7 +52,7 @@ import json,sys
 d=json.loads(sys.stdin.read())
 m=d.get("metrics",{})
 print("cell=%.3fx%.3f" % (m.get("cell_width",0), m.get("cell_height",0)))
-for k in ("colors","dash","pipe","block"):
+for k in ("colors","text","orient","baseline","timing","dash","pipe","block"):
     if k in d: print("  %-22s %s" % (k, d[k]))
 for k in ("block_vdim_rows","block_hdim_cols"):
     if k in d: print("  %-22s %s" % (k, d[k]))

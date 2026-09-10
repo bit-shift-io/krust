@@ -73,9 +73,9 @@ krust/
 │   └── src/main.rs
 ├── client/                 # WASM client crate
 │   ├── Cargo.toml
-│   ├── src/lib.rs
-│   ├── res/                # HTML pages + test harness
-│   └── pkg/                # raw WASM output
+│   ├── src/                # lib.rs, exports.rs, state.rs, renderer.rs, ffi.rs, …
+│   ├── res/                # HTML pages, krust_runtime.js, test harness
+│   └── fonts/              # Embedded Hack-Regular.ttf (WebGL2 atlas)
 ```
 
 ---

@@ -1,6 +1,6 @@
 // Client terminal state.
 //
-// Holds the vt100 parser, the active renderer (Canvas 2D default, WebGL2
+// Holds the vt100 parser, the active renderer (WebGL2 primary, Canvas 2D
 // fallback), cell dimensions, and selection state. Exposes the methods the
 // WASM exports mutate it through.
 
@@ -153,15 +153,15 @@ impl SelectionState {
 
 /// Terminal state fields.
 ///
-/// Holds the vt100 parser, the active renderer (Canvas 2D default, WebGL2
+/// Holds the vt100 parser, the active renderer (WebGL2 primary, Canvas 2D
 /// fallback), cell dimensions, and selection state. Exposes the methods the
 /// WASM exports mutate it through.
 pub(crate) struct TerminalState {
     /// vt100 parser
     parser: Parser,
-    /// 2D rendering context (Canvas 2D default path)
+    /// 2D rendering context (Canvas 2D fallback path)
     ctx: Option<JsHandle>,
-    /// WebGL2 renderer (fallback; text pass not yet rendering glyphs)
+    /// WebGL2 renderer (primary path)
     webgl: Option<renderer::WebGL2Renderer>,
     /// Canvas element (source of pixel dimensions)
     canvas: JsHandle,
@@ -228,31 +228,31 @@ impl TerminalState {
             .or_else(|| measure_cell_dimensions_scratch())
             .unwrap_or((14.0, 20.0));
 
-        // Canvas 2D primary path. Text rendering is currently unreliable under
-        // WebGL2 (glyphs missing in practice), so Canvas 2D is the default until
-        // the WebGL2 text path is fixed.
-        let ctx = ffi::canvas_get_2d(canvas);
-        let ctx = (ctx != 0).then_some(ctx);
-        let try_webgl = ctx.is_none();
-
-        // WebGL2 fallback: only when a 2D context could not be obtained.
+        // Try WebGL2 first for GPU-accelerated rendering; fall back to Canvas 2D.
         let mut webgl = None;
-        if try_webgl {
-            if let Ok(w) = renderer::WebGL2Renderer::new(
-                canvas_id,
-                cell_width,
-                cell_height,
-                DEFAULT_ROWS,
-                DEFAULT_COLS,
-                dpr,
-                renderer::EMBEDDED_FONT,
-            ) {
-                webgl = Some(w);
-            }
+        if let Ok(w) = renderer::WebGL2Renderer::new(
+            canvas_id,
+            cell_width,
+            cell_height,
+            DEFAULT_ROWS,
+            DEFAULT_COLS,
+            dpr,
+            renderer::EMBEDDED_FONT,
+        ) {
+            ffi::console_log("KRUST: WebGL2 renderer initialized");
+            webgl = Some(w);
+        } else {
+            ffi::console_log("KRUST: WebGL2 unavailable, falling back to Canvas 2D");
         }
-
+        // Canvas 2D fallback: only when WebGL2 could not be obtained.
+        let ctx = if webgl.is_none() {
+            let c = ffi::canvas_get_2d(canvas);
+            (c != 0).then_some(c)
+        } else {
+            None
+        };
         if ctx.is_none() && webgl.is_none() {
-            return Err("no rendering context available (2D failed and WebGL2 unavailable)".to_string());
+            return Err("no rendering context available (WebGL2 and Canvas 2D both failed)".to_string());
         }
 
         let canvas_w = ffi::element_offset_width(canvas);
@@ -474,9 +474,9 @@ impl TerminalState {
         }
     }
 
-    /// Dispatches to the active renderer: Canvas 2D by default, WebGL2
-    /// when it was selected as the fallback. Honors the `needs_render`
-    /// flag set by `schedule_render` to enable frame coalescing.
+    /// Dispatches to the active renderer: WebGL2 by default, Canvas 2D
+    /// when WebGL2 was unavailable. Honors the `needs_render` flag set by
+    /// `schedule_render` to enable frame coalescing.
     pub(crate) fn render(&mut self) -> Result<(), String> {
         // Always render (caller decides when to invoke). The `needs_render`
         // flag only controls full vs selective strategy inside render_canvas2d.
