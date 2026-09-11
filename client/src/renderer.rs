@@ -51,7 +51,7 @@ const COLOR_BUFFER_BIT: u32 = 0x4000;
 const TRIANGLE_STRIP: u32 = 0x0005;
 
 const ATLAS_PADDING: u32 = 2;
-const ATLAS_COLS: usize = 16;
+const ATLAS_COLS: usize = 32;
 
 /// A contiguous range of codepoints baked into the atlas.
 struct AtlasRange {
@@ -64,8 +64,11 @@ struct AtlasRange {
 /// `uv_for()` can scan linearly (the list is tiny).
 const ATLAS_RANGES: &[AtlasRange] = &[
     AtlasRange { start: 0x0000, len: 128, offset: 0 },    // ASCII
-    AtlasRange { start: 0x2800, len: 256, offset: 128 },  // Braille
-    AtlasRange { start: 0x2580, len: 128, offset: 384 },  // Block parts (U+2581-259F) + Geometric shapes (U+25A0-25FF)
+    AtlasRange { start: 0x2190, len: 112, offset: 128 },  // Arrows (spinner ↻ ↺ ← →)
+    AtlasRange { start: 0x2200, len: 256, offset: 240 },  // Math operators (⋯ ⊶ ⊷ ⇦ ⇨)
+    AtlasRange { start: 0x2580, len: 128, offset: 496 },  // Block parts (U+2581-259F) + Geometric shapes (U+25A0-25FF)
+    AtlasRange { start: 0x2700, len: 192, offset: 624 },  // Dingbats (✦ ✧ ✶ ✔)
+    AtlasRange { start: 0x2800, len: 256, offset: 816 },  // Braille
 ];
 
 /// Embedded monospace font used for glyph rasterization.
@@ -149,6 +152,7 @@ impl GlyphAtlas {
     pub fn new(
         gl: JsHandle,
         font: &FontRef,
+        fallback: Option<&FontRef>,
         cell_w: f64,
         cell_h: f64,
         dpr: f64,
@@ -199,7 +203,7 @@ impl GlyphAtlas {
                 let x = col * (glyph_w + ATLAS_PADDING);
                 let y = row * (glyph_h + ATLAS_PADDING);
 
-                Self::rasterize_glyph(font, ch, glyph_w, glyph_h, em, baseline, &mut data, x, y, atlas_w);
+                Self::rasterize_glyph(font, fallback, ch, glyph_w, glyph_h, em, baseline, &mut data, x, y, atlas_w);
 
                 let u0 = x as f32 / atlas_w as f32;
                 let v0 = y as f32 / atlas_h as f32;
@@ -228,6 +232,7 @@ impl GlyphAtlas {
 
 fn rasterize_glyph(
         font: &FontRef,
+        fallback: Option<&FontRef>,
         ch: char,
         glyph_w: u32,
         glyph_h: u32,
@@ -238,12 +243,29 @@ fn rasterize_glyph(
         y: u32,
         stride: u32,
     ) {
-        let glyph = Glyph {
-            id: font.glyph_id(ch),
-            scale: PxScale::from(em),
-            position: Point { x: 0.0, y: 0.0 },
-        };
-        if let Some(outlined) = font.outline_glyph(glyph) {
+        let cp = ch as u32;
+        // Braille (U+2800..U+28FF) is synthesized as a 2x4 dot grid instead of
+        // the font's outlines. Hack's braille at the production em (advance-==
+        // one 8px cell) renders spinner frames like ⠋/⠙ into *identical*
+        // bitmaps — the 1-dot deltas collapse to the same pixels, so opencode's
+        // spinner looks frozen on the GL path even though the screen updates.
+        // The dot grid guarantees distinct, crisp frames at any cell size.
+        if (0x2800..=0x28FF).contains(&cp) {
+            Self::rasterize_braille(cp, glyph_w, glyph_h, data, x, y, stride);
+            return;
+        }
+        // A glyph the primary font lacks (no outline) is stamped from the
+        // fallback font instead, mirroring the Canvas 2D path where the browser
+        // falls back to other installed families per-glyph.
+        for provider in [Some(font)].into_iter().flatten().chain(fallback) {
+            let glyph = Glyph {
+                id: provider.glyph_id(ch),
+                scale: PxScale::from(em),
+                position: Point { x: 0.0, y: 0.0 },
+            };
+            let Some(outlined) = provider.outline_glyph(glyph) else {
+                continue;
+            };
             let b = outlined.px_bounds();
             // (gx, gy) are relative to the glyph's own bounding box top-left.
             // In the glyph's image space the advance origin sits at (0, 0) (the
@@ -270,6 +292,71 @@ fn rasterize_glyph(
                     }
                 }
             });
+            break;
+        }
+    }
+
+    /// Paint a braille pattern (U+2800..U+28FF) as a 2x4 grid of filled dots
+    /// into the atlas slot at `(x, y)`. Braille bit layout (dot N = bit N-1):
+    ///   dot1 dot4
+    ///   dot2 dot5
+    ///   dot3 dot6
+    ///   dot7 dot8
+    fn rasterize_braille(
+        cp: u32,
+        glyph_w: u32,
+        glyph_h: u32,
+        data: &mut [u8],
+        x: u32,
+        y: u32,
+        stride: u32,
+    ) {
+        // Two dots per row across the width; four rows stacked over the height.
+        let xs = [glyph_w as f32 * 0.3125, glyph_w as f32 * 0.6875];
+        let ys = [
+            glyph_h as f32 * 0.17,
+            glyph_h as f32 * 0.42,
+            glyph_h as f32 * 0.67,
+            glyph_h as f32 * 0.92,
+        ];
+        let cx = [
+            x + xs[0].round() as u32,
+            x + xs[1].round() as u32,
+        ];
+        let cy = [
+            y + ys[0].round() as u32,
+            y + ys[1].round() as u32,
+            y + ys[2].round() as u32,
+            y + ys[3].round() as u32,
+        ];
+        // Dot diameter ~2px at an 8px cell, scaled up with the slot.
+        let r = ((glyph_w as f32 * 0.19).floor() as u32).max(1);
+        for dot in 0..8u32 {
+            if cp & (1u32 << dot) == 0 {
+                continue;
+            }
+            let (row, col) = match dot {
+                0 => (0, 0),
+                1 => (1, 0),
+                2 => (2, 0),
+                3 => (0, 1),
+                4 => (1, 1),
+                5 => (2, 1),
+                6 => (3, 0),
+                7 => (3, 1),
+                _ => unreachable!(),
+            };
+            let dcx = cx[col];
+            let dcy = cy[row];
+            let x0 = dcx.saturating_sub(r).max(x);
+            let x1 = (dcx + r).min(x + glyph_w - 1);
+            let y0 = dcy.saturating_sub(r).max(y);
+            let y1 = (dcy + r).min(y + glyph_h - 1);
+            for py in y0..=y1 {
+                for px in x0..=x1 {
+                    data[(py * stride + px) as usize] = 255;
+                }
+            }
         }
     }
 
@@ -326,11 +413,12 @@ fn rasterize_glyph(
         &mut self,
         gl: JsHandle,
         font: &FontRef,
+        fallback: Option<&FontRef>,
         cell_w: f64,
         cell_h: f64,
         dpr: f64,
     ) -> Result<(), String> {
-        let new_atlas = Self::new(gl, font, cell_w, cell_h, dpr)?;
+        let new_atlas = Self::new(gl, font, fallback, cell_w, cell_h, dpr)?;
         ffi::gl_delete_texture(gl, self.texture);
         self.texture = new_atlas.texture;
         self.atlas_width = new_atlas.atlas_width;
@@ -460,6 +548,11 @@ pub struct WebGL2Renderer {
     pub cols: u16,
     pub dpr: f64,
     pub font_bytes: Vec<u8>,
+    /// Font used to stamp any glyph the swapped-in primary font lacks. The
+    /// browser cannot expose its fallback families to wasm, so the next-best
+    /// source — the embedded font — fills the gap, mirroring how the Canvas 2D
+    /// paint path lets the browser fall back per-glyph.
+    pub fallback_font_bytes: Vec<u8>,
 }
 
 impl WebGL2Renderer {
@@ -493,8 +586,10 @@ impl WebGL2Renderer {
         let font_ref = FontRef::try_from_slice(font_bytes)
             .map_err(|e| format!("font load failed: {:?}", e))?;
         let font_check = font_ref.clone();
+        let fallback_ref = FontRef::try_from_slice(EMBEDDED_FONT)
+            .map_err(|e| format!("embedded font load failed: {:?}", e))?;
 
-        let atlas = GlyphAtlas::new(gl, &font_check, cell_w, cell_h, dpr)?;
+        let atlas = GlyphAtlas::new(gl, &font_check, Some(&fallback_ref), cell_w, cell_h, dpr)?;
         let brush = GlyphBrush::new(gl)?;
 
         Ok(WebGL2Renderer {
@@ -508,15 +603,19 @@ impl WebGL2Renderer {
             cols,
             dpr,
             font_bytes: font_bytes.to_vec(),
+            fallback_font_bytes: EMBEDDED_FONT.to_vec(),
         })
     }
 
     pub fn rebuild_atlas(&mut self) -> Result<(), String> {
         let font = FontRef::try_from_slice(&self.font_bytes)
             .map_err(|e| format!("font reload failed: {:?}", e))?;
+        let fallback = FontRef::try_from_slice(&self.fallback_font_bytes)
+            .map_err(|e| format!("embedded font reload failed: {:?}", e))?;
         let css_w = self.cell_w as f64 / self.dpr;
         let css_h = self.cell_h as f64 / self.dpr;
-        self.atlas.rebuild(self.ctx, &font, css_w, css_h, self.dpr)
+        self.atlas
+            .rebuild(self.ctx, &font, Some(&fallback), css_w, css_h, self.dpr)
     }
 
     pub fn render(
@@ -784,7 +883,7 @@ mod tests {
         let f = font();
         let (em, baseline) = em_and_baseline(&f, glyph_w, glyph_h);
         let mut slot = vec![0u8; (glyph_w * glyph_h) as usize];
-        GlyphAtlas::rasterize_glyph(&f, ch, glyph_w, glyph_h, em, baseline, &mut slot, 0, 0, glyph_w);
+        GlyphAtlas::rasterize_glyph(&f, None, ch, glyph_w, glyph_h, em, baseline, &mut slot, 0, 0, glyph_w);
         let mut top = glyph_h as i32;
         let mut bottom = -1i32;
         for r in 0..glyph_h {
@@ -855,7 +954,7 @@ mod tests {
         let f = font();
         let (em, baseline) = em_and_baseline(&f, glyph_w, glyph_h);
         let mut slot = vec![0u8; (glyph_w * glyph_h) as usize];
-        GlyphAtlas::rasterize_glyph(&f, ch, glyph_w, glyph_h, em, baseline, &mut slot, 0, 0, glyph_w);
+        GlyphAtlas::rasterize_glyph(&f, None, ch, glyph_w, glyph_h, em, baseline, &mut slot, 0, 0, glyph_w);
         let mut left = glyph_w as i32;
         let mut right = -1i32;
         for r in 0..glyph_h {
@@ -1015,22 +1114,25 @@ mod tests {
         }
     }
 
-    /// Every atlas range must be reachable through `uv_for` with correct
+/// Every atlas range must be reachable through `uv_for` with correct
     /// (non-degenerate, non-zero-area) UVs.
     #[test]
     fn uv_for_resolves_every_atlas_range() {
         let atlas = GlyphAtlas {
             texture: 0,
-            atlas_width: 160,
-            atlas_height: 640,
+            atlas_width: 320,
+            atlas_height: 680,
             glyph_width: 8,
             glyph_height: 18,
-            uv_map: (0..512).map(|_| (0.25, 0.25, 0.75, 0.75)).collect(),
+            uv_map: (0..1072).map(|_| (0.25, 0.25, 0.75, 0.75)).collect(),
         };
         for (cp, _note) in [
-            (0x41u32, "ASCII"),      // 'A'
-            (0x2888u32, "braille"),  // ⣈
+            (0x41u32, "ASCII"),       // 'A'
+            (0x2888u32, "braille"),   // ⣈
             (0x25AEu32, "geo/block"), // ▮
+            (0x21BBu32, "arrows"),    // ↻
+            (0x22EFu32, "mathops"),   // ⋯
+            (0x2736u32, "dingbats"),  // ✶
         ] {
             let ch = char::from_u32(cp).unwrap();
             let uv = atlas
@@ -1040,6 +1142,113 @@ mod tests {
         }
         // Out-of-range codepoints stay None (defaults to invisible).
         assert!(atlas.uv_for('\u{1F600}').is_none());
+    }
+
+    /// Arrow, math-operator and dingbat spinner glyphs (↻ ↺ ⇦ ⋯ ⊶ ✦ ✶) must
+    /// rasterize ink so cli-spinner style animations render on the GL path.
+    #[test]
+    fn added_spinner_ranges_rasterize_ink() {
+        let f = font();
+        let (glyph_w, glyph_h): (u32, u32) = (8, 18);
+        for cp in [0x2190u32, 0x21BA, 0x21BB, 0x2192, 0x22B6, 0x22B7, 0x22EF, 0x2726, 0x2727, 0x2736] {
+            let ch = char::from_u32(cp).unwrap();
+            let (top, bottom) = ink_bounds(ch, glyph_w, glyph_h);
+            assert!(
+                bottom >= top && top >= 0,
+                "U+{:04X} rasterizes no ink in an 8x18 slot",
+                cp
+            );
+            let has_outline = f
+                .outline_glyph(Glyph {
+                    id: f.glyph_id(ch),
+                    scale: PxScale::from(20.0),
+                    position: Point { x: 0.0, y: 0.0 },
+                })
+                .is_some();
+            assert!(has_outline, "Hack has no glyph for U+{:04X}", cp);
+        }
+    }
+
+    /// Two-tier atlas semantics: a glyph the primary font lacks falls back to
+    /// the embedded font's outline (mirroring the Canvas 2D path, where the
+    /// browser falls back per-glyph). With Hack as both providers, output must
+    /// be unchanged for a covered glyph (the loop breaks after the primary
+    /// succeeds), and an uncovered char still rasterizes without panicking.
+    #[test]
+    fn fallback_font_is_redundant_when_primary_covers() {
+        let f = font();
+        let (glyph_w, glyph_h): (u32, u32) = (8, 18);
+        let (em, baseline) = em_and_baseline(&f, glyph_w, glyph_h);
+        // Emoji is outside ATLAS_RANGES and, if Hack lacks it, becomes the
+        // font's .notdef outline; either way both providers agree and no
+        // panic occurs.
+        for ch in ['A', '\u{1F600}'] {
+            let mut no_fb = vec![0u8; (glyph_w * glyph_h) as usize];
+            let mut with_fb = vec![0u8; (glyph_w * glyph_h) as usize];
+            GlyphAtlas::rasterize_glyph(
+                &f,
+                None,
+                ch,
+                glyph_w,
+                glyph_h,
+                em,
+                baseline,
+                &mut no_fb,
+                0,
+                0,
+                glyph_w,
+            );
+            GlyphAtlas::rasterize_glyph(
+                &f,
+                Some(&f),
+                ch,
+                glyph_w,
+                glyph_h,
+                em,
+                baseline,
+                &mut with_fb,
+                0,
+                0,
+                glyph_w,
+            );
+            assert_eq!(no_fb, with_fb, "'{}' changes with a redundant fallback", ch);
+        }
+        assert!(
+            ink_cols('A', glyph_w, glyph_h).1 >= 0,
+            "'A' should rasterize ink"
+        );
+    }
+
+    /// opencode's "thinking" spinner cycles ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ at 80ms. The GL
+    /// atlas must rasterize each frame into a *distinct* slot bitmap, otherwise
+    /// the spinner looks frozen even though the screen updates (full-grid
+    /// rebuilds paint each frame but all resolve to the same ink).
+    #[test]
+    fn opencode_spinner_frames_rasterize_distinctly() {
+        let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        for (glyph_w, glyph_h) in [(8u32, 18u32), (16, 36)] {
+            let f = font();
+            let (em, baseline) = em_and_baseline(&f, glyph_w, glyph_h);
+            let mut slots: Vec<Vec<u8>> = Vec::new();
+            for ch in frames {
+                let mut slot = vec![0u8; (glyph_w * glyph_h) as usize];
+        GlyphAtlas::rasterize_glyph(&f, None, ch, glyph_w, glyph_h, em, baseline, &mut slot, 0, 0, glyph_w);
+                slots.push(slot);
+            }
+            for (i, a) in slots.iter().enumerate() {
+                let ink_a = a.iter().filter(|&&v| v > 20).count();
+                assert!(ink_a > 0, "frame {:?} (U+{:04X}) rasterizes blank at {}x{}", frames[i], frames[i] as u32, glyph_w, glyph_h);
+                for (j, b) in slots.iter().enumerate() {
+                    if i < j {
+                        assert_ne!(
+                            a, b,
+                            "frames U+{:04X} and U+{:04X} rasterize identically at {}x{}",
+                            frames[i] as u32, frames[j] as u32, glyph_w, glyph_h
+                        );
+                    }
+                }
+            }
+        }
     }
 
 }

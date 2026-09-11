@@ -24,7 +24,7 @@
         );
         window.KRUST_RUNTIME.install(wasm.instance.exports.memory);
         const tInst = performance.now();
-        const { init, set_renderer_mode, process_bytes, repaint, handle_resize, version,
+        const { init, set_renderer_mode, set_system_font, process_bytes, repaint, handle_resize, version,
                 alloc, dealloc, free_memory, free_string, free_result } = wasm.instance.exports;
         const mem = wasm.instance.exports.memory;
 
@@ -67,6 +67,7 @@
             push('_'.repeat(10) + '\r\n');
             push('x'.repeat(10) + '\r\n');
             push(' '.repeat(30) + '▮▍▎▏▪▸●◆\r\n');
+            push(' '.repeat(30) + '↻↺⇦⋯⊶✦✶✔\r\n');
             const len = parts.reduce((n, p) => n + p.length, 0);
             const joined = new Uint8Array(len);
             let off = 0;
@@ -128,6 +129,25 @@
             const tInit = performance.now();
             handle_resize(800, 600);
             const tResize = performance.now();
+
+            // Mirror production (server.html): swap the embedded Hack atlas for
+            // the system monospace font the 2D reference paints with, so the GL
+            // checks test the font that actually ships.
+            const tFont0 = performance.now();
+            try {
+                const fr = await fetch('/system-font');
+                if (fr.ok) {
+                    const sb = new Uint8Array(await fr.arrayBuffer());
+                    const sp = alloc(sb.length);
+                    if (sp) {
+                        new Uint8Array(mem.buffer, sp, sb.length).set(sb);
+                        set_system_font(sp, sb.length);
+                        dealloc(sp, sb.length);
+                    }
+                }
+            } catch (_) {}
+            const tFont = performance.now();
+
             feedContent();
             const tFeed = performance.now();
             repaint();
@@ -142,22 +162,30 @@
             // Canvas 2D renderers share the same top-down layout: row 0 sits at
             // the canvas top, so yoff = 0 for both.
             const rows = Math.floor(H / ch);
-            let img = null;
             let yoff = 0;
-            const gl = canvas.getContext('webgl2');
-            if (gl) {
-                const px = new Uint8Array(W * H * 4);
-                gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
-                img = new Uint8Array(W * H * 4);
-                for (let y = 0; y < H; y++) {
-                    const src = (H - 1 - y) * W * 4;
-                    img.set(px.subarray(src, src + W * 4), y * W * 4);
+            let gl = null;
+            function readFrame() {
+                // Read the rendered frame. Under the WebGL2 renderer the canvas
+                // has no 2D context (only one context type per canvas), so read
+                // back via readPixels (bottom-up, flipped here to top-down). The
+                // GL and Canvas 2D renderers share the same top-down layout:
+                // row 0 sits at the canvas top, so yoff = 0 for both.
+                gl = gl || canvas.getContext('webgl2');
+                if (gl) {
+                    const px = new Uint8Array(W * H * 4);
+                    gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
+                    const out = new Uint8Array(W * H * 4);
+                    for (let y = 0; y < H; y++) {
+                        const src = (H - 1 - y) * W * 4;
+                        out.set(px.subarray(src, src + W * 4), y * W * 4);
+                    }
+                    return out;
                 }
-            } else {
                 // Canvas 2D draws top-down from pixel 0, so yoff stays 0.
                 const ctx2d = canvas.getContext('2d');
-                img = ctx2d ? ctx2d.getImageData(0, 0, W, H).data : null;
+                return ctx2d ? ctx2d.getImageData(0, 0, W, H).data : null;
             }
+            let img = readFrame();
             if (!img) {
                 setResult({ pass: false, error: 'no canvas context available for pixel readback' });
                 return;
@@ -227,8 +255,10 @@
             }
             const brailleInk = rowInkPerCell(8, 30, 38);
             const geoInk = rowInkPerCell(21, 30, 38);
+            const symbolInk = rowInkPerCell(22, 30, 38);
             const brailleOk = brailleInk.filter(n => n > 0).length === 8;
             const geoOk = geoInk.filter(n => n > 0).length === 8;
+            const symbolOk = symbolInk.filter(n => n > 0).length === 8;
 
             // Orientation: 'T' has a horizontal bar at its TOP and a thin stem
             // descending below. If glyphs are mirrored across the horizontal
@@ -293,6 +323,44 @@
                 x: glyphExtent(20, 10),
             };
 
+            // Animation probe: writing two consecutive opencode spinner frames
+            // (⠋ then ⠙) to the same cell must change the rendered pixel
+            // signature. A frozen spinner (atlas slots that collapse to the
+            // same bitmap, e.g. Hack's braille at an 8px em) keeps the buffer
+            // byte-identical, so this distinguishes a live spinner from a
+            // static glyph.
+            function writeCell(str) {
+                const b = new TextEncoder().encode('\x1b[23;1H' + str);
+                const p = alloc(b.length);
+                new Uint8Array(mem.buffer, p, b.length).set(b);
+                const s = process_bytes(p, b.length);
+                dealloc(p, b.length);
+                if (s !== 0) free_result(s);
+            }
+            function cellSig(rowIdx, colIdx) {
+                const x0 = R(colIdx * cw), x1 = R((colIdx + 1) * cw);
+                const y0 = yoff + rowIdx * ch;
+                const s = [];
+                for (let y = y0; y < y0 + ch; y++) {
+                    for (let x = x0; x < x1; x++) {
+                        const i = 4 * (y * W + x);
+                        s.push(img[i], img[i + 1], img[i + 2]);
+                    }
+                }
+                return s;
+            }
+            writeCell('⠋'); repaint();
+            img = readFrame();
+            const f1Ink = cellSig(22, 0).filter(v => v > 100).length;
+            const sig1 = cellSig(22, 0);
+            writeCell('⠙'); repaint();
+            img = readFrame();
+            const f2Ink = cellSig(22, 0).filter(v => v > 100).length;
+            const sig2 = cellSig(22, 0);
+            let frameDeltas = 0;
+            for (let i = 0; i < sig1.length; i++) if (sig1[i] !== sig2[i]) frameDeltas++;
+            const animateOk = frameDeltas > 0 && f1Ink > 0 && f2Ink > 0;
+
             const res = {
                 metrics: { cell_width: cw, cell_height: ch, yoff, grid_rows: rows },
                 colors: { bright_blue_pixels: brightBlue, dark_blue_pixels: darkBlue },
@@ -304,7 +372,8 @@
                     fetch_ms: Math.round(tInst - tStart),
                     instantiate_ms: Math.round(tInit - tInst),
                     init_ms: Math.round(tResize - tInit),
-                    resize_ms: Math.round(tFeed - tResize),
+                    resize_ms: Math.round(tFont0 - tResize),
+                    font_ms: Math.round(tFont - tFont0),
                     feed_ms: Math.round(tRepaint - tFeed),
                     repaint_ms: Math.round(tRead - tRepaint),
                     total_ms: Math.round(tRead - tStart),
@@ -314,6 +383,8 @@
                 block: seamSummary(blk),
                 braille: { cells_with_ink: brailleInk.filter(n => n > 0).length },
                 blockgeo: { cells_with_ink: geoInk.filter(n => n > 0).length },
+                symbols: { cells_with_ink: symbolInk.filter(n => n > 0).length },
+                animate: { frame_deltas: frameDeltas, frame_ink: [f1Ink, f2Ink] },
                 version: (() => {
                     const v = callBoxedExport(version);
                     if (!v) return '';
@@ -334,6 +405,8 @@
                 && baselineOk
                 && brailleOk
                 && geoOk
+                && symbolOk
+                && animateOk
                 && dash.dimCols.length === 0
                 && pipe.dimRows.length === 0
                 && blk.dimRows.length === 0 && blk.dimCols.length === 0;
