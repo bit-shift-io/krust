@@ -63,7 +63,7 @@ import json,sys
 d=json.loads(sys.stdin.read())
 m=d.get("metrics",{})
 print("cell=%.3fx%.3f" % (m.get("cell_width",0), m.get("cell_height",0)))
-for k in ("colors","text","orient","baseline","align","timing","dash","pipe","block"):
+for k in ("colors","text","orient","baseline","align","timing","dash","pipe","block","braille","blockgeo"):
     if k in d: print("  %-22s %s" % (k, d[k]))
 if "error" in d: print("  error: %s" % d["error"])
 sys.exit(0 if d.get("pass") and "error" not in d else 1)

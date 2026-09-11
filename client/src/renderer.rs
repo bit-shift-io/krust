@@ -51,9 +51,22 @@ const COLOR_BUFFER_BIT: u32 = 0x4000;
 const TRIANGLE_STRIP: u32 = 0x0005;
 
 const ATLAS_PADDING: u32 = 2;
-const FIRST_ASCII: char = '\u{0}';
-const LAST_ASCII: char = '\u{7f}';
 const ATLAS_COLS: usize = 16;
+
+/// A contiguous range of codepoints baked into the atlas.
+struct AtlasRange {
+    start: u32,
+    len: u32,
+    offset: u32, // index into GlyphAtlas.uv_map
+}
+
+/// Ranges baked into the glyph atlas. Kept sorted by `start` so
+/// `uv_for()` can scan linearly (the list is tiny).
+const ATLAS_RANGES: &[AtlasRange] = &[
+    AtlasRange { start: 0x0000, len: 128, offset: 0 },    // ASCII
+    AtlasRange { start: 0x2800, len: 256, offset: 128 },  // Braille
+    AtlasRange { start: 0x2580, len: 128, offset: 384 },  // Block parts (U+2581-259F) + Geometric shapes (U+25A0-25FF)
+];
 
 /// Embedded monospace font used for glyph rasterization.
 ///
@@ -143,38 +156,16 @@ impl GlyphAtlas {
         let glyph_w = (cell_w * dpr).ceil() as u32;
         let glyph_h = (cell_h * dpr).ceil() as u32;
 
-        // Scale the font so a glyph's *advance width* equals exactly one cell
-        // width (`glyph_w` device px). Scaling em-height to the cell HEIGHT
-        // instead makes Hack's ~0.606em advance wider than the 8px cell, so
-        // glyph ink overflows the slot edge: wide glyphs touch the next cell
-        // while narrow ones leave a visible gap. Painting every glyph at a
-        // common advance == cell width reproduces the Canvas 2D renderer,
-        // whose monospace system font advances exactly one cell per char.
-        // For an 8px cell that is an ~13.2px em sitting inside the 18px slot.
-let h_adv1 = {
-                let scaled = font.as_scaled(PxScale::from(1.0));
-                scaled.h_advance(font.glyph_id(' '))
-            };
+        let h_adv1 = {
+            let scaled = font.as_scaled(PxScale::from(1.0));
+            scaled.h_advance(font.glyph_id(' '))
+        };
         let em = if h_adv1.is_finite() && h_adv1 > 0.0 {
             (glyph_w as f32 / h_adv1).max(1.0)
         } else {
             glyph_h as f32
         };
 
-        // Row (from the top of the atlas slot) where glyphs' text baseline
-        // lands, derived from the same `em` the glyphs are rasterized at.
-        // Everything vertical is derived from this one number, so every
-        // glyph shares a baseline instead of being top-aligned to its own
-        // bounding box (which would park each glyph's baseline at a different
-        // height). Hack has ascent+descent == em and line_gap == 0, so the
-        // full glyph extents fit the slot with no clipping.
-        //
-        // The baseline centers the em box (ascent..descent) inside the
-        // glyph_h slot, mirroring the Canvas 2D reference renderer, which
-        // paints with `textBaseline: "middle"` (em box centered in the cell).
-        // Parking the baseline at the cell top instead shifts the whole glyph
-        // line ~5px upward relative to the 2D path, which the gl-vs-2d visual
-        // comparison reads as "gl text is out of alignment".
         let baseline = {
             let scaled = font.as_scaled(PxScale::from(em));
             let asc = scaled.ascent();
@@ -188,33 +179,34 @@ let h_adv1 = {
             }
         };
 
-        let count = (LAST_ASCII as u32 - FIRST_ASCII as u32 + 1) as usize;
+        // Count total glyphs across all ranges.
+        let total: u32 = ATLAS_RANGES.iter().map(|r| r.len).sum();
         let cols = ATLAS_COLS as u32;
-        let rows = ((count as u32 + cols - 1) / cols) as u32;
+        let rows = (total + cols - 1) / cols;
         let atlas_w = cols * (glyph_w + ATLAS_PADDING);
         let atlas_h = rows * (glyph_h + ATLAS_PADDING);
 
         let mut data: Vec<u8> = vec![0; (atlas_w * atlas_h) as usize];
-        let mut uv_map = Vec::with_capacity(count);
+        let mut uv_map: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(total as usize);
 
-        for i in 0..count {
-            let ch = char::from_u32(FIRST_ASCII as u32 + i as u32)
-                .ok_or("invalid ASCII char")?;
-            let col = (i % ATLAS_COLS) as u32;
-            let row = (i / ATLAS_COLS) as u32;
-            let x = col * (glyph_w + ATLAS_PADDING);
-            let y = row * (glyph_h + ATLAS_PADDING);
+        for range in ATLAS_RANGES {
+            for i in 0..range.len {
+                let cp = range.start + i;
+                let ch = char::from_u32(cp).unwrap_or('\u{FFFD}');
+                let idx = range.offset + i;
+                let col = idx % cols;
+                let row = idx / cols;
+                let x = col * (glyph_w + ATLAS_PADDING);
+                let y = row * (glyph_h + ATLAS_PADDING);
 
-            Self::rasterize_glyph(font, ch, glyph_w, glyph_h, em, baseline, &mut data, x, y, atlas_w);
+                Self::rasterize_glyph(font, ch, glyph_w, glyph_h, em, baseline, &mut data, x, y, atlas_w);
 
-            let u0 = x as f32 / atlas_w as f32;
-            let v0 = y as f32 / atlas_h as f32;
-            let u1 = (x + glyph_w) as f32 / atlas_w as f32;
-            let v1 = (y + glyph_h) as f32 / atlas_h as f32;
-            // Glyphs rasterize top-down into the data array, but the screen quad
-            // samples v0 at its top edge. Swapping the row endpoints mirrors the
-            // sample across the horizontal axis so glyphs render upright.
-            uv_map.push((u0, v1, u1, v0));
+                let u0 = x as f32 / atlas_w as f32;
+                let v0 = y as f32 / atlas_h as f32;
+                let u1 = (x + glyph_w) as f32 / atlas_w as f32;
+                let v1 = (y + glyph_h) as f32 / atlas_h as f32;
+                uv_map.push((u0, v1, u1, v0));
+            }
         }
 
         // Reserve the bottom-right padding texel as an opaque "solid" sample:
@@ -313,8 +305,14 @@ fn rasterize_glyph(
     }
 
     pub fn uv_for(&self, ch: char) -> Option<(f32, f32, f32, f32)> {
-        let idx = (ch as u32).wrapping_sub(FIRST_ASCII as u32) as usize;
-        self.uv_map.get(idx).copied()
+        let cp = ch as u32;
+        for range in ATLAS_RANGES {
+            if cp >= range.start && cp < range.start + range.len {
+                let idx = (range.offset + (cp - range.start)) as usize;
+                return self.uv_map.get(idx).copied();
+            }
+        }
+        None
     }
 
     /// UV quad centered on the reserved opaque texel, for flat-color fills.
@@ -951,6 +949,97 @@ mod tests {
         assert!(t_top >= 0);
         assert!(g_bottom >= baseline, "g must descend below baseline");
         assert!(g_bottom <= glyph_h as i32 - 1);
+    }
+
+    /// The embedded Hack font must contain the braille block (U+2800..U+28FF)
+    /// used by spinner animations in TUI apps like opencode. The braile dots
+    /// are tiny (2x4 grid in a ~8x18 cell), so this test asserts ink exists
+    /// rather than a specific position.
+    #[test]
+    fn embedded_font_covers_braille_block() {
+        let f = font();
+        for cp in [0x2800u32, 0x2801, 0x2880, 0x2888, 0x28FF] {
+            let has_outline = f
+                .outline_glyph(Glyph {
+                    id: f.glyph_id(char::from_u32(cp).unwrap()),
+                    scale: PxScale::from(20.0),
+                    position: Point { x: 0.0, y: 0.0 },
+                })
+                .is_some();
+            assert!(has_outline, "Hack has no glyph for U+{:04X}", cp);
+        }
+    }
+
+    /// Braille glyphs rasterize into visible ink inside a production 8x18 slot,
+    /// so the atlas slots aren't blank (which would make them render invisible).
+    #[test]
+    fn braille_rasterizes_into_the_slot() {
+        let (glyph_w, glyph_h): (u32, u32) = (8, 18);
+        let mut any_ink = false;
+        for cp in 0x2800u32..=0x28FF {
+            let ch = char::from_u32(cp).unwrap();
+            let (top, bottom) = ink_bounds(ch, glyph_w, glyph_h);
+            if bottom >= top {
+                any_ink = true;
+                break;
+            }
+        }
+        assert!(any_ink, "no braille codepoint rasterizes any ink in an 8x18 slot");
+    }
+
+    /// Block parts not handled by `graphic_cell_rects` (U+2581..U+2587,
+    /// U+2589..U+258F, U+2594..U+259F) plus geometric shapes (U+25A0..U+25FF)
+    /// — cursor bars (▮), partial blocks (▍▎▏), and menu markers (▸ ▪ ◉) —
+    /// must all bake into the atlas so they aren't invisible on the GL path.
+    #[test]
+    fn block_parts_and_geometric_shapes_bake_ink() {
+        let f = font();
+        let (glyph_w, glyph_h): (u32, u32) = (8, 18);
+        for cp in [0x258Du32, 0x258E, 0x258F, 0x25A0, 0x25AA, 0x25AE, 0x25B0, 0x25B1, 0x25B8, 0x25CF, 0x25C9] {
+            let ch = char::from_u32(cp).unwrap();
+            let (top, bottom) = ink_bounds(ch, glyph_w, glyph_h);
+            assert!(
+                bottom >= top && top >= 0,
+                "U+{:04X} rasterizes no ink in an 8x18 slot",
+                cp
+            );
+            // The glyph must also resolve through the atlas lookup.
+            let has_outline = f
+                .outline_glyph(Glyph {
+                    id: f.glyph_id(ch),
+                    scale: PxScale::from(20.0),
+                    position: Point { x: 0.0, y: 0.0 },
+                })
+                .is_some();
+            assert!(has_outline, "Hack has no glyph for U+{:04X}", cp);
+        }
+    }
+
+    /// Every atlas range must be reachable through `uv_for` with correct
+    /// (non-degenerate, non-zero-area) UVs.
+    #[test]
+    fn uv_for_resolves_every_atlas_range() {
+        let atlas = GlyphAtlas {
+            texture: 0,
+            atlas_width: 160,
+            atlas_height: 640,
+            glyph_width: 8,
+            glyph_height: 18,
+            uv_map: (0..512).map(|_| (0.25, 0.25, 0.75, 0.75)).collect(),
+        };
+        for (cp, _note) in [
+            (0x41u32, "ASCII"),      // 'A'
+            (0x2888u32, "braille"),  // ⣈
+            (0x25AEu32, "geo/block"), // ▮
+        ] {
+            let ch = char::from_u32(cp).unwrap();
+            let uv = atlas
+                .uv_for(ch)
+                .unwrap_or_else(|| panic!("uv_for(U+{:04X}) = None", cp));
+            assert!(uv.0 < uv.2 && uv.1 < uv.3, "U+{:04X} got degenerate UV {:?}", cp, uv);
+        }
+        // Out-of-range codepoints stay None (defaults to invisible).
+        assert!(atlas.uv_for('\u{1F600}').is_none());
     }
 
 }

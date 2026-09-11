@@ -66,6 +66,7 @@
             push('g'.repeat(10) + '\r\n');
             push('_'.repeat(10) + '\r\n');
             push('x'.repeat(10) + '\r\n');
+            push(' '.repeat(30) + '▮▍▎▏▪▸●◆\r\n');
             const len = parts.reduce((n, p) => n + p.length, 0);
             const joined = new Uint8Array(len);
             let off = 0;
@@ -208,6 +209,27 @@
             const pipe = analyzeArea(W, H, img, 0, yoff + 2 * ch, R(40 * cw), yoff + 8 * ch, 'pipe');
             const blk = analyzeArea(W, H, img, 0, yoff + 9 * ch, R(10 * cw), yoff + 17 * ch, 'block');
 
+            // Braille (row 8, cols 30..37) and block/geometric cursor glyphs
+            // (row 21, cols 30..37) must each paint some ink in every cell.
+            // These are the characters TUI spinners/cursors animate; when the
+            // glyph atlas misses a range the cells render as pure background.
+            function rowInkPerCell(rowIdx, colStart, colEnd) {
+                const cells = [];
+                for (let c = colStart; c < colEnd; c++) {
+                    const x0 = R(c * cw), x1 = R((c + 1) * cw);
+                    let ink = 0;
+                    for (let y = yoff + rowIdx * ch; y < yoff + (rowIdx + 1) * ch; y++) {
+                        for (let x = x0; x < x1; x++) if (isBright(x, y)) ink++;
+                    }
+                    cells.push(ink);
+                }
+                return cells;
+            }
+            const brailleInk = rowInkPerCell(8, 30, 38);
+            const geoInk = rowInkPerCell(21, 30, 38);
+            const brailleOk = brailleInk.filter(n => n > 0).length === 8;
+            const geoOk = geoInk.filter(n => n > 0).length === 8;
+
             // Orientation: 'T' has a horizontal bar at its TOP and a thin stem
             // descending below. If glyphs are mirrored across the horizontal
             // axis the bar lands at the bottom of the cell instead. (An
@@ -290,6 +312,8 @@
                 dash: seamSummary(dash),
                 pipe: seamSummary(pipe),
                 block: seamSummary(blk),
+                braille: { cells_with_ink: brailleInk.filter(n => n > 0).length },
+                blockgeo: { cells_with_ink: geoInk.filter(n => n > 0).length },
                 version: (() => {
                     const v = callBoxedExport(version);
                     if (!v) return '';
@@ -308,6 +332,8 @@
                 && textOk
                 && orientOk
                 && baselineOk
+                && brailleOk
+                && geoOk
                 && dash.dimCols.length === 0
                 && pipe.dimRows.length === 0
                 && blk.dimRows.length === 0 && blk.dimCols.length === 0;
