@@ -245,22 +245,28 @@ fn rasterize_glyph(
         if let Some(outlined) = font.outline_glyph(glyph) {
             let b = outlined.px_bounds();
             // (gx, gy) are relative to the glyph's own bounding box top-left.
-            // In the glyph's image space the baseline sits at y=0 (the position
-            // component), so a box pixel's image row is `b.min.y + gy`. Shift
-            // every pixel so the baseline lands on the shared `baseline` slot
-            // row; pixels that fall outside the slot are clipped. This is what
-            // aligns all glyphs to one text baseline (rather than pinning each
-            // glyph's box top to the cell top).
+            // In the glyph's image space the advance origin sits at (0, 0) (the
+            // pen position), so a box pixel's image row is `b.min.y + gy` and
+            // its image column is `b.min.x + gx`. Shift every pixel so the
+            // baseline lands on the shared `baseline` slot row AND the ink
+            // lands at its natural left side bearing (an advance-origin offset
+            // of `b.min.x`), reproducing the Canvas 2D renderer, which parks
+            // the pen at the cell's left edge and lets each glyph's own bearing
+            // place its ink. Pinning the box left edge to the cell left instead
+            // (flush-left) glues narrow glyphs like `|`, `.`, and `,` to the
+            // cell edge, misaligning them against the reference renderer.
+            // Pixels that fall outside the slot are clipped.
+            let box_left = b.min.x as i32;
             let box_top = b.min.y as i32;
             outlined.draw(|gx, gy, coverage| {
-                if gx >= glyph_w {
-                    return;
-                }
-                let slot_row = box_top + gy as i32 + baseline;
-                if slot_row >= 0 && (slot_row as u32) < glyph_h {
-                    let px = x + gx;
-                    let py = y + slot_row as u32;
-                    data[(py * stride + px) as usize] = (coverage * 255.0) as u8;
+                let slot_col = box_left + gx as i32;
+                if slot_col >= 0 && (slot_col as u32) < glyph_w {
+                    let slot_row = box_top + gy as i32 + baseline;
+                    if slot_row >= 0 && (slot_row as u32) < glyph_h {
+                        let px = x + slot_col as u32;
+                        let py = y + slot_row as u32;
+                        data[(py * stride + px) as usize] = (coverage * 255.0) as u8;
+                    }
                 }
             });
         }
@@ -920,6 +926,80 @@ mod tests {
         for ch in ['g', 'p', '|', 'y'] {
             let (_top, bottom) = ink_bounds(ch, glyph_w, glyph_h);
             assert!(bottom > baseline, "'{}' should descend below the baseline", ch);
+        }
+    }
+
+    /// Rasterize `ch` into a `glyph_w x glyph_h` scratch slot using the
+    /// production scale and return the ink bounding box in slot columns.
+    fn ink_cols(ch: char, glyph_w: u32, glyph_h: u32) -> (i32, i32) {
+        let f = font();
+        let (em, baseline) = em_and_baseline(&f, glyph_w, glyph_h);
+        let mut slot = vec![0u8; (glyph_w * glyph_h) as usize];
+        GlyphAtlas::rasterize_glyph(&f, ch, glyph_w, glyph_h, em, baseline, &mut slot, 0, 0, glyph_w);
+        let mut left = glyph_w as i32;
+        let mut right = -1i32;
+        for r in 0..glyph_h {
+            for c in 0..glyph_w {
+                if slot[(r * glyph_w + c) as usize] > 20 {
+                    left = left.min(c as i32);
+                    right = right.max(c as i32);
+                }
+            }
+        }
+        (left, right)
+    }
+
+    #[test]
+    fn ink_sits_at_the_natural_left_side_bearing() {
+        // The Canvas 2D renderer parks the advance origin at the cell's left
+        // edge and lets each glyph's own left side bearing place the ink (each
+        // glyph advances exactly one cell, but its ink is offset by `b.min.x`).
+        // The atlas must reproduce that instead of flushing every glyph against
+        // the cell's left edge. Allow one sub-pixel column of anti-aliasing
+        // sliver at the box edge (coverage <= 20/255).
+        let f = font();
+        let (glyph_w, glyph_h): (u32, u32) = (8, 18); // production config
+        let (em, _baseline) = em_and_baseline(&f, glyph_w, glyph_h);
+        for ch in ['M', 'W', 'i', 'l', '|', ',', '.', 'o', 'x', 'T', '`', '-', '\'', '/'] {
+            let (left, right) = ink_cols(ch, glyph_w, glyph_h);
+            let glyph = Glyph {
+                id: f.glyph_id(ch),
+                scale: PxScale::from(em),
+                position: Point { x: 0.0, y: 0.0 },
+            };
+            if let Some(ol) = f.outline_glyph(glyph) {
+                let min_x = ol.px_bounds().min.x as i32;
+                assert!(
+                    left >= min_x,
+                    "'{}' ink starts left of its side bearing",
+                    ch
+                );
+                let drift = left - min_x;
+                assert!(
+                    drift <= 1 && (left > 0 || min_x == 0),
+                    "'{}' ink flush-left at col 0 instead of its bearing {} (drift={})",
+                    ch,
+                    min_x,
+                    drift
+                );
+                assert!(
+                    right < glyph_w as i32,
+                    "'{}' ink overflows the slot on the right",
+                    ch
+                );
+            }
+        }
+        // Narrow glyphs with big bearings must be visibly inset from the cell
+        // edge (this is the regression this test guards against).
+        for (ch, min_inset) in [('|', 2), (',', 1), ('.', 1), ('i', 0)] {
+            let (left, _right) = ink_cols(ch, glyph_w, glyph_h);
+            assert!(
+                left >= min_inset,
+                "'{}' should sit {}px in from the cell left edge, got col {}",
+                ch,
+                min_inset,
+                left
+            );
         }
     }
 
