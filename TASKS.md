@@ -49,6 +49,19 @@ Second round of fixes (all verified):
   (`text min_ink_per_cell: 15`, `orient top 180/bottom 0`,
   `baseline descender 70/underscore 80` at the smaller glyph size). Compare
   WebGL2 vs Canvas 2D visually with `?r=gl` / `?r=2d`.
+- **WebGL2/Canvas 2D pixel-convention unification (block-element & box-drawing
+  glyphs, opencode logo mispaint).** The GL path previously used a bottom-up
+  pixel convention (row 0 at `py=(rows-1-r)*cell_h`), which the vertex shader
+  translated to an upright NDC grid; `graphic_rects` compensated text glyphs
+  but applied mirrored math to block/box glyphs, so `▀`/`▄`/`┌`/`└` painted
+  upside-down (the opencode block logo collapsed into solid bars). Fix: the
+  GL renderer now shares the Canvas 2D **top-left** convention — the shader
+  negates NDC y and flips `a_texcoord.y` (atlas glyphs stay upright), `py =
+  r * cell_h`, and `graphic_rects` mirrors `draw_graphic_cell`'s math exactly.
+  `render-test.html` GL readback (`yoff`) no longer assumes the bottom-aligned
+  grid. Verified: 52 client + 12 server tests, `render-check.sh` green with
+  gl/2d alignment parity ≤2px, and the opencode block-logo crown rows render
+  pixel-identically in GL vs 2D.
 - **Slow first load — investigated, root cause NOT in krust.** Symptoms: only
   the *first* page load waits ~10-20s for the shell prompt; refreshes are
   instant (the session and its shell persist). Measurements: raw PTY spawn of

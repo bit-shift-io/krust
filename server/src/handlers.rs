@@ -9,10 +9,12 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    http::header,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::sync::OnceLock;
 use tokio::sync::broadcast;
 
 use crate::session::{get_or_create_session, pty_size, pty_write, AppState};
@@ -105,6 +107,87 @@ pub(crate) async fn runtime_js() -> ([(header::HeaderName, &'static str); 2], &'
         ],
         RUNTIME_JS,
     )
+}
+
+/// The system font families the browser resolves via the CSS `FONT_STACK`
+/// (see `client/src/measure.rs`), in priority order. `monospace` is the
+/// generic alias and always accepts fontconfig's match; the named families
+/// must resolve to *themselves* to be accepted, because fontconfig fuzzily
+/// falls back to the top installed font (e.g. "Noto Sans") for a missing
+/// name, which the browser would not use for that family slot.
+const SYSTEM_FONT_STACK: &[&str] = &[
+    "JetBrains Mono",
+    "Fira Code",
+    "Menlo",
+    "Consolas",
+    "monospace",
+];
+
+/// Resolved system font bytes, computed once on the first request. System
+/// fonts don't change during a server run, so a `OnceLock` cache suffices.
+static SYSTEM_FONT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+
+fn system_font_bytes() -> Option<&'static [u8]> {
+    SYSTEM_FONT.get_or_init(resolve_system_font).as_deref()
+}
+
+/// Ask fontconfig which family `family` resolves to and where its file lives.
+fn fc_match(family: &str) -> Option<(String, String)> {
+    let out = std::process::Command::new("fc-match")
+        .args(["--format=%{family[0]}|%{file}", family])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(out.stdout).ok()?;
+    let (resolved_family, file) = stdout.trim().split_once('|')?;
+    if file.is_empty() {
+        return None;
+    }
+    Some((resolved_family.to_string(), file.to_string()))
+}
+
+/// Resolve the first installed family from [`SYSTEM_FONT_STACK`] and read its
+/// file bytes. Returns `None` when fontconfig is unavailable or none of the
+/// families are installed.
+fn resolve_system_font() -> Option<Vec<u8>> {
+    for family in SYSTEM_FONT_STACK {
+        let (resolved, file) = fc_match(family)?;
+        let installed = family.eq_ignore_ascii_case("monospace")
+            || resolved.eq_ignore_ascii_case(family);
+        if !installed {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(&file) {
+            if !bytes.is_empty() {
+                return Some(bytes);
+            }
+        }
+    }
+    None
+}
+
+/// Serve the resolved system monospace font bytes.
+///
+/// The browser will not expose installed font files to the WASM client, so
+/// the local server resolves the same family stack the Canvas 2D reference
+/// renderer uses and streams the matching font file over HTTP. The client
+/// feeds these bytes to `ab_glyph` to rasterize its WebGL2 glyph atlas with
+/// the exact font the reference path paints. Serves 404 when no matching
+/// family is installed; the client falls back to its embedded Hack font.
+pub(crate) async fn system_font() -> Response {
+    match system_font_bytes() {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, "font/ttf"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "no matching system font").into_response(),
+    }
 }
 
 pub(crate) async fn ws_handler(

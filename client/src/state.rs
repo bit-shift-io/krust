@@ -893,6 +893,22 @@ impl TerminalState {
         self.cols = cols;
     }
 
+    /// Swap the WebGL2 renderer's rasterized font and rebuild its glyph atlas
+    /// (no-op on the Canvas 2D path, which paints via CSS fonts directly).
+    pub(crate) fn set_font_bytes(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        let Some(w) = self.webgl.as_mut() else {
+            return Ok(());
+        };
+        let prev = std::mem::replace(&mut w.font_bytes, bytes);
+        if let Err(e) = w.rebuild_atlas() {
+            w.font_bytes = prev;
+            return Err(e);
+        }
+        ffi::console_log("KRUST: system font applied to WebGL2 glyph atlas");
+        self.mark_all_dirty();
+        self.render()
+    }
+
     /// Resize the underlying parser screen to `rows` x `cols`.
     pub(crate) fn resize_screen(&mut self, rows: u16, cols: u16) {
         let _ = self.parser.screen_mut().set_size(rows, cols);

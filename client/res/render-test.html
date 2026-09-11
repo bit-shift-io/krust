@@ -137,18 +137,14 @@
 
             // Read the rendered frame. Under the WebGL2 renderer the canvas has
             // no 2D context (only one context type per canvas), so read back
-            // via readPixels (bottom-up, flipped here to top-down). Under the
-            // Canvas 2D path use getImageData as before.
+            // via readPixels (bottom-up, flipped here to top-down). The GL and
+            // Canvas 2D renderers share the same top-down layout: row 0 sits at
+            // the canvas top, so yoff = 0 for both.
             const rows = Math.floor(H / ch);
             let img = null;
             let yoff = 0;
             const gl = canvas.getContext('webgl2');
             if (gl) {
-                // The WebGL2 renderer draws a grid of rows*cell_h pixels,
-                // bottom-aligned in the GL framebuffer. When the canvas is
-                // taller than the grid (800x600 canvas vs 33*18=594), the grid
-                // lands at img y in [yoff, H) after the flip below.
-                yoff = H - rows * ch;
                 const px = new Uint8Array(W * H * 4);
                 gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
                 img = new Uint8Array(W * H * 4);

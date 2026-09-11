@@ -406,6 +406,27 @@ pub extern "C" fn key_to_bytes(
     return_pair(ptr, len)
 }
 
+/// Install the system-monospace font bytes fetched from the local krust server
+/// so the WebGL2 renderer can rebuild its glyph atlas with the *same* font the
+/// Canvas 2D reference path resolves via its CSS `FONT_STACK`. The browser
+/// cannot expose installed font files, so the server resolves the family via
+/// fontconfig and serves the file; the bytes land here as a (ptr, len) pair.
+/// No-op on the Canvas 2D path (it paints with CSS fonts directly).
+#[no_mangle]
+pub extern "C" fn set_system_font(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+    TERM_STATE.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut() {
+            if let Err(e) = state.set_font_bytes(bytes) {
+                ffi::console_log(&format!("KRUST: system font rejected: {}", e));
+            }
+        }
+    });
+}
+
 /// Free memory allocated by an exported function.
 /// # Parameters
 /// * `ptr` - Pointer to the start of the data

@@ -27,7 +27,7 @@
             window.KRUST_RUNTIME.imports
         );
         window.KRUST_RUNTIME.install(wasm.instance.exports.memory);
-        const { init, set_renderer_mode, process_bytes, query_replies, handle_resize, repaint,
+        const { init, set_renderer_mode, set_system_font, process_bytes, query_replies, handle_resize, repaint,
                 key_to_bytes, set_selection, selected_text, clear_selection,
                 scroll, scroll_to, scroll_to_bottom, scroll_to_top,
                 scroll_offset, scrollback_len, version,
@@ -400,6 +400,26 @@
         // Flush them now that the terminal state exists.
         for (let i = 0; i < wsQueue.length; i++) handleWsData({ data: wsQueue[i] });
         wsQueue = [];
+
+        // Prefer the system monospace font — the exact family the Canvas 2D
+        // reference renderer resolves via its CSS FONT_STACK — for WebGL2
+        // glyph rasterization. The browser won't expose installed font bytes
+        // to wasm, so the local krust server resolves the family via
+        // fontconfig and serves the file here. The wasm swaps its embedded
+        // Hack font for these bytes and rebuilds the glyph atlas.
+        fetch('/system-font').then((r) => {
+            if (!r.ok) return null;
+            return r.arrayBuffer();
+        }).then((buf) => {
+            if (!buf || buf.byteLength === 0) return;
+            const bytes = new Uint8Array(buf);
+            const ptr = alloc(bytes.length);
+            if (ptr === 0) return;
+            new Uint8Array(mem.buffer, ptr, bytes.length).set(bytes);
+            set_system_font(ptr, bytes.length);
+            dealloc(ptr, bytes.length);
+            scheduleRender();
+        }).catch(() => {});
 
         const proto = location.protocol === 'https:' ? 'wss' : 'ws';
         const st = params.get('selftest');

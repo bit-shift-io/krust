@@ -82,8 +82,14 @@ varying float v_cur;
 uniform vec2 u_resolution;
 void main() {
     vec2 scaled = a_position * a_size + a_offset;
-    gl_Position = vec4(scaled / u_resolution * 2.0 - 1.0, 0.0, 1.0);
-    v_texcoord = mix(a_uv.xy, a_uv.zw, a_texcoord);
+    // Pixel y=0 is the canvas TOP, the same convention as the Canvas 2D
+    // renderer. The raw NDC y is bottom-up, so negate it to flip the axis.
+    // a_texcoord's v is flipped too so the atlas's stored glyph orientation
+    // (top row at zw) still lands at the quad's top edge.
+    gl_Position = vec4(scaled.x / u_resolution.x * 2.0 - 1.0,
+                       -(scaled.y / u_resolution.y * 2.0 - 1.0),
+                       0.0, 1.0);
+    v_texcoord = mix(a_uv.xy, a_uv.zw, vec2(a_texcoord.x, 1.0 - a_texcoord.y));
     v_fg = a_fg;
     v_bg = a_bg;
     v_sel = a_sel;
@@ -442,9 +448,10 @@ fn rgb_to_floats(rgb: u32) -> (f32, f32, f32) {
 }
 
 /// Compute the device-pixel rects that paint a graphic glyph (box-drawing or
-/// block element) inside a cell starting at (px, py). Mirrors the Canvas 2D
-/// `draw_graphic_cell` path, but in device pixels: line widths and the overdraw
-/// epsilon are scaled by `dpr`. Returns `(x, y, w, h, alpha)` rects.
+/// block element) inside a cell whose top-left pixel is `(px, py)`. The GL
+/// renderer uses the same top-down pixel convention as the Canvas 2D path, so
+/// this mirrors `draw_graphic_cell` exactly (line widths and the overdraw
+/// epsilon are scaled by `dpr`). Returns `(x, y, w, h, alpha)` rects.
 fn graphic_rects(
     ch: char,
     px: f32,
@@ -593,8 +600,9 @@ impl WebGL2Renderer {
         let gl = self.ctx;
         // Use the full drawing buffer as the viewport so the destination rect
         // always matches it (avoids Firefox's "Drawing to a destination rect
-        // smaller than the viewport rect" warning). The grid is still laid out
-        // from pixel origin (0,0), so it occupies the bottom-left corner.
+        // smaller than the viewport rect" warning). The grid is laid out from
+        // pixel origin (0,0) downward (top-left convention), so it occupies
+        // the top-left corner of the buffer.
         let buf_w = ffi::canvas_width(self.canvas);
         let buf_h = ffi::canvas_height(self.canvas);
 
@@ -723,9 +731,9 @@ impl WebGL2Renderer {
         for r in 0..rows {
             for c in 0..cols {
                 let px = c * cell_w;
-                // The vertex shader maps pixel y=0 to NDC -1 (framebuffer
-                // bottom), so terminal row 0 must be placed at the highest y.
-                let py = (rows - 1 - r) * cell_h;
+                // Both renderers share the top-down pixel convention: row 0 is
+                // the canvas top and each row steps one cell height downward.
+                let py = r * cell_h;
                 let is_selected = sel_set.contains(&(r as u16, c as u16));
                 let is_cursor = (r as u16, c as u16) == cursor;
 
@@ -1029,5 +1037,56 @@ mod tests {
         assert!(t_top >= 0);
         assert!(g_bottom >= baseline, "g must descend below baseline");
         assert!(g_bottom <= glyph_h as i32 - 1);
+    }
+
+    /// `py` is the pixel y of the cell's TOP edge (top-down convention, shared
+    /// with the Canvas 2D renderer). Return the midpoint of a rect on that axis.
+    fn rect_vcenter(r: &(f32, f32, f32, f32, f32), ch_h: f32, py: f32) -> f32 {
+        r.1 + r.3 * 0.5
+    }
+
+    #[test]
+    fn block_geometry_paints_upward_not_mirrored() {
+        let (px, py, cw, ch_h, dpr) = (0.0f32, 100.0f32, 8.0f32, 18.0f32, 1.0);
+        let mid = py + ch_h * 0.5;
+        // ▀ upper-half block: rect center must sit in the visual UPPER half.
+        let up = graphic_rects('\u{2580}', px, py, cw, ch_h, dpr).unwrap();
+        assert!(
+            rect_vcenter(&up[0], ch_h, py) < mid,
+            "▀ (upper half) painted below mid: center {} in the lower half",
+            rect_vcenter(&up[0], ch_h, py)
+        );
+        // ▄ lower-half block: rect center must sit in the visual LOWER half.
+        let down = graphic_rects('\u{2584}', px, py, cw, ch_h, dpr).unwrap();
+        assert!(
+            rect_vcenter(&down[0], ch_h, py) >= mid,
+            "▄ (lower half) painted above mid: center {} in the upper half",
+            rect_vcenter(&down[0], ch_h, py)
+        );
+        // █ full block spans the whole cell (centered on the middle).
+        let full = graphic_rects('\u{2588}', px, py, cw, ch_h, dpr).unwrap();
+        assert!((rect_vcenter(&full[0], ch_h, py) - mid).abs() < 1.0);
+    }
+
+    #[test]
+    fn box_corners_point_the_right_way_up() {
+        let (px, py, cw, ch_h, dpr) = (0.0f32, 100.0f32, 8.0f32, 18.0f32, 1.0);
+        let mid = py + ch_h * 0.5;
+        // ┌ (right bar + UP stem): the stem must sit in the top half; └ (right
+        // bar + DOWN stem): the stem must sit in the bottom half. A vertically
+        // flipped renderer swaps them (┌ renders as └).
+        let tl = graphic_rects('\u{250C}', px, py, cw, ch_h, dpr).unwrap();
+        let bl = graphic_rects('\u{2514}', px, py, cw, ch_h, dpr).unwrap();
+        // First rect is the stem (bar rects are horizontal; only one arm each).
+        assert!(
+            rect_vcenter(&tl[0], ch_h, py) < mid,
+            "┌ stem must point up, painted below mid {}",
+            mid
+        );
+        assert!(
+            rect_vcenter(&bl[0], ch_h, py) >= mid,
+            "└ stem must point down, painted above mid {}",
+            mid
+        );
     }
 }

@@ -27,6 +27,7 @@ async fn main() {
         .route("/ws", get(handlers::ws_handler))
         .route("/pkg/terminal_client_bg.wasm", get(handlers::pkg_wasm))
         .route("/krust_runtime.js", get(handlers::runtime_js))
+        .route("/system-font", get(handlers::system_font))
         .layer(CorsLayer::permissive());
     let app = app.with_state(state);
 
@@ -191,5 +192,46 @@ mod tests {
                 .is_some(),
             "krust must emit CORS headers (cross-origin fetch from Grit web UI)"
         );
+    }
+
+    #[tokio::test]
+    async fn system_font_route_serves_a_parseable_font_or_404() {
+        // Environment-dependent (fontconfig + an installed monospace family):
+        // the contract is "200 with the font file bytes when a system font is
+        // found, 404 with an empty-ish body otherwise".
+        let app = Router::new().route("/system-font", get(handlers::system_font));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/system-font")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        if response.status() == axum::http::StatusCode::OK {
+            let body = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap();
+            assert!(!body.is_empty(), "font response must be non-empty");
+            assert!(
+                ab_glyph_sniff(&body).unwrap_or(false),
+                "served bytes must look like a usable font (have a sfnt table)"
+            );
+        } else {
+            assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        }
+    }
+
+    /// Cheap sniff: any sfnt font (TTF/OTF/variable) starts with a 4-byte
+    /// signature (0x00010000 true/ttcf/OTTO).
+    fn ab_glyph_sniff(bytes: &[u8]) -> Option<bool> {
+        if bytes.len() < 4 {
+            return Some(false);
+        }
+        let sig = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        Some(matches!(sig, 0x0001_0000 | 0x7472_7565 | 0x4f54_544f | 0x7474_6366))
     }
 }
