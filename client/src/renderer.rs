@@ -17,13 +17,16 @@
 //   [14]    selection flag (1.0 = selected, 0.0 = not)
 //   [15]    cursor flag (1.0 = cursor cell, 0.0 = not)
 //
-// Color overrides (applied in build_instances):
-//   selected: fg and bg are swapped
-//   cursor: fg = original bg, bg = original fg (block cursor)
+// Color overrides: resolved by the shared `crate::color::cell_visual` helper
+// (same decision as the Canvas 2D path):
+//   selected: fg = black, bg = original fg (highlight)
+//   cursor:   fg = original bg, bg = original fg (block cursor)
 
 use ab_glyph::{Font, FontRef, Glyph, Point, PxScale, ScaleFont};
 
+use crate::color::{cell_visual, CellOverride};
 use crate::ffi::{self, JsHandle};
+use crate::graphics::graphic_cell_rects;
 
 // --- WebGL2 constants (the "krust" JS runtime mirrors the browser values) ---
 const VERTEX_SHADER_KIND: u32 = 0x8B31;
@@ -447,71 +450,6 @@ fn rgb_to_floats(rgb: u32) -> (f32, f32, f32) {
     )
 }
 
-/// Compute the device-pixel rects that paint a graphic glyph (box-drawing or
-/// block element) inside a cell whose top-left pixel is `(px, py)`. The GL
-/// renderer uses the same top-down pixel convention as the Canvas 2D path, so
-/// this mirrors `draw_graphic_cell` exactly (line widths and the overdraw
-/// epsilon are scaled by `dpr`). Returns `(x, y, w, h, alpha)` rects.
-fn graphic_rects(
-    ch: char,
-    px: f32,
-    py: f32,
-    cw: f32,
-    ch_h: f32,
-    dpr: f64,
-) -> Option<Vec<(f32, f32, f32, f32, f32)>> {
-    use crate::graphics::{
-        block_geometry, box_geometry, box_line_width, BarSide, StemSide, GRAPHIC_EPS,
-    };
-    let eps = (GRAPHIC_EPS * dpr) as f32;
-    if let Some((fx0, fy0, fx1, fy1, alpha)) = block_geometry(ch) {
-        let x = px + fx0 as f32 * cw - eps;
-        let y = py + fy0 as f32 * ch_h - eps;
-        let w = (fx1 - fx0) as f32 * cw + eps * 2.0;
-        let h = (fy1 - fy0) as f32 * ch_h + eps * 2.0;
-        return Some(vec![(x, y, w, h, alpha as f32)]);
-    }
-    let (bar, stem, weight) = box_geometry(ch)?;
-    let s = dpr as f32;
-    let (t_css, gap_css) = box_line_width(weight);
-    let t = t_css as f32 * s;
-    let gap = gap_css as f32 * s;
-    let cx = px + cw * 0.5;
-    let cy = py + ch_h * 0.5;
-    let null_off = 0.0f32;
-    let offsets: &[f32] = if gap > 0.0 { &[-gap, gap] } else { &[null_off] };
-    let mut rects = Vec::with_capacity(4);
-    for &off in offsets {
-        if stem != StemSide::None {
-            let x = cx + off - t * 0.5;
-            let (y, h) = match stem {
-                StemSide::Full => (py - eps, ch_h + eps * 2.0),
-                StemSide::Up => (py - eps, cy - py + t * 0.5 + eps),
-                StemSide::Down => {
-                    let y = cy - t * 0.5 - eps;
-                    (y, (py + ch_h) - (cy - t * 0.5 - eps) + eps)
-                }
-                _ => unreachable!(),
-            };
-            rects.push((x, y, t, h, 1.0));
-        }
-        if bar != BarSide::None {
-            let y = cy + off - t * 0.5;
-            let (x, w) = match bar {
-                BarSide::Full => (px - eps, cw + eps * 2.0),
-                BarSide::Left => (px - eps, cx - px + t * 0.5 + eps),
-                BarSide::Right => {
-                    let x = cx - t * 0.5 - eps;
-                    (x, (px + cw) - (cx - t * 0.5 - eps) + eps)
-                }
-                _ => unreachable!(),
-            };
-            rects.push((x, y, w, t, 1.0));
-        }
-    }
-    Some(rects)
-}
-
 pub struct WebGL2Renderer {
     /// Canvas element backing the GL context, queried for drawing-buffer size.
     pub canvas: JsHandle,
@@ -737,53 +675,26 @@ impl WebGL2Renderer {
                 let is_selected = sel_set.contains(&(r as u16, c as u16));
                 let is_cursor = (r as u16, c as u16) == cursor;
 
-                let ch = if r < prows as u32 && c < pcols as u32 {
-                    screen
-                        .cell(r as u16, c as u16)
-                        .map(|cell| cell.contents().chars().next().unwrap_or(' '))
-                        .unwrap_or(' ')
+                let cell = if r < prows as u32 && c < pcols as u32 {
+                    screen.cell(r as u16, c as u16)
                 } else {
-                    ' '
+                    None
                 };
+                let ch = cell
+                    .and_then(|cell| cell.contents().chars().next())
+                    .unwrap_or(' ');
 
-                let (mut fg_r, mut fg_g, mut fg_b, mut bg_r, mut bg_g, mut bg_b) =
-                    if r < prows as u32 && c < pcols as u32 {
-                        if let Some(cell) = screen.cell(r as u16, c as u16) {
-                            let fg_rgb = crate::color::cell_fg_rgb(&cell, default_fg);
-                            let bg_rgb = crate::color::color_to_rgb(cell.bgcolor(), default_bg);
-                            let (fr, fg, fb) = rgb_to_floats(fg_rgb);
-                            let (br, bg, bb) = rgb_to_floats(bg_rgb);
-                            (fr, fg, fb, br, bg, bb)
-                        } else {
-                            let (fr, fg, fb) = rgb_to_floats(default_fg);
-                            let (br, bg, bb) = rgb_to_floats(default_bg);
-                            (fr, fg, fb, br, bg, bb)
-                        }
-                    } else {
-                        let (fr, fg, fb) = rgb_to_floats(default_fg);
-                        let (br, bg, bb) = rgb_to_floats(default_bg);
-                        (fr, fg, fb, br, bg, bb)
-                    };
-
-                // Apply visual overrides (cursor takes priority over selection)
-                if is_cursor {
-                    // Block cursor: swap fg and bg
-                    let (t_r, t_g, t_b) = (fg_r, fg_g, fg_b);
-                    fg_r = bg_r;
-                    fg_g = bg_g;
-                    fg_b = bg_b;
-                    bg_r = t_r;
-                    bg_g = t_g;
-                    bg_b = t_b;
+                // Shared cursor/selection color decision (same as Canvas 2D).
+                let override_ = if is_cursor {
+                    CellOverride::Cursor
                 } else if is_selected {
-                    // Selection: background = original fg, text = black
-                    bg_r = fg_r;
-                    bg_g = fg_g;
-                    bg_b = fg_b;
-                    fg_r = 0.0;
-                    fg_g = 0.0;
-                    fg_b = 0.0;
-                }
+                    CellOverride::Selected
+                } else {
+                    CellOverride::Normal
+                };
+                let (fg_rgb, bg_rgb) = cell_visual(cell, default_fg, default_bg, override_);
+                let (fg_r, fg_g, fg_b) = rgb_to_floats(fg_rgb);
+                let (bg_r, bg_g, bg_b) = rgb_to_floats(bg_rgb);
 
                 let sel = if is_selected && !is_cursor { 1.0 } else { 0.0 };
                 let cur = if is_cursor { 1.0 } else { 0.0 };
@@ -799,8 +710,11 @@ impl WebGL2Renderer {
                 ]);
 
                 // Text pass: glyph quad, or flat geometry for graphic cells
-                if let Some(rects) = graphic_rects(ch, px as f32, py as f32, cell_wf, cell_hf, dpr) {
+                if let Some(rects) =
+                    graphic_cell_rects(ch, px as f64, py as f64, cell_wf as f64, cell_hf as f64, dpr)
+                {
                     for (x, y, w, h, a) in rects {
+                        let a = a as f32;
                         // Shaded blocks are pre-blended over the cell background;
                         // full-alpha glyphs use the foreground as-is.
                         let (tr, tg, tb) = if a < 1.0 {
@@ -813,7 +727,7 @@ impl WebGL2Renderer {
                             (fg_r, fg_g, fg_b)
                         };
                         text.extend_from_slice(&[
-                            x, y, w, h,     // geometry rect
+                            x as f32, y as f32, w as f32, h as f32, // geometry rect
                             solid.0, solid.1, solid.2, solid.3, // flat sample
                             tr, tg, tb,     // paint color
                             bg_r, bg_g, bg_b,
@@ -1039,54 +953,4 @@ mod tests {
         assert!(g_bottom <= glyph_h as i32 - 1);
     }
 
-    /// `py` is the pixel y of the cell's TOP edge (top-down convention, shared
-    /// with the Canvas 2D renderer). Return the midpoint of a rect on that axis.
-    fn rect_vcenter(r: &(f32, f32, f32, f32, f32), ch_h: f32, py: f32) -> f32 {
-        r.1 + r.3 * 0.5
-    }
-
-    #[test]
-    fn block_geometry_paints_upward_not_mirrored() {
-        let (px, py, cw, ch_h, dpr) = (0.0f32, 100.0f32, 8.0f32, 18.0f32, 1.0);
-        let mid = py + ch_h * 0.5;
-        // ▀ upper-half block: rect center must sit in the visual UPPER half.
-        let up = graphic_rects('\u{2580}', px, py, cw, ch_h, dpr).unwrap();
-        assert!(
-            rect_vcenter(&up[0], ch_h, py) < mid,
-            "▀ (upper half) painted below mid: center {} in the lower half",
-            rect_vcenter(&up[0], ch_h, py)
-        );
-        // ▄ lower-half block: rect center must sit in the visual LOWER half.
-        let down = graphic_rects('\u{2584}', px, py, cw, ch_h, dpr).unwrap();
-        assert!(
-            rect_vcenter(&down[0], ch_h, py) >= mid,
-            "▄ (lower half) painted above mid: center {} in the upper half",
-            rect_vcenter(&down[0], ch_h, py)
-        );
-        // █ full block spans the whole cell (centered on the middle).
-        let full = graphic_rects('\u{2588}', px, py, cw, ch_h, dpr).unwrap();
-        assert!((rect_vcenter(&full[0], ch_h, py) - mid).abs() < 1.0);
-    }
-
-    #[test]
-    fn box_corners_point_the_right_way_up() {
-        let (px, py, cw, ch_h, dpr) = (0.0f32, 100.0f32, 8.0f32, 18.0f32, 1.0);
-        let mid = py + ch_h * 0.5;
-        // ┌ (right bar + UP stem): the stem must sit in the top half; └ (right
-        // bar + DOWN stem): the stem must sit in the bottom half. A vertically
-        // flipped renderer swaps them (┌ renders as └).
-        let tl = graphic_rects('\u{250C}', px, py, cw, ch_h, dpr).unwrap();
-        let bl = graphic_rects('\u{2514}', px, py, cw, ch_h, dpr).unwrap();
-        // First rect is the stem (bar rects are horizontal; only one arm each).
-        assert!(
-            rect_vcenter(&tl[0], ch_h, py) < mid,
-            "┌ stem must point up, painted below mid {}",
-            mid
-        );
-        assert!(
-            rect_vcenter(&bl[0], ch_h, py) >= mid,
-            "└ stem must point down, painted above mid {}",
-            mid
-        );
-    }
 }

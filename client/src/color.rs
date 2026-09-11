@@ -59,3 +59,85 @@ pub(crate) fn cell_fg_rgb(cell: &vt100::Cell, default: u32) -> u32 {
     }
     color_to_rgb(cell.fgcolor(), default)
 }
+
+/// How a cell's cursor/selection state alters its fg/bg colors. Cursor takes
+/// priority over selection (a block cursor masks the highlight).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CellOverride {
+    Normal,
+    Selected,
+    Cursor,
+}
+
+/// Selection highlight text color (black over the original foreground).
+pub(crate) const SELECTION_FG: u32 = 0x000000;
+
+/// Resolved `(fg, bg)` colors for a cell after applying the cursor/selection
+/// override. Shared by the Canvas 2D and WebGL2 renderers so both paint the
+/// same colors for the same cell state:
+///   Cursor:   fg = original bg, bg = original fg (block cursor)
+///   Selected: fg = black,       bg = original fg
+pub(crate) fn cell_visual(
+    cell: Option<&vt100::Cell>,
+    default_fg: u32,
+    default_bg: u32,
+    override_: CellOverride,
+) -> (u32, u32) {
+    let (fg0, bg0) = match cell {
+        Some(c) => (
+            cell_fg_rgb(c, default_fg),
+            color_to_rgb(c.bgcolor(), default_bg),
+        ),
+        None => (default_fg, default_bg),
+    };
+    match override_ {
+        CellOverride::Normal => (fg0, bg0),
+        CellOverride::Selected => (SELECTION_FG, fg0),
+        CellOverride::Cursor => (bg0, fg0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vt100::Parser;
+
+    fn cell() -> vt100::Cell {
+        let mut p = Parser::new(1, 1, 0);
+        p.process("\u{1b}[31;44mX".as_bytes());
+        p.screen().cell(0, 0).unwrap().clone()
+    }
+
+    #[test]
+    fn normal_uses_cell_colors() {
+        let (fg, bg) = cell_visual(Some(&cell()), DEFAULT_FG, DEFAULT_BG, CellOverride::Normal);
+        assert_eq!(fg, 0xCD0000);
+        assert_eq!(bg, 0x0000EE);
+    }
+
+    #[test]
+    fn selected_keeps_original_fg_as_highlight() {
+        let (fg, bg) = cell_visual(
+            Some(&cell()),
+            DEFAULT_FG,
+            DEFAULT_BG,
+            CellOverride::Selected,
+        );
+        assert_eq!(fg, SELECTION_FG);
+        assert_eq!(bg, 0xCD0000);
+    }
+
+    #[test]
+    fn cursor_swaps_fg_and_bg() {
+        let (fg, bg) = cell_visual(Some(&cell()), DEFAULT_FG, DEFAULT_BG, CellOverride::Cursor);
+        assert_eq!(fg, 0x0000EE);
+        assert_eq!(bg, 0xCD0000);
+    }
+
+    #[test]
+    fn empty_cell_yields_defaults() {
+        let (fg, bg) = cell_visual(None, DEFAULT_FG, DEFAULT_BG, CellOverride::Normal);
+        assert_eq!(fg, DEFAULT_FG);
+        assert_eq!(bg, DEFAULT_BG);
+    }
+}

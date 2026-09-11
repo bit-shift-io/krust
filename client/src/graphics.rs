@@ -149,6 +149,68 @@ pub(crate) fn box_geometry(c: char) -> Option<(BarSide, StemSide, LineWeight)> {
     Some(g)
 }
 
+/// Compute the pixel rects that paint a graphic glyph (block element or
+/// box-drawing) inside a cell whose top-left origin is `(ox, oy)`. `cw`/`ch`
+/// are the cell size in the caller's pixel unit and `scale` multiplies the
+/// CSS-derived constants (overdraw epsilon, box line widths): `1.0` for the
+/// Canvas 2D path, the device pixel ratio for WebGL2. Returns `(x, y, w, h,
+/// alpha)` rects, or `None` when `c` is not a graphic glyph. Both renderers
+/// share this geometry so block/box cells paint identically on either path.
+pub(crate) fn graphic_cell_rects(
+    c: char,
+    ox: f64,
+    oy: f64,
+    cw: f64,
+    ch: f64,
+    scale: f64,
+) -> Option<Vec<(f64, f64, f64, f64, f64)>> {
+    let eps = GRAPHIC_EPS * scale;
+    if let Some((fx0, fy0, fx1, fy1, alpha)) = block_geometry(c) {
+        let x = ox + fx0 * cw - eps;
+        let y = oy + fy0 * ch - eps;
+        let w = (fx1 - fx0) * cw + eps * 2.0;
+        let h = (fy1 - fy0) * ch + eps * 2.0;
+        return Some(vec![(x, y, w, h, alpha)]);
+    }
+    let (bar, stem, weight) = box_geometry(c)?;
+    let (t_css, gap_css) = box_line_width(weight);
+    let t = t_css * scale;
+    let gap = gap_css * scale;
+    let cx = ox + cw * 0.5;
+    let cy = oy + ch * 0.5;
+    let offsets: &[f64] = if gap > 0.0 { &[-gap, gap] } else { &[0.0] };
+    let mut rects = Vec::with_capacity(4);
+    for &off in offsets {
+        if stem != StemSide::None {
+            let x = cx + off - t * 0.5;
+            let (y, h) = match stem {
+                StemSide::Full => (oy - eps, ch + eps * 2.0),
+                StemSide::Up => (oy - eps, cy - oy + t * 0.5 + eps),
+                StemSide::Down => {
+                    let y = cy - t * 0.5 - eps;
+                    (y, (oy + ch) - (cy - t * 0.5 - eps) + eps)
+                }
+                _ => unreachable!(),
+            };
+            rects.push((x, y, t, h, 1.0));
+        }
+        if bar != BarSide::None {
+            let y = cy + off - t * 0.5;
+            let (x, w) = match bar {
+                BarSide::Full => (ox - eps, cw + eps * 2.0),
+                BarSide::Left => (ox - eps, cx - ox + t * 0.5 + eps),
+                BarSide::Right => {
+                    let x = cx - t * 0.5 - eps;
+                    (x, (ox + cw) - (cx - t * 0.5 - eps) + eps)
+                }
+                _ => unreachable!(),
+            };
+            rects.push((x, y, w, t, 1.0));
+        }
+    }
+    Some(rects)
+}
+
 /// Paint a graphic glyph (block element or box-drawing) as geometry covering
 /// its cell. Returns `true` when handled (caller skips the font path).
 pub(crate) fn draw_graphic_cell(
@@ -163,26 +225,19 @@ pub(crate) fn draw_graphic_cell(
     let Some(c) = glyph.chars().next() else {
         return false;
     };
-    if let Some((fx0, fy0, fx1, fy1, alpha)) = block_geometry(c) {
-        let x = col as f64 * cw + fx0 * cw - GRAPHIC_EPS;
-        let y = row as f64 * ch + fy0 * ch - GRAPHIC_EPS;
-        let w = (fx1 - fx0) * cw + GRAPHIC_EPS * 2.0;
-        let h = (fy1 - fy0) * ch + GRAPHIC_EPS * 2.0;
+    let Some(rects) = graphic_cell_rects(c, col as f64 * cw, row as f64 * ch, cw, ch, 1.0) else {
+        return false;
+    };
+    ffi::ctx_set_fill_style(ctx, &css_color(color));
+    for (x, y, w, h, alpha) in rects {
         if alpha < 1.0 {
             ffi::ctx_set_global_alpha(ctx, alpha);
         }
-        ffi::ctx_set_fill_style(ctx, &css_color(color));
         ffi::ctx_fill_rect(ctx, x, y, w, h);
         if alpha < 1.0 {
             ffi::ctx_set_global_alpha(ctx, 1.0);
         }
-        return true;
     }
-    let Some((bar, stem, weight)) = box_geometry(c) else {
-        return false;
-    };
-    ffi::ctx_set_fill_style(ctx, &css_color(color));
-    draw_box_lines(ctx, col, row, cw, ch, bar, stem, weight);
     true
 }
 
@@ -194,41 +249,58 @@ pub(crate) fn box_line_width(weight: LineWeight) -> (f64, f64) {
     }
 }
 
-fn draw_box_lines(
-    ctx: JsHandle,
-    col: u16,
-    row: u16,
-    cw: f64,
-    ch: f64,
-    bar: BarSide,
-    stem: StemSide,
-    weight: LineWeight,
-) {
-    let cx = col as f64 * cw + cw * 0.5;
-    let cy = row as f64 * ch + ch * 0.5;
-    let (t, gap) = box_line_width(weight);
-    let offsets: &[f64] = if gap > 0.0 { &[-gap, gap] } else { &[0.0] };
+#[cfg(test)]
+mod tests {
+    use super::graphic_cell_rects;
 
-    for &off in offsets {
-        if stem != StemSide::None {
-            let x = cx + off - t * 0.5;
-            let (y, h) = match stem {
-                StemSide::Full => (row as f64 * ch - GRAPHIC_EPS, ch + GRAPHIC_EPS * 2.0),
-                StemSide::Up => (row as f64 * ch - GRAPHIC_EPS, cy - row as f64 * ch + t * 0.5 + GRAPHIC_EPS),
-                StemSide::Down => (cy - t * 0.5 - GRAPHIC_EPS, (row as f64 + 1.0) * ch - (cy - t * 0.5 - GRAPHIC_EPS) + GRAPHIC_EPS),
-                _ => unreachable!(),
-            };
-            ffi::ctx_fill_rect(ctx, x, y, t, h);
-        }
-        if bar != BarSide::None {
-            let y = cy + off - t * 0.5;
-            let (x, w) = match bar {
-                BarSide::Full => (col as f64 * cw - GRAPHIC_EPS, cw + GRAPHIC_EPS * 2.0),
-                BarSide::Left => (col as f64 * cw - GRAPHIC_EPS, cx - col as f64 * cw + t * 0.5 + GRAPHIC_EPS),
-                BarSide::Right => (cx - t * 0.5 - GRAPHIC_EPS, (col as f64 + 1.0) * cw - (cx - t * 0.5 - GRAPHIC_EPS) + GRAPHIC_EPS),
-                _ => unreachable!(),
-            };
-            ffi::ctx_fill_rect(ctx, x, y, w, t);
-        }
+    /// `oy` is the pixel y of the cell's TOP edge (top-down convention, shared
+    /// with the WebGL2 renderer). Return the midpoint of a rect on that axis.
+    fn rect_vcenter(r: &(f64, f64, f64, f64, f64)) -> f64 {
+        r.1 + r.3 * 0.5
+    }
+
+    #[test]
+    fn block_geometry_paints_upward_not_mirrored() {
+        let (ox, oy, cw, ch, scale) = (0.0f64, 100.0f64, 8.0f64, 18.0f64, 1.0);
+        let mid = oy + ch * 0.5;
+        // ▀ upper-half block: rect center must sit in the visual UPPER half.
+        let up = graphic_cell_rects('\u{2580}', ox, oy, cw, ch, scale).unwrap();
+        assert!(
+            rect_vcenter(&up[0]) < mid,
+            "▀ (upper half) painted below mid: center {} in the lower half",
+            rect_vcenter(&up[0])
+        );
+        // ▄ lower-half block: rect center must sit in the visual LOWER half.
+        let down = graphic_cell_rects('\u{2584}', ox, oy, cw, ch, scale).unwrap();
+        assert!(
+            rect_vcenter(&down[0]) >= mid,
+            "▄ (lower half) painted above mid: center {} in the upper half",
+            rect_vcenter(&down[0])
+        );
+        // █ full block spans the whole cell (centered on the middle).
+        let full = graphic_cell_rects('\u{2588}', ox, oy, cw, ch, scale).unwrap();
+        assert!((rect_vcenter(&full[0]) - mid).abs() < 1.0);
+    }
+
+    #[test]
+    fn box_corners_point_the_right_way_up() {
+        let (ox, oy, cw, ch, scale) = (0.0f64, 100.0f64, 8.0f64, 18.0f64, 1.0);
+        let mid = oy + ch * 0.5;
+        // ┌ (right bar + UP stem): the stem must sit in the top half; └ (right
+        // bar + DOWN stem): the stem must sit in the bottom half. A vertically
+        // flipped renderer swaps them (┌ renders as └).
+        let tl = graphic_cell_rects('\u{250C}', ox, oy, cw, ch, scale).unwrap();
+        let bl = graphic_cell_rects('\u{2514}', ox, oy, cw, ch, scale).unwrap();
+        // First rect is the stem (bar rects are horizontal; only one arm each).
+        assert!(
+            rect_vcenter(&tl[0]) < mid,
+            "┌ stem must point up, painted below mid {}",
+            mid
+        );
+        assert!(
+            rect_vcenter(&bl[0]) >= mid,
+            "└ stem must point down, painted above mid {}",
+            mid
+        );
     }
 }

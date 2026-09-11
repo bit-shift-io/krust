@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 use vt100::Parser;
 
-use crate::color::{cell_fg_rgb, color_to_rgb, DEFAULT_BG, DEFAULT_FG};
+use crate::color::{cell_visual, color_to_rgb, CellOverride, DEFAULT_BG, DEFAULT_FG};
 use crate::ffi::{self, JsHandle};
 use crate::graphics::draw_graphic_cell;
 use crate::measure::{
@@ -690,15 +690,8 @@ impl TerminalState {
         let Some((cr, cc)) = cursor else { return Ok(None) };
         let screen = self.parser.screen();
         let cell = screen.cell(cr, cc);
-        let (mut fg, mut bg) = if let Some(c) = cell {
-            (
-                cell_fg_rgb(&c, DEFAULT_FG),
-                color_to_rgb(c.bgcolor(), DEFAULT_BG),
-            )
-        } else {
-            (DEFAULT_FG, DEFAULT_BG)
-        };
-        std::mem::swap(&mut fg, &mut bg);
+        // Shared cursor decision: swap original fg/bg (block cursor).
+        let (fg, bg) = cell_visual(cell, DEFAULT_FG, DEFAULT_BG, CellOverride::Cursor);
         ffi::ctx_set_fill_style(ctx, &css_color(bg));
         ffi::ctx_fill_rect(ctx, cc as f64 * cw, cr as f64 * ch, cw, ch);
         ffi::ctx_set_fill_style(ctx, &css_color(fg));
@@ -743,29 +736,26 @@ impl TerminalState {
             None
         };
         let selected = self.selected(row, col);
+        let override_ = if selected {
+            CellOverride::Selected
+        } else {
+            CellOverride::Normal
+        };
 
         // 2. Non-default background rect
-        let bg = match cell {
+        let base_bg = match cell {
             Some(c) => color_to_rgb(c.bgcolor(), DEFAULT_BG),
             _ => DEFAULT_BG,
         };
-        if bg != DEFAULT_BG && !selected {
-            ffi::ctx_set_fill_style(ctx, &css_color(bg));
+        if base_bg != DEFAULT_BG && !selected {
+            ffi::ctx_set_fill_style(ctx, &css_color(base_bg));
             ffi::ctx_fill_rect(ctx, col as f64 * cw, row as f64 * ch, cw, ch);
         }
 
         // 3. Selection background rect (before text)
         if selected {
-            let (fg0, bg0) = match cell {
-                Some(c) => (
-                    cell_fg_rgb(&c, DEFAULT_FG),
-                    color_to_rgb(c.bgcolor(), DEFAULT_BG),
-                ),
-                _ => (DEFAULT_FG, DEFAULT_BG),
-            };
-            let (mut fg, mut bg) = (fg0, bg0);
-            std::mem::swap(&mut fg, &mut bg);
-            ffi::ctx_set_fill_style(ctx, &css_color(bg));
+            let (_fg, sel_bg) = cell_visual(cell, DEFAULT_FG, DEFAULT_BG, CellOverride::Selected);
+            ffi::ctx_set_fill_style(ctx, &css_color(sel_bg));
             ffi::ctx_fill_rect(
                 ctx,
                 col as f64 * cw - CELL_EPSILON,
@@ -779,9 +769,7 @@ impl TerminalState {
         if let Some(c) = cell {
             let s = c.contents();
             if !s.is_empty() {
-                const SELECTION_FG: u32 = 0x000000;
-                let fg = cell_fg_rgb(&c, DEFAULT_FG);
-                let draw_fg = if selected { SELECTION_FG } else { fg };
+                let (draw_fg, _bg) = cell_visual(Some(c), DEFAULT_FG, DEFAULT_BG, override_);
                 if draw_fg != DEFAULT_BG {
                     if draw_graphic_cell(ctx, col, row, cw, ch, s, draw_fg) {
                         return;
