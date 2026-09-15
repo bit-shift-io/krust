@@ -16,11 +16,33 @@ Two extra fixes were required beyond the original plan:
   location instead of the doc-root argument, because `render-check.sh`
   starts the server with the doc root at `client/`.
 
-Known limitation (out of scope for this plan): the WebGL2 glyph atlas
-rasterizes all 128 ASCII glyphs (0x00–0x7F). Non-ASCII characters such as
-braille (`⠋⠁⠂…`) still have no atlas entry (`uv_for` → `None`), so they
-render invisible under WebGL2 (the Canvas 2D path falls back to the system
-font).
+Known limitation (out of scope for this plan): the WebGL2 glyph atlas does not
+cover every codepoint — it bakes fixed ranges (ASCII; Latin-1 Supplement;
+General Punctuation `…–—‘’“”`; Currency; box-drawing/geometric; arrows; math
+operators; misc symbols; dingbats `✓✦✶`; braille). Arbitrary Unicode outside
+those ranges (CJK, emoji, etc.) has no atlas entry (`uv_for` → `None`) and
+renders invisible under WebGL2 (the Canvas 2D path falls back to the system
+font via CSS).
+
+Latest round of fixes (both verified under headless Chromium with WebGL2):
+- **WebGL context-loss recovery (tab-switch freeze).** Firefox drops the WebGL
+  context while a tab is hidden; every GL object krust holds becomes invalid, so
+  `repaint()` silently no-ops and the terminal stays blank after switching away
+  and back. `server.html` now `preventDefault()`s `webglcontextlost` (opting
+  into restoration) and, on `webglcontextrestored`, calls the new `rebuild_webgl`
+  wasm export — `TerminalState::rebuild_webgl()` recreates the whole
+  `WebGL2Renderer` (program, buffers, atlas, preserving the swapped-in system
+  font) and full-redraws. Verified: dispatch restore-handler on the live page →
+  identical frame; on a genuinely-lost context → the rebuild performs real GL
+  work and reports `compile_shader` failure (proves the wiring, not a no-op).
+- **Missing General Punctuation / Latin-1 glyphs.** `… – — ‘ ’ “ ”` and `· ° €`
+  etc. rendered blank on the GL path because `ATLAS_RANGES` skipped them.
+  Added Latin-1 Supplement, General Punctuation, Currency, and Misc Symbols
+  ranges (1072 → 1584 atlas slots). Verified by a new client unit test
+  (`unicode_text_ranges_rasterize_ink`), a new `punctuation` probe in
+  `render-test.html`, and a browser glyph-ink probe (all cells now paint ink).
+- `render-check.sh` retries a cold-start page dump up to 3× (headless chromium
+  `--virtual-time-budget` sometimes dumped `loading...` before init finished).
 
 Post-completion fixes: the atlas UV rows were swapped (glyphs rasterize
 top-down but the screen quad samples v0 at its top edge) so text renders

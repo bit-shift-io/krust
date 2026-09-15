@@ -158,9 +158,14 @@ obtained. On init it logs `KRUST: WebGL2 renderer initialized` or
 
 ### 3.4 WebGL2 Renderer (`client/src/renderer.rs`, primary path)
 
-* **Font atlas (`GlyphAtlas`):** the 128 ASCII glyphs (0x00–0x7F) are
+* **Font atlas (`GlyphAtlas`):** a fixed set of Unicode **ranges** is
   rasterized at init from `EMBEDDED_FONT` (`client/fonts/Hack-Regular.ttf`,
-  shipped via `include_bytes!`). `ab_glyph` handles layout; glyphs land in a
+  shipped via `include_bytes!`) — ASCII, Latin-1 Supplement, General
+  Punctuation (`…–—‘’“”`), Currency, Arrows, Math Operators, Misc Symbols,
+  Blocks/Geometric, Dingbats (`✓✦✶`) and Braille (1072–1584 slots total).
+  Codepoints outside these ranges resolve to no atlas entry (`uv_for` → `None`)
+  and render as blank cells; the Canvas 2D path instead falls back to the
+  system font via CSS. `ab_glyph` handles layout; glyphs land in a
   WebGL2 texture. Each glyph is rasterized at an em scale derived from the
   **cell width** (`em = glyph_w / h_advance(1.0)`), so every character
   advances exactly one cell width — the same monospace invariant the Canvas 2D
@@ -172,6 +177,13 @@ obtained. On init it logs `KRUST: WebGL2 renderer initialized` or
   atlas UV rows are swapped when uploading so glyphs render upright. The atlas
   is the alpha source for every text pass; a reserved opaque texel supplies
   flat fills for graphic cells.
+* **Context-loss recovery:** browsers may drop the WebGL context while a tab is
+  hidden (Firefox does under memory pressure), which invalidates every GL
+  object. `server.html` opts into restoration with
+  `webglcontextlost.preventDefault()` and, on `webglcontextrestored`, calls the
+  `rebuild_webgl()` export; `TerminalState::rebuild_webgl()` recreates the whole
+  renderer (program, buffers, atlas — preserving the swapped-in system font) so
+  the next `render()` paints a full frame instead of silently no-opping.
 * **Two-pass instanced drawing (`GlyphBrush`):**
   * Pass 0 (mode 0) — per-cell background rects using a solid 1×1 atlas pixel;
   * Pass 1 (mode 1) — text glyphs sampling atlas alpha.

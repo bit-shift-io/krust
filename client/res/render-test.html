@@ -68,6 +68,7 @@
             push('x'.repeat(10) + '\r\n');
             push(' '.repeat(30) + '▮▍▎▏▪▸●◆\r\n');
             push(' '.repeat(30) + '↻↺⇦⋯⊶✦✶✔\r\n');
+            push(' '.repeat(30) + '…–—‘’“”·\r\n');
             const len = parts.reduce((n, p) => n + p.length, 0);
             const joined = new Uint8Array(len);
             let off = 0;
@@ -256,9 +257,11 @@
             const brailleInk = rowInkPerCell(8, 30, 38);
             const geoInk = rowInkPerCell(21, 30, 38);
             const symbolInk = rowInkPerCell(22, 30, 38);
+            const punctInk = rowInkPerCell(23, 30, 38);
             const brailleOk = brailleInk.filter(n => n > 0).length === 8;
             const geoOk = geoInk.filter(n => n > 0).length === 8;
             const symbolOk = symbolInk.filter(n => n > 0).length === 8;
+            const punctOk = punctInk.filter(n => n > 0).length === 8;
 
             // Orientation: 'T' has a horizontal bar at its TOP and a thin stem
             // descending below. If glyphs are mirrored across the horizontal
@@ -384,6 +387,7 @@
                 braille: { cells_with_ink: brailleInk.filter(n => n > 0).length },
                 blockgeo: { cells_with_ink: geoInk.filter(n => n > 0).length },
                 symbols: { cells_with_ink: symbolInk.filter(n => n > 0).length },
+                punctuation: { cells_with_ink: punctInk.filter(n => n > 0).length },
                 animate: { frame_deltas: frameDeltas, frame_ink: [f1Ink, f2Ink] },
                 version: (() => {
                     const v = callBoxedExport(version);
@@ -406,6 +410,7 @@
                 && brailleOk
                 && geoOk
                 && symbolOk
+                && punctOk
                 && animateOk
                 && dash.dimCols.length === 0
                 && pipe.dimRows.length === 0

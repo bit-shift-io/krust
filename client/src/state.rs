@@ -897,6 +897,38 @@ impl TerminalState {
         self.render()
     }
 
+    /// Recreate the entire WebGL2 renderer (shader program, buffers and glyph
+    /// atlas) from scratch on the currently bound context.
+    ///
+    /// Browsers may drop the WebGL context while a tab is hidden (Firefox does
+    /// this under memory pressure). Every GL object handle becomes invalid, so
+    /// `render()` on the old objects silently no-ops and the terminal freezes
+    /// as a blank canvas — which is what krust showed whenever the user
+    /// switched tabs away and back. After the browser fires
+    /// `webglcontextrestored`, calling this rebuilds all objects (keeping the
+    /// swapped-in system font) and the next `render()` paints a full frame.
+    pub(crate) fn rebuild_webgl(&mut self) -> Result<(), String> {
+        let Some(w) = self.webgl.as_ref() else {
+            return Ok(());
+        };
+        let font_bytes = w.font_bytes.clone();
+        let fallback_bytes = w.fallback_font_bytes.clone();
+        let dpr = ffi::window_dpr(ffi::window());
+        let mut fresh = renderer::WebGL2Renderer::new(
+            &self.canvas_id,
+            self.cell_width,
+            self.cell_height,
+            self.rows,
+            self.cols,
+            dpr,
+            &font_bytes,
+        )?;
+        fresh.fallback_font_bytes = fallback_bytes;
+        self.webgl = Some(fresh);
+        self.mark_all_dirty();
+        Ok(())
+    }
+
     /// Resize the underlying parser screen to `rows` x `cols`.
     pub(crate) fn resize_screen(&mut self, rows: u16, cols: u16) {
         let _ = self.parser.screen_mut().set_size(rows, cols);

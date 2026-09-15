@@ -427,6 +427,33 @@ pub extern "C" fn set_system_font(ptr: *const u8, len: usize) {
     });
 }
 
+/// Recreate the entire WebGL2 renderer (program, buffers, glyph atlas) after
+/// the browser restored a lost WebGL context. Fires from the page's
+/// `webglcontextrestored` handler: the browser drops every GL object when it
+/// loses the context (e.g. the tab was hidden), so all rendering silently
+/// stops until krust rebuilds them. Returns 1 on success (and triggers a full
+/// redraw), 0 when there is nothing to rebuild or the rebuild failed.
+#[no_mangle]
+pub extern "C" fn rebuild_webgl() -> i32 {
+    TERM_STATE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let Some(state) = guard.as_mut() else {
+            return 0;
+        };
+        match state.rebuild_webgl() {
+            Ok(()) => {
+                ffi::console_log("KRUST: WebGL2 renderer rebuilt after context restore");
+                let _ = state.render();
+                1
+            }
+            Err(e) => {
+                ffi::console_log(&format!("KRUST: WebGL2 rebuild failed: {}", e));
+                0
+            }
+        }
+    })
+}
+
 /// Free memory allocated by an exported function.
 /// # Parameters
 /// * `ptr` - Pointer to the start of the data

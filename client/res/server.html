@@ -27,7 +27,7 @@
             window.KRUST_RUNTIME.imports
         );
         window.KRUST_RUNTIME.install(wasm.instance.exports.memory);
-        const { init, set_renderer_mode, set_system_font, process_bytes, query_replies, handle_resize, repaint,
+        const { init, set_renderer_mode, set_system_font, rebuild_webgl, process_bytes, query_replies, handle_resize, repaint,
                 key_to_bytes, set_selection, selected_text, clear_selection,
                 scroll, scroll_to, scroll_to_bottom, scroll_to_top,
                 scroll_offset, scrollback_len, version,
@@ -158,6 +158,22 @@
 
         const status = document.getElementById('status');
         const canvas = document.getElementById('terminal-canvas');
+
+        // Recover from WebGL context loss (Firefox drops the context while the
+        // tab is hidden). `preventDefault()` opts into the browser restoring
+        // the context; without it the context is lost permanently and the
+        // terminal freezes as a blank canvas until reload. On restore, the
+        // browser has invalidated every GL object krust holds, so the whole
+        // WebGL2 renderer (program, buffers, glyph atlas) must be rebuilt
+        // before the next frame can paint anything.
+        canvas.addEventListener('webglcontextlost', (e) => {
+            e.preventDefault();
+            try { repaint(); } catch (_) {}
+        });
+        canvas.addEventListener('webglcontextrestored', () => {
+            try { rebuild_webgl(); } catch (_) {}
+            try { fit(); } catch (_) {}
+        });
 
         let lastTitle = 'krust | terminal';
         let lastRenderTime = 0;

@@ -69,6 +69,10 @@ const ATLAS_RANGES: &[AtlasRange] = &[
     AtlasRange { start: 0x2580, len: 128, offset: 496 },  // Block parts (U+2581-259F) + Geometric shapes (U+25A0-25FF)
     AtlasRange { start: 0x2700, len: 192, offset: 624 },  // Dingbats (✦ ✧ ✶ ✔)
     AtlasRange { start: 0x2800, len: 256, offset: 816 },  // Braille
+    AtlasRange { start: 0x00A0, len: 96, offset: 1072 },  // Latin-1 Supplement (· ° ± « »)
+    AtlasRange { start: 0x2000, len: 112, offset: 1168 }, // General Punctuation (… – — ‘ ’ “ ”)
+    AtlasRange { start: 0x20A0, len: 48, offset: 1280 },  // Currency (€ £ ¥)
+    AtlasRange { start: 0x2600, len: 256, offset: 1328 }, // Misc Symbols (☀ ⚙ ⚠ ★)
 ];
 
 /// Embedded monospace font used for glyph rasterization.
@@ -1121,10 +1125,10 @@ mod tests {
         let atlas = GlyphAtlas {
             texture: 0,
             atlas_width: 320,
-            atlas_height: 680,
+            atlas_height: 1000,
             glyph_width: 8,
             glyph_height: 18,
-            uv_map: (0..1072).map(|_| (0.25, 0.25, 0.75, 0.75)).collect(),
+            uv_map: (0..1584).map(|_| (0.25, 0.25, 0.75, 0.75)).collect(),
         };
         for (cp, _note) in [
             (0x41u32, "ASCII"),       // 'A'
@@ -1133,6 +1137,10 @@ mod tests {
             (0x21BBu32, "arrows"),    // ↻
             (0x22EFu32, "mathops"),   // ⋯
             (0x2736u32, "dingbats"),  // ✶
+            (0x00B7u32, "latin1"),    // ·
+            (0x2026u32, "punct"),     // …
+            (0x20ACu32, "currency"),  // €
+            (0x2699u32, "misc"),      // ⚙
         ] {
             let ch = char::from_u32(cp).unwrap();
             let uv = atlas
@@ -1142,6 +1150,35 @@ mod tests {
         }
         // Out-of-range codepoints stay None (defaults to invisible).
         assert!(atlas.uv_for('\u{1F600}').is_none());
+    }
+
+    /// The atlas ranges opencode's TUI regularly emits but that used to fall
+    /// between the ASCII, block and dingbat ranges must actually *bake ink*
+    /// (General Punctuation: … – — ‘’ “”; Latin-1: ·; Misc Symbols: ⚙). Before
+    /// these ranges were added the atlas resolved them via `uv_for` to `None`,
+    /// so the WebGL2 path drew them as blank cells even though the Canvas 2D
+    /// renderer (CSS font fallback) painted them fine.
+    #[test]
+    fn unicode_text_ranges_rasterize_ink() {
+        let f = font();
+        let (glyph_w, glyph_h): (u32, u32) = (8, 18);
+        for cp in [0x2026u32, 0x2013, 0x2014, 0x2018, 0x2019, 0x201C, 0x201D, 0x00B7, 0x20AC, 0x2699] {
+            let ch = char::from_u32(cp).unwrap();
+            let (top, bottom) = ink_bounds(ch, glyph_w, glyph_h);
+            assert!(
+                bottom >= top && top >= 0,
+                "U+{:04X} rasterizes no ink in an 8x18 slot",
+                cp
+            );
+            let has_outline = f
+                .outline_glyph(Glyph {
+                    id: f.glyph_id(ch),
+                    scale: PxScale::from(20.0),
+                    position: Point { x: 0.0, y: 0.0 },
+                })
+                .is_some();
+            assert!(has_outline, "Hack has no glyph for U+{:04X}", cp);
+        }
     }
 
     /// Arrow, math-operator and dingbat spinner glyphs (↻ ↺ ⇦ ⋯ ⊶ ✦ ✶) must

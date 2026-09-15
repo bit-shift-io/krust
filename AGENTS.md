@@ -104,6 +104,8 @@ the `krust` FFI registry.
 | `init(canvas_id_ptr, canvas_id_len)` | Initialize terminal, return JSON config (boxed pair) |
 | `process_bytes(bytes_ptr, bytes_len)` | Feed PTY output, render, return JSON summary (boxed pair) |
 | `query_replies(bytes_ptr, bytes_len)` | Detect DA1/DA2/CPR/OSC-11 queries, return reply bytes (boxed pair) |
+| `set_system_font(ptr, len)` | Install system TTF bytes, rebuild WebGL2 glyph atlas |
+| `rebuild_webgl()` | Recreate WebGL2 renderer after `webglcontextrestored` (i32 result) |
 | `repaint()` | Force redraw from current parser state |
 | `handle_resize(w, h)` | Update canvas dimensions, notify server |
 | `key_to_bytes(key_ptr, key_len, ctrl, alt, shift, meta)` | Map keyboard event to PTY bytes (boxed pair) |

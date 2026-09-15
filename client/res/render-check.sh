@@ -40,13 +40,24 @@ run_mode() {
     local mode="$1"
     PROFILE="${TMPDIR:-/tmp}/krust-chrome-profile-${mode}"
     rm -rf "$PROFILE"
-    timeout 60 "$CR" --headless=new --no-sandbox --disable-gpu \
-      --user-data-dir="$PROFILE" \
-      --virtual-time-budget=8000 \
-      --dump-dom "http://127.0.0.1:$PORT/res/render-test.html?r=${mode}" \
-      >"$OUT" 2>/dev/null || { echo "FAIL: chromium did not dump the page (${mode})"; exit 1; }
-    local json
-    json=$(grep -o '<pre id="result">[^<]*' "$OUT" | head -1 | sed 's/^<pre id="result">//')
+    # The page runs init + a full repaint before writing its result; cold
+    # starts (swiftshader compile, font raster) sometimes outrun the virtual
+    # time budget and dump a "loading..." DOM. Retry a few times rather than
+    # failing on a prematurely-dumped page.
+    local attempt json
+    for attempt in 1 2 3; do
+        timeout 60 "$CR" --headless=new --no-sandbox --disable-gpu \
+          --user-data-dir="$PROFILE" \
+          --virtual-time-budget=30000 \
+          --dump-dom "http://127.0.0.1:$PORT/res/render-test.html?r=${mode}" \
+          >"$OUT" 2>/dev/null || { echo "FAIL: chromium did not dump the page (${mode})"; exit 1; }
+        json=$(grep -o '<pre id="result">[^<]*' "$OUT" | head -1 | sed 's/^<pre id="result">//')
+        if echo "$json" | python3 -c 'import json,sys; s=sys.stdin.read(); json.loads(s); sys.exit(1 if s.startswith("loading") else 0)' 2>/dev/null; then
+            echo "$json"
+            return 0
+        fi
+        rm -rf "$PROFILE"
+    done
     if [ -z "$json" ]; then
         echo "FAIL: no KRTEST line in page dump (${mode}) (did the wasm build succeed?)"
         exit 1
