@@ -16,13 +16,39 @@ Two extra fixes were required beyond the original plan:
   location instead of the doc-root argument, because `render-check.sh`
   starts the server with the doc root at `client/`.
 
-Known limitation (out of scope for this plan): the WebGL2 glyph atlas does not
-cover every codepoint — it bakes fixed ranges (ASCII; Latin-1 Supplement;
-General Punctuation `…–—‘’“”`; Currency; box-drawing/geometric; arrows; math
-operators; misc symbols; dingbats `✓✦✶`; braille). Arbitrary Unicode outside
-those ranges (CJK, emoji, etc.) has no atlas entry (`uv_for` → `None`) and
-renders invisible under WebGL2 (the Canvas 2D path falls back to the system
-font via CSS).
+Known limitation: the WebGL2 glyph atlas does not cover every codepoint — it
+bakes fixed ranges (ASCII; Latin-1 Supplement; General Punctuation `…–—‘’“”`;
+Currency; box-drawing/geometric; arrows; math operators; misc symbols;
+dingbats `✓✦✶`; braille). Arbitrary Unicode outside those ranges (CJK, emoji,
+etc.) has no atlas entry (`uv_for` → `None`) and renders invisible under WebGL2
+(the Canvas 2D path falls back to the system font via CSS). Within the ranges,
+each slot is baked by the browser through the same Canvas 2D text engine and
+font stack the 2D path uses, so per-glyph system-font fallback applies inside
+the atlas too (see the font-pipeline migration note below).
+
+Font-pipeline migration (verified: client + server tests green; render-check
+for both `?r=gl` and `?r=2d`):
+- **Removed the embedded font and the whole `ab_glyph`/fontconfig path.** The
+  WebGL2 atlas no longer rasterizes `Hack-Regular.ttf` (deleted) with
+  `ab_glyph`, and the server no longer resolves/serves a system font over
+  `/system-font` (route, `SYSTEM_FONT_STACK`, `fc_match`,
+  `resolve_system_font`, `set_system_font`, and the HTML fetch all removed).
+  `GlyphAtlas::new` now bakes every slot with the browser's own Canvas 2D
+  `fillText` (via the existing `krust` FFI) using the shared
+  `measure::FONT_FAMILIES` stack at `FONT_SIZE_CSS * dpr` with
+  `textBaseline="middle"`, i.e. exactly how `state.rs` paints text — so the GL
+  and 2D renderers are identical by construction and missing glyphs resolve
+  through the browser's normal per-glyph fallback. Slots are drawn on an
+  isolated double-pitch grid and copied from one batched `getImageData` so
+  overhanging glyphs can't bleed. Braille is still synthesized (fonts can
+  collapse spinner frames to identical bitmaps) after the browser pass.
+  `ab_glyph` is dropped from `client/Cargo.toml`; glyph-shape checks now live
+  in `render-check.sh` (host tests can't rasterize without a DOM, and the old
+  `ab_glyph`-based ink/baseline tests were removed as false positives).
+- **`▣` U+25A3 synthesized as geometry.** Noto Sans Mono renders it
+  double-width (advance 1200 vs 600), so a single-cell font draw was clipped.
+  `graphics::graphic_cell_rects` now paints it as a hollow square frame plus a
+  centered filled square, on both renderers.
 
 Latest round of fixes (both verified under headless Chromium with WebGL2):
 - **WebGL context-loss recovery (tab-switch freeze).** Firefox drops the WebGL

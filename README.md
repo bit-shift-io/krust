@@ -74,9 +74,12 @@ krust/
 ├── client/                 # WASM client crate
 │   ├── Cargo.toml
 │   ├── src/                # lib.rs, exports.rs, state.rs, renderer.rs, ffi.rs, …
-│   ├── res/                # HTML pages, krust_runtime.js, test harness
-│   └── fonts/              # Embedded Hack-Regular.ttf (WebGL2 atlas)
+│   └── res/                # HTML pages, krust_runtime.js, test harness
 ```
+
+The WebGL2 renderer bakes its glyph atlas with the browser's own Canvas 2D text
+engine (the same font stack the 2D fallback paints with), so no font files are
+bundled and missing glyphs resolve through the browser's normal font fallback.
 
 ---
 

@@ -9,6 +9,18 @@ use crate::ffi::{self, JsHandle};
 /// Epsilon to prevent 1-pixel anti-aliasing gaps between adjacent cell rects
 pub(crate) const CELL_EPSILON: f64 = 0.5;
 
+/// CSS `font-family` list for the WebGL2 atlas rasterizer. It is the same
+/// family list as [`FONT_STACK`] (minus the size/line-height prefix), so the GL
+/// atlas and the Canvas 2D reference resolve identical families and per-glyph
+/// fallback. Only the wasm atlas rasterizer consumes it.
+#[cfg(target_arch = "wasm32")]
+pub(crate) const FONT_FAMILIES: &str =
+    "'JetBrains Mono', 'Fira Code', Menlo, Consolas, monospace";
+
+/// CSS font size (px) the Canvas 2D renderer draws text at. The WebGL2 atlas
+/// rasterizes glyphs at `FONT_SIZE_CSS * dpr` device px to match.
+pub(crate) const FONT_SIZE_CSS: f64 = 14.0;
+
 /// CSS font stack used by the canvas-2D glyph renderer (native vector text).
 pub(crate) const FONT_STACK: &str =
     "14px/18px 'JetBrains Mono', 'Fira Code', Menlo, Consolas, monospace";

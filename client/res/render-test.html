@@ -24,7 +24,7 @@
         );
         window.KRUST_RUNTIME.install(wasm.instance.exports.memory);
         const tInst = performance.now();
-        const { init, set_renderer_mode, set_system_font, process_bytes, repaint, handle_resize, version,
+        const { init, set_renderer_mode, process_bytes, repaint, handle_resize, version,
                 alloc, dealloc, free_memory, free_string, free_result } = wasm.instance.exports;
         const mem = wasm.instance.exports.memory;
 
@@ -66,8 +66,8 @@
             push('g'.repeat(10) + '\r\n');
             push('_'.repeat(10) + '\r\n');
             push('x'.repeat(10) + '\r\n');
-            push(' '.repeat(30) + '▮▍▎▏▪▸●◆\r\n');
-            push(' '.repeat(30) + '↻↺⇦⋯⊶✦✶✔\r\n');
+            push(' '.repeat(30) + '▮▍▎▏▪▸●▣\r\n');
+            push(' '.repeat(30) + '↻↺⇦⋯⊶✦✶✱\r\n');
             push(' '.repeat(30) + '…–—‘’“”·\r\n');
             const len = parts.reduce((n, p) => n + p.length, 0);
             const joined = new Uint8Array(len);
@@ -130,24 +130,6 @@
             const tInit = performance.now();
             handle_resize(800, 600);
             const tResize = performance.now();
-
-            // Mirror production (server.html): swap the embedded Hack atlas for
-            // the system monospace font the 2D reference paints with, so the GL
-            // checks test the font that actually ships.
-            const tFont0 = performance.now();
-            try {
-                const fr = await fetch('/system-font');
-                if (fr.ok) {
-                    const sb = new Uint8Array(await fr.arrayBuffer());
-                    const sp = alloc(sb.length);
-                    if (sp) {
-                        new Uint8Array(mem.buffer, sp, sb.length).set(sb);
-                        set_system_font(sp, sb.length);
-                        dealloc(sp, sb.length);
-                    }
-                }
-            } catch (_) {}
-            const tFont = performance.now();
 
             feedContent();
             const tFeed = performance.now();
@@ -375,8 +357,7 @@
                     fetch_ms: Math.round(tInst - tStart),
                     instantiate_ms: Math.round(tInit - tInst),
                     init_ms: Math.round(tResize - tInit),
-                    resize_ms: Math.round(tFont0 - tResize),
-                    font_ms: Math.round(tFont - tFont0),
+                    resize_ms: Math.round(tFeed - tResize),
                     feed_ms: Math.round(tRepaint - tFeed),
                     repaint_ms: Math.round(tRead - tRepaint),
                     total_ms: Math.round(tRead - tStart),

@@ -248,7 +248,6 @@ impl TerminalState {
                 DEFAULT_ROWS,
                 DEFAULT_COLS,
                 dpr,
-                renderer::EMBEDDED_FONT,
             ) {
                 Ok(w) => {
                     ffi::console_log(if mode == 1 {
@@ -881,22 +880,6 @@ impl TerminalState {
         self.cols = cols;
     }
 
-    /// Swap the WebGL2 renderer's rasterized font and rebuild its glyph atlas
-    /// (no-op on the Canvas 2D path, which paints via CSS fonts directly).
-    pub(crate) fn set_font_bytes(&mut self, bytes: Vec<u8>) -> Result<(), String> {
-        let Some(w) = self.webgl.as_mut() else {
-            return Ok(());
-        };
-        let prev = std::mem::replace(&mut w.font_bytes, bytes);
-        if let Err(e) = w.rebuild_atlas() {
-            w.font_bytes = prev;
-            return Err(e);
-        }
-        ffi::console_log("KRUST: system font applied to WebGL2 glyph atlas");
-        self.mark_all_dirty();
-        self.render()
-    }
-
     /// Recreate the entire WebGL2 renderer (shader program, buffers and glyph
     /// atlas) from scratch on the currently bound context.
     ///
@@ -905,25 +888,21 @@ impl TerminalState {
     /// `render()` on the old objects silently no-ops and the terminal freezes
     /// as a blank canvas — which is what krust showed whenever the user
     /// switched tabs away and back. After the browser fires
-    /// `webglcontextrestored`, calling this rebuilds all objects (keeping the
-    /// swapped-in system font) and the next `render()` paints a full frame.
+    /// `webglcontextrestored`, calling this rebuilds all objects and the next
+    /// `render()` paints a full frame.
     pub(crate) fn rebuild_webgl(&mut self) -> Result<(), String> {
-        let Some(w) = self.webgl.as_ref() else {
+        let Some(_) = self.webgl.as_ref() else {
             return Ok(());
         };
-        let font_bytes = w.font_bytes.clone();
-        let fallback_bytes = w.fallback_font_bytes.clone();
         let dpr = ffi::window_dpr(ffi::window());
-        let mut fresh = renderer::WebGL2Renderer::new(
+        let fresh = renderer::WebGL2Renderer::new(
             &self.canvas_id,
             self.cell_width,
             self.cell_height,
             self.rows,
             self.cols,
             dpr,
-            &font_bytes,
         )?;
-        fresh.fallback_font_bytes = fallback_bytes;
         self.webgl = Some(fresh);
         self.mark_all_dirty();
         Ok(())

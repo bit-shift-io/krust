@@ -172,6 +172,28 @@ pub(crate) fn graphic_cell_rects(
         let h = (fy1 - fy0) * ch + eps * 2.0;
         return Some(vec![(x, y, w, h, alpha)]);
     }
+    // ▣ U+25A3 (white square containing black small square) is synthesized as a
+    // hollow square frame plus a centered filled square. Some monospace fonts
+    // (e.g. Noto Sans Mono) render it double-width, so the font path would clip
+    // it across a single cell; geometry keeps it square and centered on both
+    // renderers.
+    if c == '\u{25A3}' {
+        let side = (cw.min(ch) * 0.8).max(1.0);
+        let (x0, y0) = (ox + (cw - side) * 0.5, oy + (ch - side) * 0.5);
+        let x1 = x0 + side;
+        let y1 = y0 + side;
+        let t = (side * 0.16).max(1.0);
+        let cx = ox + cw * 0.5;
+        let cy = oy + ch * 0.5;
+        let inner = side * 0.34;
+        return Some(vec![
+            (x0 - eps, y0 - eps, side + eps * 2.0, t + eps, 1.0),
+            (x0 - eps, y1 - t - eps, side + eps * 2.0, t + eps, 1.0),
+            (x0 - eps, y0 - eps, t + eps, side + eps * 2.0, 1.0),
+            (x1 - t - eps, y0 - eps, t + eps, side + eps * 2.0, 1.0),
+            (cx - inner * 0.5, cy - inner * 0.5, inner, inner, 1.0),
+        ]);
+    }
     let (bar, stem, weight) = box_geometry(c)?;
     let (t_css, gap_css) = box_line_width(weight);
     let t = t_css * scale;
@@ -302,5 +324,30 @@ mod tests {
             "└ stem must point down, painted above mid {}",
             mid
         );
+    }
+
+    #[test]
+    fn small_square_in_square_is_a_frame_plus_centered_fill() {
+        let (ox, oy, cw, ch, scale) = (0.0f64, 100.0f64, 8.0f64, 18.0f64, 1.0);
+        let rects = graphic_cell_rects('\u{25A3}', ox, oy, cw, ch, scale).unwrap();
+        assert!(
+            rects.len() >= 5,
+            "▣ needs a frame (4 bars) plus an inner fill, got {}",
+            rects.len()
+        );
+        let cx = ox + cw * 0.5;
+        let cy = oy + ch * 0.5;
+        // The last rect is the inner fill: centered and clearly smaller than the
+        // cell (so it reads as ▣ rather than a solid block).
+        let inner = rects[rects.len() - 1];
+        assert!((inner.0 + inner.2 * 0.5 - cx).abs() < 0.5);
+        assert!((inner.1 + inner.3 * 0.5 - cy).abs() < 0.5);
+        assert!(inner.2 < cw * 0.6 && inner.3 < ch * 0.6);
+        // The frame's outer extents stay within the cell (plus the seam eps).
+        for r in &rects {
+            assert!(r.0 >= ox - 1.0 && r.1 >= oy - 1.0);
+            assert!(r.0 + r.2 <= ox + cw + 1.0);
+            assert!(r.1 + r.3 <= oy + ch + 1.0);
+        }
     }
 }

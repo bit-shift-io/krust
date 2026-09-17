@@ -21,9 +21,9 @@ cell grid onto a `<canvas>` — WebGL2 by default, Canvas 2D as fallback.
 * **Server:** Rust, Tokio (`full`), Axum (`ws`), `portable-pty`, `tower-http`
   (permissive CORS), `futures-util`, `serde`/`serde_json`
 * **Client:** Rust compiled to raw WASM (`wasm32-unknown-unknown`, no
-  `wasm-bindgen`/`web-sys`/`js-sys`), `vt100` parser crate, `ab_glyph` (WebGL2
-  glyph atlas); the DOM/Canvas/WebGL2 APIs are reached through a hand-written
-  FFI import module (`krust`) implemented in `client/res/krust_runtime.js`
+  `wasm-bindgen`/`web-sys`/`js-sys`), `vt100` parser crate (no font crates); the
+  DOM/Canvas/WebGL2 APIs are reached through a hand-written FFI import module
+  (`krust`) implemented in `client/res/krust_runtime.js`
 * **Rendering:** WebGL2 primary (two-pass instanced quads with a rasterized
   glyph atlas + geometry-drawn box/block glyphs); Canvas 2D fallback when
   WebGL2 is unavailable
@@ -54,9 +54,7 @@ No grid state ever crosses the wire — the parser is the frame delimiter.
 │       ├── main.rs          # Axum router, PTY sessions, WebSocket handler, tests
 │       └── handlers.rs      # HTTP/WS handlers; embeds server.html, krust_runtime.js, the wasm
 └── client/
-    ├── Cargo.toml           # vt100/ab_glyph deps (no wasm-bindgen)
-    ├── fonts/
-    │   └── Hack-Regular.ttf # Embedded monospace font (include_bytes!)
+    ├── Cargo.toml           # vt100 deps only (no wasm-bindgen, no font crates)
     ├── src/
     │   ├── lib.rs           # Module root + re-exports + tests
     │   ├── ffi.rs           # Raw `extern "C"` imports from the `krust` JS module
@@ -158,25 +156,20 @@ obtained. On init it logs `KRUST: WebGL2 renderer initialized` or
 
 ### 3.4 WebGL2 Renderer (`client/src/renderer.rs`, primary path)
 
-* **Font atlas (`GlyphAtlas`):** a fixed set of Unicode **ranges** is
-  rasterized at init from `EMBEDDED_FONT` (`client/fonts/Hack-Regular.ttf`,
-  shipped via `include_bytes!`) — ASCII, Latin-1 Supplement, General
-  Punctuation (`…–—‘’“”`), Currency, Arrows, Math Operators, Misc Symbols,
-  Blocks/Geometric, Dingbats (`✓✦✶`) and Braille (1072–1584 slots total).
-  Codepoints outside these ranges resolve to no atlas entry (`uv_for` → `None`)
-  and render as blank cells; the Canvas 2D path instead falls back to the
-  system font via CSS. `ab_glyph` handles layout; glyphs land in a
-  WebGL2 texture. Each glyph is rasterized at an em scale derived from the
-  **cell width** (`em = glyph_w / h_advance(1.0)`), so every character
-  advances exactly one cell width — the same monospace invariant the Canvas 2D
-  path gets from its font — instead of an em sized to the cell height (whose
-  wider advance overflowed the slot and made wide glyphs touch the next cell
-  while narrow ones left uneven gaps). All glyphs share a single text
-  **baseline** (placement is offset by the ascent, so descenders hang below
-  the line instead of every glyph being glued to the top of its cell); the
-  atlas UV rows are swapped when uploading so glyphs render upright. The atlas
-  is the alpha source for every text pass; a reserved opaque texel supplies
-  flat fills for graphic cells.
+* **Font atlas (`GlyphAtlas`):** a fixed set of Unicode **ranges** is baked at
+  init — ASCII, Latin-1 Supplement, General Punctuation (`…–—‘’“”`), Currency,
+  Arrows, Math Operators, Misc Symbols, Blocks/Geometric, Dingbats (`✓✦✶`) and
+  Braille (1072–1584 slots total). Slots are rasterized by the browser's own
+  Canvas 2D text engine via the shared FFI, drawing each codepoint with the
+  same font stack and size the Canvas 2D fallback paints with
+  (`measure::FONT_FAMILIES` / `FONT_SIZE_CSS`), so the GL path and the 2D
+  reference produce identical glyphs and missing glyphs resolve through the
+  browser's normal per-glyph font fallback. No font file is embedded and no
+  font crate is linked. Braille slots are overwritten with synthesized 2×4 dot
+  grids (fonts can collapse spinner frames to identical bitmaps). Codepoints
+  outside these ranges resolve to no atlas entry (`uv_for` → `None`) and render
+  as blank cells on the GL path. The atlas is the alpha source for every text
+  pass; a reserved opaque texel supplies flat fills for graphic cells.
 * **Context-loss recovery:** browsers may drop the WebGL context while a tab is
   hidden (Firefox does under memory pressure), which invalidates every GL
   object. `server.html` opts into restoration with
@@ -310,7 +303,6 @@ whichever renderer is active.
 | `client/src/query.rs` | DA1/DA2/CPR/OSC-11 reply detection |
 | `client/src/selection.rs` | Selection range + text extraction |
 | `client/res/krust_runtime.js` | Browser FFI runtime (`window.KRUST_RUNTIME`) |
-| `client/fonts/Hack-Regular.ttf` | Embedded font for the WebGL2 atlas |
 | `client/res/server.html` | Production HTML page (served at `/`) |
 | `client/res/render-check.sh` | Headless-Chromium pixel verification |
 | `client/res/render-test.html` | Pixel-assertion test page |
