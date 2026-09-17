@@ -58,6 +58,14 @@ documents (ARCHITECTURE.md, NOTES.md) are stale and should be ignored.
   as `(ptr, len)` pairs allocated with `alloc` and freed with `free_string` /
   `free_result`; the runtime keeps `i32` handles into a heap registry
   (0 = null).
+- **Glyph atlas:** no font is embedded and no font crate is linked. The
+  WebGL2 atlas is baked with the browser's own Canvas 2D `fillText` via the
+  shared FFI: fixed Unicode ranges at init plus a dynamic region for
+  arbitrary codepoints (CJK/emoji), rasterized on demand and LRU-evicted
+  (`GlyphAtlas::ensure_glyphs`, `gl.texSubImage2D`). `WebGL2Renderer::render`
+  is `&mut self` so it can bake newly seen glyphs before drawing. `▣`
+  (`graphics.rs`) and braille (`renderer.rs`) are synthesized, not
+  font-rendered.
 - **Tests:** Unit tests live alongside code in `#[cfg(test)] mod tests`.
   Server tests use `tower::util::ServiceExt` for one-shot HTTP requests.
 - **CORS:** `tower-http::cors::CorsLayer::permissive()` is enabled on all

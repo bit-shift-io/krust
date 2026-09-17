@@ -78,6 +78,22 @@ extern "C" {
         ptr: *const u8,
         len: usize,
     );
+    #[cfg(target_arch = "wasm32")]
+    fn krust_gl_tex_sub_image_2d_alpha(
+        gl: i32,
+        target: u32,
+        level: i32,
+        xoffset: i32,
+        yoffset: i32,
+        w: i32,
+        h: i32,
+        format: u32,
+        type_: u32,
+        ptr: *const u8,
+        len: usize,
+    );
+    #[cfg(target_arch = "wasm32")]
+    fn krust_gl_pixel_storei(gl: i32, pname: u32, param: i32);
     fn krust_gl_active_texture(gl: i32, unit: u32);
     fn krust_gl_uniform1f(gl: i32, loc: i32, f: f32);
     fn krust_gl_uniform1i(gl: i32, loc: i32, i: i32);
@@ -329,6 +345,35 @@ pub(crate) fn gl_tex_image_2d_alpha(
             data.as_ptr(), data.len(),
         )
     }
+}
+
+/// `gl.texSubImage2D(..., UNSIGNED_BYTE, src)` into an `ALPHA`-format texture.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn gl_tex_sub_image_2d_alpha(
+    gl: JsHandle,
+    target: u32,
+    level: i32,
+    xoffset: i32,
+    yoffset: i32,
+    w: i32,
+    h: i32,
+    format: u32,
+    type_: u32,
+    data: &[u8],
+) {
+    unsafe {
+        krust_gl_tex_sub_image_2d_alpha(
+            gl, target, level, xoffset, yoffset, w, h, format, type_,
+            data.as_ptr(), data.len(),
+        )
+    }
+}
+
+/// `gl.pixelStorei(pname, param)` — used to set `UNPACK_ALIGNMENT = 1` before
+/// uploading glyph rows whose width is not a multiple of 4.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn gl_pixel_storei(gl: JsHandle, pname: u32, param: i32) {
+    unsafe { krust_gl_pixel_storei(gl, pname, param) }
 }
 
 pub(crate) fn gl_active_texture(gl: JsHandle, unit: u32) {

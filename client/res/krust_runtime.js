@@ -160,6 +160,12 @@ window.KRUST_RUNTIME = (function () {
     krust_gl_tex_image_2d_alpha: (gl, target, level, ifmt, w, h, border, format, type, p, len) => {
       getObject(gl).texImage2D(target, level, ifmt, w, h, border, format, type, u8view(p, len));
     },
+    krust_gl_tex_sub_image_2d_alpha: (gl, target, level, x, y, w, h, format, type, p, len) => {
+      getObject(gl).texSubImage2D(target, level, x, y, w, h, format, type, u8view(p, len));
+    },
+    krust_gl_pixel_storei: (gl, pname, param) => {
+      getObject(gl).pixelStorei(pname, param);
+    },
     krust_gl_active_texture: (gl, unit) => {
       getObject(gl).activeTexture(unit);
     },

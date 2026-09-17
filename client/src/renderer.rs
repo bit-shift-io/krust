@@ -54,6 +54,14 @@ const TRIANGLE_STRIP: u32 = 0x0005;
 const ATLAS_PADDING: u32 = 2;
 const ATLAS_COLS: usize = 32;
 
+/// Rows reserved at the bottom of the atlas for glyphs baked on demand
+/// (codepoints outside [`ATLAS_RANGES`], e.g. CJK/emoji). Each row holds
+/// [`ATLAS_COLS`] slots; when full, the least-recently-used glyph is evicted
+/// and re-baked if it appears again.
+const DYNAMIC_ROWS: u32 = 32;
+#[cfg(target_arch = "wasm32")]
+const UNPACK_ALIGNMENT: u32 = 0x0CF5;
+
 /// A contiguous range of codepoints baked into the atlas.
 struct AtlasRange {
     start: u32,
@@ -144,6 +152,28 @@ pub struct GlyphAtlas {
     pub glyph_width: u32,
     pub glyph_height: u32,
     pub uv_map: Vec<(f32, f32, f32, f32)>,
+    /// Device-pixel scale, kept so on-demand glyphs bake at the same size as
+    /// the pre-baked static glyphs.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    dpr: f64,
+    /// First atlas slot index of the on-demand region (a row boundary, so it
+    /// may exceed the static slot count).
+    dynamic_base: u32,
+    /// Char occupying each dynamic slot (`None` when free).
+    dynamic_slots: Vec<Option<char>>,
+    /// Reverse lookup from a dynamically baked char to its slot.
+    dynamic_index: std::collections::HashMap<char, u32>,
+    /// Last frame each dynamic slot was referenced, for LRU eviction.
+    dynamic_stamp: Vec<u64>,
+    frame: u64,
+}
+
+/// True when `cp` is covered by the pre-baked static ranges, in which case it
+/// never needs the on-demand region.
+fn is_static_cp(cp: u32) -> bool {
+    ATLAS_RANGES
+        .iter()
+        .any(|r| cp >= r.start && cp < r.start + r.len)
 }
 
 impl GlyphAtlas {
@@ -154,7 +184,8 @@ impl GlyphAtlas {
         // Count total glyphs across all ranges.
         let total: u32 = ATLAS_RANGES.iter().map(|r| r.len).sum();
         let cols = ATLAS_COLS as u32;
-        let rows = (total + cols - 1) / cols;
+        let static_rows = (total + cols - 1) / cols;
+        let rows = static_rows + DYNAMIC_ROWS;
         let atlas_w = cols * (glyph_w + ATLAS_PADDING);
         let atlas_h = rows * (glyph_h + ATLAS_PADDING);
 
@@ -216,6 +247,8 @@ impl GlyphAtlas {
 
         let texture = Self::upload_texture(gl, &data, atlas_w, atlas_h)?;
 
+        let dynamic_base = static_rows * cols;
+        let dynamic_capacity = (DYNAMIC_ROWS * cols) as usize;
         Ok(GlyphAtlas {
             texture,
             atlas_width: atlas_w,
@@ -223,6 +256,12 @@ impl GlyphAtlas {
             glyph_width: glyph_w,
             glyph_height: glyph_h,
             uv_map,
+            dpr,
+            dynamic_base,
+            dynamic_slots: vec![None; dynamic_capacity],
+            dynamic_index: std::collections::HashMap::new(),
+            dynamic_stamp: vec![0; dynamic_capacity],
+            frame: 0,
         })
     }
 
@@ -435,6 +474,25 @@ impl GlyphAtlas {
         Ok(texture)
     }
 
+    /// Pixel origin of atlas slot `idx` (static or dynamic).
+    fn slot_px(&self, idx: u32) -> (u32, u32) {
+        let cols = ATLAS_COLS as u32;
+        (
+            (idx % cols) * (self.glyph_width + ATLAS_PADDING),
+            (idx / cols) * (self.glyph_height + ATLAS_PADDING),
+        )
+    }
+
+    /// UV quad for atlas slot `idx`.
+    fn slot_uv(&self, idx: u32) -> (f32, f32, f32, f32) {
+        let (x, y) = self.slot_px(idx);
+        let u0 = x as f32 / self.atlas_width as f32;
+        let v0 = y as f32 / self.atlas_height as f32;
+        let u1 = (x + self.glyph_width) as f32 / self.atlas_width as f32;
+        let v1 = (y + self.glyph_height) as f32 / self.atlas_height as f32;
+        (u0, v1, u1, v0)
+    }
+
     pub fn uv_for(&self, ch: char) -> Option<(f32, f32, f32, f32)> {
         let cp = ch as u32;
         for range in ATLAS_RANGES {
@@ -443,7 +501,9 @@ impl GlyphAtlas {
                 return self.uv_map.get(idx).copied();
             }
         }
-        None
+        self.dynamic_index
+            .get(&ch)
+            .map(|&slot| self.slot_uv(self.dynamic_base + slot))
     }
 
     /// UV quad centered on the reserved opaque texel, for flat-color fills.
@@ -451,6 +511,176 @@ impl GlyphAtlas {
         let u = (self.atlas_width as f32 - 0.5) / self.atlas_width as f32;
         let v = (self.atlas_height as f32 - 0.5) / self.atlas_height as f32;
         (u, v, u, v)
+    }
+
+    /// Advance the LRU frame and return the codepoints in `needed` that are not
+    /// yet in the atlas (static ranges excluded, deduplicated). Chars already in
+    /// the dynamic region are stamped as used.
+    fn plan_missing(&mut self, needed: &[char]) -> Vec<char> {
+        self.frame = self.frame.wrapping_add(1);
+        let mut to_bake: Vec<char> = Vec::new();
+        for &ch in needed {
+            if is_static_cp(ch as u32) {
+                continue;
+            }
+            if let Some(&slot) = self.dynamic_index.get(&ch) {
+                self.dynamic_stamp[slot as usize] = self.frame;
+                continue;
+            }
+            if !to_bake.contains(&ch) {
+                to_bake.push(ch);
+            }
+        }
+        to_bake
+    }
+
+    /// Allocate a dynamic slot per char, evicting the least-recently-used slot
+    /// when the region is full, and return the char→slot assignments to bake.
+    fn assign_slots(&mut self, to_bake: &[char]) -> Vec<(char, u32)> {
+        let mut out = Vec::with_capacity(to_bake.len());
+        for &ch in to_bake {
+            let slot = if let Some(i) = self.dynamic_slots.iter().position(|s| s.is_none()) {
+                i as u32
+            } else {
+                let mut oldest = 0usize;
+                let mut oldest_stamp = u64::MAX;
+                for (i, &stamp) in self.dynamic_stamp.iter().enumerate() {
+                    if stamp < oldest_stamp {
+                        oldest_stamp = stamp;
+                        oldest = i;
+                    }
+                }
+                if let Some(evicted) = self.dynamic_slots[oldest] {
+                    self.dynamic_index.remove(&evicted);
+                }
+                oldest as u32
+            };
+            self.dynamic_slots[slot as usize] = Some(ch);
+            self.dynamic_index.insert(ch, slot);
+            self.dynamic_stamp[slot as usize] = self.frame;
+            out.push((ch, slot));
+        }
+        out
+    }
+
+    /// Bake codepoints outside [`ATLAS_RANGES`] into the dynamic region using
+    /// the same browser Canvas 2D engine as the static pass, then upload the
+    /// results with `texSubImage2D`. Bounded work: only newly seen chars are
+    /// rasterized, and evicted ones are re-baked if they reappear.
+    #[cfg(target_arch = "wasm32")]
+    pub fn ensure_glyphs(&mut self, gl: JsHandle, needed: &[char]) -> Result<(), String> {
+        let to_bake = self.plan_missing(needed);
+        if to_bake.is_empty() {
+            return Ok(());
+        }
+        let assignments = self.assign_slots(&to_bake);
+        let font_px = FONT_SIZE_CSS * self.dpr;
+        let gw = self.glyph_width;
+        let gh = self.glyph_height;
+
+        ffi::gl_bind_texture(gl, TEXTURE_2D, self.texture);
+        ffi::gl_pixel_storei(gl, UNPACK_ALIGNMENT, 1);
+        // Chunk so one wide scratch canvas never exceeds the browser's limit.
+        for chunk in assignments.chunks(128) {
+            let bitmaps = Self::rasterize_dynamic(chunk, gw, gh, font_px);
+            if bitmaps.len() != chunk.len() {
+                continue;
+            }
+            for ((_, slot), bmp) in chunk.iter().zip(bitmaps) {
+                let (x, y) = self.slot_px(self.dynamic_base + slot);
+                ffi::gl_tex_sub_image_2d_alpha(
+                    gl,
+                    TEXTURE_2D,
+                    0,
+                    x as i32,
+                    y as i32,
+                    gw as i32,
+                    gh as i32,
+                    ALPHA,
+                    UNSIGNED_BYTE,
+                    &bmp,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Host-test stub: assign slots so `uv_for` resolves, but skip the DOM
+    /// rasterization and GL upload (those FFI imports don't exist off-wasm).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn ensure_glyphs(&mut self, _gl: JsHandle, needed: &[char]) -> Result<(), String> {
+        let to_bake = self.plan_missing(needed);
+        if !to_bake.is_empty() {
+            self.assign_slots(&to_bake);
+        }
+        Ok(())
+    }
+
+    /// Rasterize one glyph per horizontal slot into an RGBA scratch canvas and
+    /// return each glyph's `glyph_w × glyph_h` alpha bitmap.
+    #[cfg(target_arch = "wasm32")]
+    fn rasterize_dynamic(
+        assignments: &[(char, u32)],
+        glyph_w: u32,
+        glyph_h: u32,
+        font_px: f64,
+    ) -> Vec<Vec<u8>> {
+        let win = ffi::window();
+        if win == 0 {
+            return Vec::new();
+        }
+        let doc = ffi::window_document(win);
+        if doc == 0 {
+            return Vec::new();
+        }
+        let canvas = ffi::document_create_canvas(doc);
+        if canvas == 0 {
+            return Vec::new();
+        }
+
+        let pitch_x = glyph_w * 2;
+        let pitch_y = glyph_h * 2;
+        let out_w = assignments.len() as u32 * pitch_x;
+        ffi::canvas_set_width(canvas, out_w);
+        ffi::canvas_set_height(canvas, pitch_y);
+        let ctx = ffi::canvas_get_2d(canvas);
+        if ctx == 0 {
+            ffi::release(canvas);
+            return Vec::new();
+        }
+        ffi::ctx_set_font(ctx, &format!("{}px {}", font_px, FONT_FAMILIES));
+        ffi::ctx_set_fill_style(ctx, "#ffffff");
+        ffi::ctx_set_text_baseline(ctx, "middle");
+        for (i, (ch, _)) in assignments.iter().enumerate() {
+            ffi::ctx_fill_text(
+                ctx,
+                &ch.to_string(),
+                (i as u32 * pitch_x) as f64,
+                glyph_h as f64 * 0.5,
+            );
+        }
+
+        let mut px = vec![0u8; (out_w * pitch_y * 4) as usize];
+        let written = ffi::ctx_get_image_data(ctx, 0.0, 0.0, out_w as f64, pitch_y as f64, &mut px);
+        ffi::release(ctx);
+        ffi::release(canvas);
+        if written < px.len() {
+            return Vec::new();
+        }
+
+        let mut out = Vec::with_capacity(assignments.len());
+        for i in 0..assignments.len() {
+            let mut bmp = vec![0u8; (glyph_w * glyph_h) as usize];
+            let sx = i as u32 * pitch_x;
+            for gy in 0..glyph_h {
+                for gx in 0..glyph_w {
+                    bmp[(gy * glyph_w + gx) as usize] =
+                        px[(((gy * out_w + sx + gx) as usize) * 4) + 3];
+                }
+            }
+            out.push(bmp);
+        }
+        out
     }
 
     pub fn rebuild(
@@ -462,12 +692,7 @@ impl GlyphAtlas {
     ) -> Result<(), String> {
         let new_atlas = Self::new(gl, cell_w, cell_h, dpr)?;
         ffi::gl_delete_texture(gl, self.texture);
-        self.texture = new_atlas.texture;
-        self.atlas_width = new_atlas.atlas_width;
-        self.atlas_height = new_atlas.atlas_height;
-        self.glyph_width = new_atlas.glyph_width;
-        self.glyph_height = new_atlas.glyph_height;
-        self.uv_map = new_atlas.uv_map;
+        *self = new_atlas;
         Ok(())
     }
 }
@@ -641,7 +866,7 @@ impl WebGL2Renderer {
     }
 
     pub fn render(
-        &self,
+        &mut self,
         screen: &vt100::Screen,
         default_fg: u32,
         default_bg: u32,
@@ -655,6 +880,26 @@ impl WebGL2Renderer {
         let cols = rcols as u32;
 
         let gl = self.ctx;
+
+        // Bake any codepoint on screen that isn't in the static ranges into the
+        // on-demand atlas region, so the GL path renders the full Unicode range
+        // exactly like the Canvas 2D fallback.
+        let mut needed: Vec<char> = Vec::new();
+        for r in 0..rows {
+            for c in 0..cols {
+                if r < prows as u32 && c < pcols as u32 {
+                    if let Some(cell) = screen.cell(r as u16, c as u16) {
+                        if let Some(ch) = cell.contents().chars().next() {
+                            if !is_static_cp(ch as u32) && !needed.contains(&ch) {
+                                needed.push(ch);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.atlas.ensure_glyphs(gl, &needed)?;
+
         // Use the full drawing buffer as the viewport so the destination rect
         // always matches it (avoids Firefox's "Drawing to a destination rect
         // smaller than the viewport rect" warning). The grid is laid out from
@@ -875,13 +1120,20 @@ mod tests {
     use super::*;
 
     fn scratch_atlas() -> GlyphAtlas {
+        let cap = DYNAMIC_ROWS as usize * ATLAS_COLS;
         GlyphAtlas {
             texture: 0,
             atlas_width: 320,
-            atlas_height: 1000,
+            atlas_height: 1640,
             glyph_width: 8,
             glyph_height: 18,
             uv_map: (0..1584).map(|_| (0.25, 0.25, 0.75, 0.75)).collect(),
+            dpr: 1.0,
+            dynamic_base: 1584,
+            dynamic_slots: vec![None; cap],
+            dynamic_index: std::collections::HashMap::new(),
+            dynamic_stamp: vec![0; cap],
+            frame: 0,
         }
     }
 
@@ -912,6 +1164,52 @@ mod tests {
         }
         // Out-of-range codepoints stay None (defaults to invisible).
         assert!(atlas.uv_for('\u{1F600}').is_none());
+    }
+
+    /// Codepoints outside the static ranges must resolve after being baked on
+    /// demand (host stub assigns slots without touching the DOM/GL).
+    #[test]
+    fn uv_for_resolves_dynamically_baked_codepoints() {
+        let mut atlas = scratch_atlas();
+        for ch in ['\u{4E2D}', '\u{1F600}', '\u{FB01}'] {
+            assert!(atlas.uv_for(ch).is_none(), "{:?} resolved before baking", ch);
+        }
+        atlas.ensure_glyphs(0, &['\u{4E2D}', '\u{1F600}', '\u{FB01}']).unwrap();
+        for ch in ['\u{4E2D}', '\u{1F600}', '\u{FB01}'] {
+            let uv = atlas.uv_for(ch).unwrap_or_else(|| panic!("{:?} = None", ch));
+            // (u_left, v_bottom, u_right, v_top): left < right, bottom > top.
+            assert!(uv.0 < uv.2 && uv.1 > uv.3, "{:?} got degenerate UV {:?}", ch, uv);
+        }
+    }
+
+    /// Static codepoints never consume on-demand slots.
+    #[test]
+    fn static_codepoints_never_use_dynamic_slots() {
+        let mut atlas = scratch_atlas();
+        atlas.ensure_glyphs(0, &['A', ' ', '\u{25A3}', '\u{2731}']).unwrap();
+        assert!(atlas.dynamic_index.is_empty(), "static chars entered the dynamic region");
+    }
+
+    /// Filling the dynamic region then adding one more distinct char must evict
+    /// the least-recently-used slot and keep recently touched glyphs.
+    #[test]
+    fn dynamic_slots_evict_least_recently_used() {
+        let mut atlas = scratch_atlas();
+        let cap = atlas.dynamic_slots.len();
+        let chars: Vec<char> = (0..cap as u32)
+            .map(|i| char::from_u32(0x4E00 + i).unwrap())
+            .collect();
+        atlas.ensure_glyphs(0, &chars).unwrap();
+        assert!(atlas.uv_for(chars[0]).is_some());
+
+        // Touch the first char so it becomes the most recently used.
+        atlas.ensure_glyphs(0, &[chars[0]]).unwrap();
+
+        let extra = '\u{9FA5}';
+        atlas.ensure_glyphs(0, &[extra]).unwrap();
+        assert!(atlas.uv_for(extra).is_some(), "new char was not baked");
+        assert!(atlas.uv_for(chars[0]).is_some(), "recently used char was evicted");
+        assert!(atlas.uv_for(chars[1]).is_none(), "LRU char was not evicted");
     }
 
     /// Without a DOM (host tests) the browser rasterizer must be a no-op: it

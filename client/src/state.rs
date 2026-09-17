@@ -506,23 +506,28 @@ impl TerminalState {
         // flag only controls full vs selective strategy inside render_canvas2d.
         self.needs_render = false;
         self.apply_scrollback();
-        if let Some(w) = self.webgl.as_ref() {
-            let screen = self.parser.screen();
-            let (cr, cc) = screen.cursor_position();
+        if self.webgl.is_some() {
+            // Compute everything that borrows `self` before taking the mutable
+            // WebGL borrow, which may bake new glyphs into the atlas.
+            let scroll_offset = self.active_scroll_offset();
+            let selection = self.selection_cells();
+            let (cr, cc) = self.parser.screen().cursor_position();
             // Hide the block cursor when scrolled into history.
-            let cursor = if self.active_scroll_offset() == 0 {
+            let cursor = if scroll_offset == 0 {
                 (cr, cc)
             } else {
                 (u16::MAX, u16::MAX)
             };
-            let selection = self.selection_cells();
-            return w.render(
-                screen,
-                DEFAULT_FG,
-                DEFAULT_BG,
-                &selection,
-                cursor,
-            );
+            let screen = self.parser.screen();
+            if let Some(w) = self.webgl.as_mut() {
+                return w.render(
+                    screen,
+                    DEFAULT_FG,
+                    DEFAULT_BG,
+                    &selection,
+                    cursor,
+                );
+            }
         }
         self.render_canvas2d()
     }

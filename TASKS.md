@@ -2,8 +2,8 @@
 
 ## Status: COMPLETE
 
-All five tasks are done and verified: `cargo test` (11 server + 46 client
-tests) passes, `cargo build` is clean, and `render-check.sh` is green under
+All five tasks are done and verified: `cargo test --workspace` (11 server + 59
+client tests) passes, `cargo build` is clean, and `render-check.sh` is green under
 headless Chromium with the WebGL2 renderer active — the new per-cell text
 assertion reports `min_ink_per_cell: 17, cells_with_ink: 8`.
 
@@ -16,15 +16,19 @@ Two extra fixes were required beyond the original plan:
   location instead of the doc-root argument, because `render-check.sh`
   starts the server with the doc root at `client/`.
 
-Known limitation: the WebGL2 glyph atlas does not cover every codepoint — it
-bakes fixed ranges (ASCII; Latin-1 Supplement; General Punctuation `…–—‘’“”`;
-Currency; box-drawing/geometric; arrows; math operators; misc symbols;
-dingbats `✓✦✶`; braille). Arbitrary Unicode outside those ranges (CJK, emoji,
-etc.) has no atlas entry (`uv_for` → `None`) and renders invisible under WebGL2
-(the Canvas 2D path falls back to the system font via CSS). Within the ranges,
-each slot is baked by the browser through the same Canvas 2D text engine and
-font stack the 2D path uses, so per-glyph system-font fallback applies inside
-the atlas too (see the font-pipeline migration note below).
+Glyph coverage: the WebGL2 glyph atlas bakes fixed ranges at init (ASCII;
+Latin-1 Supplement; General Punctuation `…–‘’“”`; Currency;
+box-drawing/geometric; arrows; math operators; misc symbols; dingbats `✓✦✶`;
+braille) and reserves a dynamic region (32 rows = 1024 slots) for everything
+else. Each frame `render()` collects the screen's non-static codepoints and
+`GlyphAtlas::ensure_glyphs` rasterizes the newly seen ones with the same
+browser Canvas 2D engine the static pass uses, uploading them via
+`gl.texSubImage2D`. Slots are LRU-evicted when the region is full and re-baked
+if they reappear, so the GL path now renders arbitrary Unicode (CJK, emoji, …)
+like the Canvas 2D fallback. Baking all codepoints up front is deliberately not
+done — the whole BMP is ≈13 MB and a ~41k px-tall texture, past WebGL's texture
+limit. Per-glyph system-font fallback applies within the atlas too (see the
+font-pipeline migration note below).
 
 Font-pipeline migration (verified: client + server tests green; render-check
 for both `?r=gl` and `?r=2d`):

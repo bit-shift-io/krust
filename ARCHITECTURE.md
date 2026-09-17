@@ -157,26 +157,34 @@ obtained. On init it logs `KRUST: WebGL2 renderer initialized` or
 ### 3.4 WebGL2 Renderer (`client/src/renderer.rs`, primary path)
 
 * **Font atlas (`GlyphAtlas`):** a fixed set of Unicode **ranges** is baked at
-  init — ASCII, Latin-1 Supplement, General Punctuation (`…–—‘’“”`), Currency,
+  init — ASCII, Latin-1 Supplement, General Punctuation (`…–‘’“”`), Currency,
   Arrows, Math Operators, Misc Symbols, Blocks/Geometric, Dingbats (`✓✦✶`) and
-  Braille (1072–1584 slots total). Slots are rasterized by the browser's own
+  Braille (1584 slots total). Slots are rasterized by the browser's own
   Canvas 2D text engine via the shared FFI, drawing each codepoint with the
   same font stack and size the Canvas 2D fallback paints with
   (`measure::FONT_FAMILIES` / `FONT_SIZE_CSS`), so the GL path and the 2D
   reference produce identical glyphs and missing glyphs resolve through the
   browser's normal per-glyph font fallback. No font file is embedded and no
   font crate is linked. Braille slots are overwritten with synthesized 2×4 dot
-  grids (fonts can collapse spinner frames to identical bitmaps). Codepoints
-  outside these ranges resolve to no atlas entry (`uv_for` → `None`) and render
-  as blank cells on the GL path. The atlas is the alpha source for every text
-  pass; a reserved opaque texel supplies flat fills for graphic cells.
+  grids (fonts can collapse spinner frames to identical bitmaps).
+* **On-demand glyphs:** `DYNAMIC_ROWS` (32 rows = 1024 slots) at the bottom of
+  the atlas are reserved for codepoints outside the static ranges (CJK, emoji,
+  …). Each frame `render()` collects the screen's non-static codepoints and
+  calls `GlyphAtlas::ensure_glyphs`, which rasterizes only the newly seen ones
+  with the same Canvas 2D engine and uploads them with `gl.texSubImage2D`
+  (`UNPACK_ALIGNMENT = 1`). Slots are LRU-tracked; when the region is full the
+  least-recently-used glyph is evicted and re-baked if it reappears. This gives
+  the GL path full Unicode coverage while keeping init cost and texture size
+  bounded (baking all of Unicode up front is infeasible — the whole BMP is
+  ≈13 MB and a ~41k px-tall texture). The atlas is the alpha source for every
+  text pass; a reserved opaque texel supplies flat fills for graphic cells.
 * **Context-loss recovery:** browsers may drop the WebGL context while a tab is
   hidden (Firefox does under memory pressure), which invalidates every GL
   object. `server.html` opts into restoration with
   `webglcontextlost.preventDefault()` and, on `webglcontextrestored`, calls the
   `rebuild_webgl()` export; `TerminalState::rebuild_webgl()` recreates the whole
-  renderer (program, buffers, atlas — preserving the swapped-in system font) so
-  the next `render()` paints a full frame instead of silently no-opping.
+  renderer (program, buffers, atlas) so the next `render()` paints a full frame
+  instead of silently no-opping.
 * **Two-pass instanced drawing (`GlyphBrush`):**
   * Pass 0 (mode 0) — per-cell background rects using a solid 1×1 atlas pixel;
   * Pass 1 (mode 1) — text glyphs sampling atlas alpha.

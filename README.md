@@ -80,6 +80,9 @@ krust/
 The WebGL2 renderer bakes its glyph atlas with the browser's own Canvas 2D text
 engine (the same font stack the 2D fallback paints with), so no font files are
 bundled and missing glyphs resolve through the browser's normal font fallback.
+Codepoints outside the pre-baked ranges (CJK, emoji, …) are rasterized on demand
+into a dynamic atlas region with LRU eviction, so the WebGL2 path covers the
+full Unicode range.
 
 ---
 

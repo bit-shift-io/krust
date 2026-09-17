@@ -69,6 +69,7 @@
             push(' '.repeat(30) + '▮▍▎▏▪▸●▣\r\n');
             push(' '.repeat(30) + '↻↺⇦⋯⊶✦✶✱\r\n');
             push(' '.repeat(30) + '…–—‘’“”·\r\n');
+            push(' '.repeat(30) + '中文字元\r\n');
             const len = parts.reduce((n, p) => n + p.length, 0);
             const joined = new Uint8Array(len);
             let off = 0;
@@ -245,6 +246,13 @@
             const symbolOk = symbolInk.filter(n => n > 0).length === 8;
             const punctOk = punctInk.filter(n => n > 0).length === 8;
 
+            // On-demand glyphs (row 24, cols 30..38): CJK outside the static
+            // atlas ranges must be rasterized at render time into the dynamic
+            // region. Wide chars occupy two cells; check each glyph's leading
+            // cell has ink (a blank/missing bake leaves it background-only).
+            const cjkInk = [30, 32, 34, 36].map(c => rowInkPerCell(24, c, c + 1)[0]);
+            const cjkOk = cjkInk.filter(n => n > 0).length === 4;
+
             // Orientation: 'T' has a horizontal bar at its TOP and a thin stem
             // descending below. If glyphs are mirrored across the horizontal
             // axis the bar lands at the bottom of the cell instead. (An
@@ -369,6 +377,7 @@
                 blockgeo: { cells_with_ink: geoInk.filter(n => n > 0).length },
                 symbols: { cells_with_ink: symbolInk.filter(n => n > 0).length },
                 punctuation: { cells_with_ink: punctInk.filter(n => n > 0).length },
+                ondemand: { cells_with_ink: cjkInk.filter(n => n > 0).length },
                 animate: { frame_deltas: frameDeltas, frame_ink: [f1Ink, f2Ink] },
                 version: (() => {
                     const v = callBoxedExport(version);
@@ -392,6 +401,7 @@
                 && geoOk
                 && symbolOk
                 && punctOk
+                && cjkOk
                 && animateOk
                 && dash.dimCols.length === 0
                 && pipe.dimRows.length === 0
