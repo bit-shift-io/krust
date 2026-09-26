@@ -138,8 +138,8 @@ mod tests {
         let cell = p.screen().cell(0, 0).unwrap();
         assert!(cell.bold());
         assert_eq!(cell.fgcolor(), Color::Idx(4));
-        assert_eq!(cell_fg_rgb(&cell, DEFAULT_FG), xterm_palette(12));
-        assert_eq!(cell_fg_rgb(&cell, DEFAULT_FG), 0x5C5CFF);
+        assert_eq!(cell_fg_rgb(cell, DEFAULT_FG), xterm_palette(12));
+        assert_eq!(cell_fg_rgb(cell, DEFAULT_FG), 0x5C5CFF);
     }
 
     #[test]
@@ -148,7 +148,7 @@ mod tests {
         p.process(b"\x1b[34mX");
         let cell = p.screen().cell(0, 0).unwrap();
         assert!(!cell.bold());
-        assert_eq!(cell_fg_rgb(&cell, DEFAULT_FG), 0x0000EE);
+        assert_eq!(cell_fg_rgb(cell, DEFAULT_FG), 0x0000EE);
     }
 
     #[test]

@@ -186,7 +186,6 @@ async fn handle_socket(
     // 3. Task: WebSocket input -> PTY writer & resize handlers
     let writer = session.writer.clone();
     let master = session.master.clone();
-    let _sid = session_id.clone();
 
     let ws_recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_receiver.next().await {

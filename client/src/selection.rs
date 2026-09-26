@@ -153,8 +153,8 @@ mod tests {
         let mut parser = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
         parser.process(b"abcdef");
         let screen = parser.screen();
-        let forward = extract_selection(&screen, (0, 1), (0, 4));
-        let backward = extract_selection(&screen, (0, 4), (0, 1));
+        let forward = extract_selection(screen, (0, 1), (0, 4));
+        let backward = extract_selection(screen, (0, 4), (0, 1));
         assert_eq!(forward, backward);
         assert_eq!(forward, "bcde");
     }
@@ -164,7 +164,7 @@ mod tests {
         let mut parser = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
         parser.process(b"abcdef");
         let screen = parser.screen();
-        assert_eq!(extract_selection(&screen, (0, 2), (0, 2)), "c");
+        assert_eq!(extract_selection(screen, (0, 2), (0, 2)), "c");
     }
 
     #[test]

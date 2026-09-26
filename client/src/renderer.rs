@@ -184,7 +184,7 @@ impl GlyphAtlas {
         // Count total glyphs across all ranges.
         let total: u32 = ATLAS_RANGES.iter().map(|r| r.len).sum();
         let cols = ATLAS_COLS as u32;
-        let static_rows = (total + cols - 1) / cols;
+        let static_rows = total.div_ceil(cols);
         let rows = static_rows + DYNAMIC_ROWS;
         let atlas_w = cols * (glyph_w + ATLAS_PADDING);
         let atlas_h = rows * (glyph_h + ATLAS_PADDING);
@@ -874,8 +874,8 @@ impl WebGL2Renderer {
         cursor: (u16, u16),
     ) -> Result<(), String> {
         let (prows, pcols) = screen.size();
-        let rrows = if self.rows > 0 { self.rows } else { prows as u16 };
-        let rcols = if self.cols > 0 { self.cols } else { pcols as u16 };
+        let rrows = if self.rows > 0 { self.rows } else { prows };
+        let rcols = if self.cols > 0 { self.cols } else { pcols };
         let rows = rrows as u32;
         let cols = rcols as u32;
 

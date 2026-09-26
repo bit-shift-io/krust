@@ -37,7 +37,7 @@ pub(crate) fn normalize_save_restore(bytes: &[u8], carry: &mut Vec<u8>) -> Vec<u
     let carry_from = if feed.len() >= 2 && feed[feed.len() - 2] == 0x1b && feed[feed.len() - 1] == b'['
     {
         feed.len() - 2
-    } else if feed.len() >= 1 && feed[feed.len() - 1] == 0x1b {
+    } else if !feed.is_empty() && feed[feed.len() - 1] == 0x1b {
         feed.len() - 1
     } else {
         feed.len()
@@ -231,7 +231,7 @@ impl TerminalState {
         // sensible defaults.
         let (cell_width, cell_height) = cached
             .filter(|(w, h)| *w > 0.0 && *h > 0.0)
-            .or_else(|| measure_cell_dimensions_scratch())
+            .or_else(measure_cell_dimensions_scratch)
             .unwrap_or((14.0, 20.0));
 
         // Try WebGL2 first for GPU-accelerated rendering; fall back to Canvas 2D.
@@ -548,7 +548,7 @@ impl TerminalState {
     fn render_canvas2d(&mut self) -> Result<(), String> {
         // Clone the (cheap) context handle so no borrow of `self` lingers
         // while the render helpers mutate other fields.
-        let ctx = self.ctx.clone().ok_or("no renderer")?;
+        let ctx = self.ctx.ok_or("no renderer")?;
         let (prows, pcols) = self.parser.screen().size();
         let rows = if self.rows > 0 { self.rows } else { prows };
         let cols = if self.cols > 0 { self.cols } else { pcols };
@@ -668,8 +668,8 @@ impl TerminalState {
             return None;
         }
         let (cr, cc) = screen.cursor_position();
-        if (cr as u16) < rows && (cc as u16) < cols {
-            Some((cr as u16, cc as u16))
+        if cr < rows && cc < cols {
+            Some((cr, cc))
         } else {
             None
         }
@@ -701,10 +701,8 @@ impl TerminalState {
         ffi::ctx_set_fill_style(ctx, &css_color(fg));
         if let Some(c) = cell {
             let s = c.contents();
-            if !s.is_empty() {
-                if !draw_graphic_cell(ctx, cc, cr, cw, ch, s, fg) {
-                    ffi::ctx_fill_text(ctx, s, cc as f64 * cw, cr as f64 * ch + ch * 0.5);
-                }
+            if !s.is_empty() && !draw_graphic_cell(ctx, cc, cr, cw, ch, s, fg) {
+                ffi::ctx_fill_text(ctx, s, cc as f64 * cw, cr as f64 * ch + ch * 0.5);
             }
         }
         Ok(Some((cr, cc)))
@@ -915,7 +913,7 @@ impl TerminalState {
 
     /// Resize the underlying parser screen to `rows` x `cols`.
     pub(crate) fn resize_screen(&mut self, rows: u16, cols: u16) {
-        let _ = self.parser.screen_mut().set_size(rows, cols);
+        self.parser.screen_mut().set_size(rows, cols);
     }
 }
 

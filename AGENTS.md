@@ -17,32 +17,41 @@ Krust is a Rust terminal emulator with a two-crate workspace:
   Parses VT100 ANSI bytes via the `vt100` crate and renders on a Canvas 2D
   surface (with a WebGL2 fast path).
 
-The project is **not** a Git client. All references to "Grit" in older
-documents (ARCHITECTURE.md, NOTES.md) are stale and should be ignored.
-
 ---
 
 ## Key Files
 
 | File | Purpose |
 |---|---|
-| `server/src/main.rs` | Axum router, PTY session management, WebSocket handler, tests |
+| `server/src/main.rs` | Axum router + CORS layer, tests |
+| `server/src/session.rs` | PTY session management (spawn, scrollback history, broadcast fan-out) |
+| `server/src/handlers.rs` | HTTP/WS handler layer; embeds the client HTML, runtime JS, and WASM |
 | `client/src/lib.rs` | WASM terminal: VT100 parser, Canvas 2D renderer, input mapping, selection, tests |
 | `client/src/ffi.rs` | Raw `extern "C"` imports from the `krust` JS module + safe wrappers |
 | `client/res/krust_runtime.js` | Browser-side FFI runtime (`window.KRUST_RUNTIME`); embedded into the server binary (`include_str!` in `handlers.rs`) |
 | `client/res/server.html` | Production HTML served by the server (embedded via `include_str!`) |
-| `target/wasm/wasm32-unknown-unknown/release/terminal_client.wasm` | WASM client; embedded into the server binary (`include_bytes!` in `handlers.rs`) |
+| `target/wasm/wasm32-unknown-unknown/release/terminal_client.wasm` | Raw WASM build output; embedded into the server binary (`include_bytes!` in `handlers.rs`) |
 | `client/res/index.html` | Minimal smoke-test HTML |
-| `target/wasm/wasm32-unknown-unknown/release/terminal_client.wasm` | Raw wasm build output |
 | `Cargo.toml` | Workspace manifest (`server`, `client`) |
 | `TASKS.md` | Implementation roadmap |
-| `NOTES.md` | Design rationale and key decisions |
+| `NOTES.md` | Design rationale and key decisions (currently an empty stub) |
 
 ---
 
 ## Conventions
 
-- **Async runtime:** Tokio (`full` features) on the server.
+- **Async runtime:** Tokio on the server, with features listed explicitly
+  (`macros`, `rt-multi-thread`, `net`, `sync`) rather than `full`. Do not
+  widen this without checking what it pulls in — `full` adds `parking_lot`,
+  `signal-hook-registry`, `lock_api`, and friends for code that is not here.
+- **Dependencies are deliberately minimal.** The client's only dependency is
+  `vt100`; the four JSON payloads crossing the FFI boundary are built and
+  parsed by the `json_string` / `json_f64` / `json_number_field` helpers in
+  `client/src/exports.rs` rather than by `serde_json`, which cost ~50 KB of
+  the shipped `.wasm` (16.5%) to format them. The server keeps `serde_json` and
+  `serde`, which it genuinely needs for `ClientMessage`. Note `axum`'s `ws`
+  feature already depends on `tokio-tungstenite`, so the server does not
+  declare it.
 - **WebSocket protocol:** Binary frames (`ArrayBuffer`) for PTY output.
   JSON messages (`{"type":"Input","data":...}` and `{"type":"Resize",...}`)
   for client→server control. The server also accepts raw binary input frames.
@@ -70,7 +79,8 @@ documents (ARCHITECTURE.md, NOTES.md) are stale and should be ignored.
   Server tests use `tower::util::ServiceExt` for one-shot HTTP requests.
 - **CORS:** `tower-http::cors::CorsLayer::permissive()` is enabled on all
   routes. The krust server serves cross-origin requests from the Grit
-  web UI (running on `localhost:5000`).
+  web UI (running on `localhost:5000`). Kept deliberately: hand-rolling
+  this saves exactly one crate and risks preflight correctness.
 - **Build:** `server/build.rs` runs `cargo build --release --target wasm32-unknown-unknown`
   into `target/wasm/` (alongside the main workspace target) when stale,
   so a plain `cargo build`/`cargo run` suffices (skip with

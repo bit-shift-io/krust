@@ -10,5 +10,9 @@ crate-type = ["cdylib", "rlib"]
 # Pure-Rust dependencies only. Browser interop is handled by the raw "krust"
 # FFI module (imports provided by `res/krust_runtime.js`); no wasm-bindgen
 # runtime or web-sys/js-sys glue is required or linked.
+#
+# Deliberately no `serde_json`: the four JSON payloads crossing the FFI
+# boundary are fixed-shape and handled by the `json_*` helpers in
+# `src/exports.rs`. Pulling in serde_json costs ~54 KB of the shipped .wasm
+# (an 18% regression) to format them.
 vt100 = "0.16"
-serde_json = "1.0"

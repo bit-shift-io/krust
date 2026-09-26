@@ -14,6 +14,94 @@ use crate::query::collect_query_replies;
 use crate::selection::extract_selection;
 use crate::state::{TerminalState, TERM_STATE};
 
+// --- Minimal JSON support -------------------------------------------------
+//
+// The client deliberately has no `serde_json` dependency: it would add ~54 KB
+// to the shipped `.wasm` (an 18% regression) to format four tiny,
+// fixed-shape payloads. These two helpers cover the whole surface — three
+// numeric/bool objects we build, and one `{w,h}` object we parse.
+
+/// Render `s` as a quoted, escaped JSON string (quotes included).
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Format a float as a JSON number.
+///
+/// Non-finite values are not representable in JSON, so they become `null`
+/// (matching what `serde_json` would have emitted) rather than the bare
+/// `NaN` / `inf` that `{}` would produce.
+fn json_f64(v: f64) -> String {
+    if v.is_finite() {
+        format!("{}", v)
+    } else {
+        "null".to_string()
+    }
+}
+
+/// Look up a numeric field by key in a flat JSON object and parse it.
+///
+/// Sufficient for the only object the client parses, `{"w":<f64>,"h":<f64>}`,
+/// and tolerant of key order and surrounding whitespace. Returns `None` when
+/// the key is absent or its value is not a JSON number (including `null`).
+fn json_number_field(json: &str, key: &str) -> Option<f64> {
+    let needle = format!("\"{}\"", key);
+    let after_key = json.find(&needle)? + needle.len();
+    let rest = json[after_key..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+
+    let bytes = rest.as_bytes();
+    let mut end = 0;
+    if bytes.first() == Some(&b'-') {
+        end += 1;
+    }
+    let int_start = end;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == int_start {
+        return None;
+    }
+    if bytes.get(end) == Some(&b'.') {
+        end += 1;
+        let frac_start = end;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == frac_start {
+            return None;
+        }
+    }
+    if matches!(bytes.get(end), Some(b'e') | Some(b'E')) {
+        let mut exp = end + 1;
+        if matches!(bytes.get(exp), Some(b'+') | Some(b'-')) {
+            exp += 1;
+        }
+        let exp_start = exp;
+        while exp < bytes.len() && bytes[exp].is_ascii_digit() {
+            exp += 1;
+        }
+        if exp > exp_start {
+            end = exp;
+        }
+    }
+    rest[..end].parse::<f64>().ok()
+}
+
 /// Helper: write a string into WASM memory and return (ptr, len).
 fn write_string_to_wasm(s: String) -> (*mut c_char, usize) {
     let cstring = CString::new(s).unwrap_or_else(|_| CString::new("").unwrap());
@@ -85,13 +173,7 @@ pub extern "C" fn init(
             std::str::from_utf8(std::slice::from_raw_parts(cached_dims_ptr, cached_dims_len))
                 .unwrap_or("")
         };
-        serde_json::from_str::<serde_json::Value>(json_str)
-            .ok()
-            .and_then(|v| {
-                let w = v.get("w")?.as_f64()?;
-                let h = v.get("h")?.as_f64()?;
-                Some((w, h))
-            })
+        json_number_field(json_str, "w").zip(json_number_field(json_str, "h"))
     } else {
         None
     };
@@ -99,14 +181,14 @@ pub extern "C" fn init(
     let term_state = TerminalState::new(&canvas_id, cached)
         .unwrap_or_else(|_| panic!("terminal init failed"));
 
-    let state_json = serde_json::json!({
-        "canvas_id": term_state.canvas_id(),
-        "rows": term_state.size().0,
-        "cols": term_state.size().1,
-        "cell_width": term_state.cell_width,
-        "cell_height": term_state.cell_height,
-    })
-    .to_string();
+    let state_json = format!(
+        "{{\"canvas_id\":{},\"rows\":{},\"cols\":{},\"cell_width\":{},\"cell_height\":{}}}",
+        json_string(term_state.canvas_id()),
+        term_state.size().0,
+        term_state.size().1,
+        json_f64(term_state.cell_width),
+        json_f64(term_state.cell_height),
+    );
 
 TERM_STATE.with(|s| *s.borrow_mut() = Some(term_state));
      let (ptr, len) = write_string_to_wasm(state_json);
@@ -130,13 +212,12 @@ pub extern "C" fn process_bytes(bytes_ptr: *const u8, bytes_len: usize) -> *mut 
             Ok(s) => {
                 s.process_bytes(bytes);
                 s.schedule_render();
-                Ok(serde_json::json!({
-                    "processed": true,
-                    "byte_count": bytes.len(),
-                    "rows": s.rows,
-                    "cols": s.cols,
-                })
-                .to_string())
+                Ok(format!(
+                    "{{\"processed\":true,\"byte_count\":{},\"rows\":{},\"cols\":{}}}",
+                    bytes.len(),
+                    s.rows,
+                    s.cols
+                ))
             }
             Err(e) => Err(e),
         }
@@ -298,7 +379,7 @@ pub extern "C" fn handle_click(x: i32, y: i32) -> *mut u8 {
             let _ = state.render();
             let col = (x as f64 / state.cell_width).floor() as u16;
             let row = (y as f64 / state.cell_height).floor() as u16;
-            serde_json::json!({ "row": row, "col": col }).to_string()
+            format!("{{\"row\":{},\"col\":{}}}", row, col)
         } else {
             String::new()
         }
@@ -534,5 +615,70 @@ mod tests {
         assert!(s.contains("krust-terminal"));
         free_string(data_ptr as *mut c_char);
         free_result(ptr);
+    }
+
+    #[test]
+    fn test_json_string_quotes_and_leaves_plain_text_alone() {
+        assert_eq!(json_string("term"), "\"term\"");
+        assert_eq!(json_string(""), "\"\"");
+    }
+
+    #[test]
+    fn test_json_string_escapes_specials() {
+        assert_eq!(json_string(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(json_string(r"a\b"), r#""a\\b""#);
+        assert_eq!(json_string("a\nb\tc"), r#""a\nb\tc""#);
+        // Control characters become \uXXXX escapes, not raw bytes.
+        assert_eq!(json_string("\u{1}"), "\"\\u0001\"");
+        assert_eq!(json_string("\u{1b}"), "\"\\u001b\"");
+    }
+
+    #[test]
+    fn test_json_f64_matches_plain_number_format() {
+        assert_eq!(json_f64(8.0), "8");
+        assert_eq!(json_f64(18.5), "18.5");
+        assert_eq!(json_f64(-0.25), "-0.25");
+    }
+
+    #[test]
+    fn test_json_f64_maps_non_finite_to_null() {
+        // Bare `NaN`/`inf` would not be valid JSON for the JS side to parse.
+        assert_eq!(json_f64(f64::NAN), "null");
+        assert_eq!(json_f64(f64::INFINITY), "null");
+    }
+
+    #[test]
+    fn test_json_number_field_parses_the_cached_dims_shape() {
+        let json = r#"{"w":8.0,"h":18.5}"#;
+        assert_eq!(json_number_field(json, "w"), Some(8.0));
+        assert_eq!(json_number_field(json, "h"), Some(18.5));
+    }
+
+    #[test]
+    fn test_json_number_field_tolerates_key_order_and_whitespace() {
+        let json = r#"{ "h" : -12 , "w" : 7 }"#;
+        assert_eq!(json_number_field(json, "w"), Some(7.0));
+        assert_eq!(json_number_field(json, "h"), Some(-12.0));
+    }
+
+    #[test]
+    fn test_json_number_field_handles_exponents_and_stops_at_delimiter() {
+        assert_eq!(json_number_field(r#"{"w":1e2}"#, "w"), Some(100.0));
+        assert_eq!(json_number_field(r#"{"w":2E-3}"#, "w"), Some(0.002));
+        assert_eq!(json_number_field(r#"{"w":5,"h":6}"#, "w"), Some(5.0));
+        assert_eq!(json_number_field(r#"{"w":5.25e1}"#, "w"), Some(52.5));
+    }
+
+    #[test]
+    fn test_json_number_field_rejects_non_numbers() {
+        assert_eq!(json_number_field(r#"{"w":null}"#, "w"), None);
+        assert_eq!(json_number_field(r#"{"w":"8"}"#, "w"), None);
+        assert_eq!(json_number_field(r#"{"w":true}"#, "w"), None);
+        assert_eq!(json_number_field(r#"{"w":}"#, "w"), None);
+        assert_eq!(json_number_field(r#"{"w":.}"#, "w"), None);
+        assert_eq!(json_number_field(r#"{"w":-}"#, "w"), None);
+        assert_eq!(json_number_field(r#"{"width":8}"#, "w"), None);
+        assert_eq!(json_number_field(r#"{"w":1.}"#, "w"), None);
+        assert_eq!(json_number_field("not json", "w"), None);
     }
 }
