@@ -6,9 +6,12 @@
 verified in a throwaway copy of the repo at `/tmp` (`cargo tree` crate-count deltas +
 `cargo test --workspace`).
 
-> **Status:** the recommended cleanup has been **applied**. See
+> **Status:** the recommended cleanup has been **applied** (committed as `bfeb961`). See
 > [Outcome](#outcome-of-the-cleanup) at the end for final measured numbers.
 > The findings below are preserved as the pre-cleanup baseline.
+>
+> A second, separate investigation followed: a **phantom-glyph rendering bug** in the WebGL2
+> path. See [Phase 2](#phase-2--phantom-glyph-investigation-webgl2).
 
 ---
 
@@ -37,6 +40,10 @@ Separately from dependencies: `cargo clippy` reported **23 warnings**, one dead 
 `setup.sh` that installs `wasm-pack` — a tool the project no longer uses), and a
 set of docs describing a superseded state of the project.
 
+> A later bug report (phantom characters in the WebGL2 render path) is covered separately in
+> [Phase 2](#phase-2--phantom-glyph-investigation-webgl2). It is unrelated to the dependency
+> findings above but is the reason two WebGL2 defects are now covered by tests.
+
 ## Key Metrics
 
 - **Unused/Orphan Files:** 3 (`client-wasm/`, `setup.sh`, `client/res/slow.png`)
@@ -44,8 +51,22 @@ set of docs describing a superseded state of the project.
 - **Removable Dependencies:** 1 (`serde_json` from client); **Reducible:** 2 (`tokio` features, `futures-util` features)
 - **Dead Functions/Exports:** 1 (`_sid` in `handlers.rs:189`)
 - **Clippy Warnings:** 23 → **5** (18 auto-fixed; the 5 remaining are the deliberate complexity findings)
-- **Commented-Out Code / Debug Logs:** 0 (the `console_log` calls in `state.rs`/`exports.rs` are deliberate diagnostics behind a `KRUST:` prefix, not leftovers)
+- **Commented-Out Code / Debug Logs:** 0 (the `console_log` calls in `state.rs`/`exports.rs` are
+  deliberate diagnostics — `KRUST:` for renderer-selection info, `krust panic:` for the Phase 2
+  panic hook — not leftovers)
 - **Open TODOs/FIXMEs:** 0
+
+Phase 2 added:
+
+- **WebGL2 correctness bugs fixed:** 2 (stale glyph after a failed atlas bake; `unwrap_or` zero-UV
+  fallback painting an unrelated glyph)
+- **Silent-failure defects fixed:** 2 (wasm panics reaching JS with no message and being
+  swallowed by `catch (_) {}`; `init` discarding the real error text)
+- **Hypotheses tested and ruled out:** 5
+- **New tests:** 2 (both in `client/src/renderer.rs`)
+- **Test total:** 78 → **80**
+- **WASM cost of the fixes:** +2,487 B (**+1.0%**); net vs original baseline still **−15.7%**
+- **New clippy warnings:** 0
 
 ### Dependency graph: measured crate-count deltas
 
@@ -120,7 +141,7 @@ The `serde_json` dep stays on the **server**, where it is genuinely load-bearing
 
 | File Path | Issue | Context / Severity | Suggested Refactor |
 | :--- | :--- | :--- | :--- |
-| `client/src/renderer.rs` | File too large | 1,270 lines — largest in the project. Medium | Split the WebGL2 backend out of `renderer.rs` (glyph atlas / instance building / draw loop are already separable) |
+| `client/src/renderer.rs` | File too large | 1,270 lines at audit time; **1,369** after Phase 2. Largest in the project. Medium | Split the WebGL2 backend out of `renderer.rs` (glyph atlas / instance building / draw loop are already separable) |
 | `client/src/state.rs` | File too large | 925 lines, plus the project's longest function. Medium | Extract `TerminalState` renderer-agnostic core from the render path |
 | `client/src/state.rs:720` | Function too long | `paint_cell` spans ~78 lines with a 10-arg signature. Medium | Extract bg-quad, glyph, and overlay passes into helpers |
 | `client/src/renderer.rs:1010` | 13 parameters | `build_instances` — worst offender in the codebase. Medium | Bundle into a `CellMetrics`/`DrawParams` struct |
@@ -168,6 +189,124 @@ behavioural change.
 
 ---
 
+## Phase 2 — Phantom-Glyph Investigation (WebGL2)
+
+**Trigger:** a user report that phantom letters/numbers appear in krust's input line while
+running OpenCode — visually present, not submitted to the shell, and cleared by typing.
+
+**Scope:** diagnosis only, plus fixes for defects found on the way. No dependency or
+structural changes; the 5 remaining clippy findings are untouched.
+
+### Bugs found and fixed
+
+| # | Location | Defect | Symptom | Fix |
+| :--- | :--- | :--- | :--- | :--- |
+| A | `client/src/renderer.rs` `ensure_glyphs` | `assign_slots` registered a char in `dynamic_index` **before** its pixels reached the GPU. When `rasterize_dynamic` returned fewer bitmaps than chars, the `continue` left the reservation in place, so `uv_for` returned a texel still holding a **different** glyph — and `plan_missing` then saw the char as present, so it was never re-baked. | A permanently wrong character in a cell, with no way for it to self-correct. Exactly the reported "phantom letter". | New `release_slots` rolls the chunk's reservations back on failure, returning the chars to the not-yet-baked state so the next frame retries. |
+| B | `client/src/renderer.rs` `build_instances` | A codepoint with no atlas entry fell back to `uv_for(ch).unwrap_or((0.0, 0.0, 0.0, 0.0))`, sampling the atlas's top-left texel. | An unrelated character painted at that cell. | Emit no glyph quad at all when `uv_for` returns `None`; the next frame re-bakes the glyph. |
+
+Both are **WebGL2-only** failure modes. Canvas 2D has no atlas and no UVs, which is why the
+`?r=2d` vs `?r=gl` split is the decisive A/B test for this class of bug.
+
+Two tests were added for A (`a_failed_upload_releases_the_slot_instead_of_showing_a_stale_glyph`,
+`release_slots_leaves_a_reassigned_slot_alone`); the second pins that a rollback must not evict
+a char that has since taken over the same slot.
+
+### Diagnosability defects found (these masked the bug)
+
+| # | Location | Defect | Fix |
+| :--- | :--- | :--- | :--- |
+| C | `client/src/exports.rs`, every `server.html` call site | A wasm panic reaches JS as a bare `RuntimeError: unreachable` with no message, and every call site wraps exports in `try { ... } catch (_) {}`. A panic in the render path was therefore **completely silent** while the WebGL framebuffer went on presenting the last frame that finished drawing — which itself looks like stale text. | `install_panic_hook` logs the message and source location through `krust_console_log` (wasm-only; no-op on host, where the console import does not exist and tests rely on the default hook). |
+| D | `client/src/exports.rs` `init` | `TerminalState::new(...).unwrap_or_else(\|_\| panic!("terminal init failed"))` discarded the underlying error, which already carried a specific message. | Panic with the real error text. This is what identified the missing-WebGL2 finding below. |
+
+### Hypotheses tested and ruled out
+
+| Hypothesis | Verdict | Evidence |
+| :--- | :--- | :--- |
+| Dirty-cell coalescing leaves stale cells | **Ruled out** | `repaint()` calls `mark_all_dirty()`, so every repaint is a full redraw. |
+| Canvas 2D accumulates stale pixels | **Ruled out** | The 2D path clears the whole canvas and repaints every cell each frame. |
+| WebGL instance buffer holds stale tail data | **Ruled out** | `gl_buffer_data_f32` uses `bufferData` (full realloc at exact size) each frame, and `drawArraysInstanced` uses the current instance count — not `bufferSubData` into a fixed capacity. |
+| Glyph-atlas capacity thrashing | **Ruled out** | The dynamic region is `DYNAMIC_ROWS 32 × 32 cols` = **1024** slots. OpenCode's live set (braille spinner, box drawing in static ranges, occasional CJK) is far below that, so LRU eviction does not thrash. |
+| WebGL context loss | Not reproduced | `rebuild_webgl()` already exists for `webglcontextrestored`; no loss observed in the headless runs. |
+
+### Environment finding (not a code defect)
+
+`client/res/render-check.sh` reports `renderer=gl: FAIL` on this machine because **headless
+Chromium 152 provides no WebGL2 context at all**. Retried with `--enable-unsafe-swiftshader`,
+`--use-gl=angle --use-angle=swiftshader`, and `--use-gl=swiftshader`; all three report
+`webgl2 context unavailable`.
+
+This was verified to be **pre-existing**: it reproduces identically with the Phase 2 changes
+stashed. The GL half of the render regression suite simply cannot run here, and its failure
+must not be read as a regression.
+
+The GL path was instead validated in **Firefox 155**, which does provide software WebGL. Driving
+it required a throwaway Marionette client (`--dump-dom` screenshots fire before the async wasm
+init completes, and Chromium here has no GL), kept in `/tmp` — no repo files were changed for it.
+
+### Verification
+
+| Check | Result |
+| :--- | :--- |
+| `cargo test --workspace` | **80 pass** (11 server, 69 client — 2 new), 0 fail |
+| `cargo clippy --workspace --all-targets` | **5 warnings** — the same deliberate complexity findings as §3; no new ones |
+| `client/res/smoke-test.sh` (Firefox, production page) | **OK** — glyphs rendered |
+| Firefox render-test `?r=2d` | **pass** — align `T{3,12} g{5,15} _{16,16} x{5,12}`, `ondemand` 4 cells, `braille` 8, 30 animation frame deltas |
+| Firefox render-test `?r=gl` | **pass** — **identical** align metrics, `ondemand` 4, `braille` 8, 54 animation frame deltas |
+| WASM size | 251,943 B → **254,430 B** (+2,487 B, **+1.0%**) for the panic hook and rollback path |
+| `krust` release binary | 3,119,816 B, still fully self-contained |
+
+> **Note on the +1.0% WASM growth.** The panic hook and the `release_slots` rollback are the
+> entire delta. This is a deliberate trade: they convert a silent, self-perpetuating wrong-pixel
+> bug into a logged, self-healing one. The 16.5% saving from Phase 1 is unaffected in relative
+> terms (301,901 B → 254,430 B is still **−15.7%** against the original baseline).
+
+### Open item — needs user confirmation
+
+Bugs A and B are a mechanism that produces exactly the reported symptom, but the specific
+glitch was **not reproduced end-to-end**. Confirming it is the same defect requires an A/B run
+on the affected machine:
+
+1. Load krust with `?r=2d`, then with `?r=gl`.
+2. When a phantom appears, select and copy it.
+3. If the clipboard **contains** the phantom text, OpenCode emitted real terminal state and this
+   is not a rendering bug.
+4. If phantoms appear **only** under `?r=gl` and are **absent** from the clipboard, it is bug A/B
+   and this fix resolves it.
+
+### Process note
+
+One self-inflicted error is worth recording. The first draft of finding C inserted the new
+function *between* `#[no_mangle]` and `pub extern "C" fn init`, so `#[no_mangle]` attached to
+`install_panic_hook` instead — silently un-exporting `init` and breaking every page. It surfaced
+immediately as `TypeError: fn is not a function` in the render test, and was caught by checking
+the wasm **export section** rather than trusting a green build. `client/src/exports.rs` is now
+the only file where a raw-WASM export is defined, so re-verify the export list after any edit
+there:
+
+```bash
+python3 - <<'PY'
+import sys
+d=open("target/wasm/wasm32-unknown-unknown/release/terminal_client.wasm","rb").read()
+def uleb(b,i):
+    r=s=0
+    while True:
+        x=b[i];i+=1;r|=(x&0x7f)<<s;s+=7
+        if not x&0x80: return r,i
+i=8
+while i<len(d):
+    sid=d[i];i+=1; size,i=uleb(d,i)
+    if sid==7:
+        n,j=uleb(d,i); out=[]
+        for _ in range(n):
+            ln,j=uleb(d,j); out.append(d[j:j+ln].decode()); j+=ln
+            j+=1; _,j=uleb(d,j)
+        print(len(out), "exports:", " ".join(sorted(out))); break
+    i+=size
+PY
+```
+
+---
+
 ## Outcome of the cleanup
 
 Everything marked **Done** above is applied and verified:
@@ -178,7 +317,7 @@ Everything marked **Done** above is applied and verified:
 - Server graph 99 → **92** crates; client graph 10 → **7** crates.
 - Shipped WASM 301,901 B → **251,943 B** (−49,958 B, **−16.5%**).
 - `krust` release binary 3,117,392 B, still fully self-contained (HTML + runtime JS + WASM embedded).
-- Nothing committed — changes are staged/unstaged in the working tree for review.
+- Committed as `bfeb961` ("audit and clean"). Phase 2 is uncommitted, for review.
 
 ## Top Priority Action Plan
 
@@ -192,6 +331,29 @@ Everything marked **Done** above is applied and verified:
    `_sid`, `slow.png`) — *DONE*.
 7. **[Low] Lean `futures-util`** — *DONE*. **Kept `tower-http`.**
 8. **[Open, not started] Refactor the rendering hot path** — `build_instances` (13 args),
-   `paint_cell` (~78 lines), `renderer.rs` (1,270 lines), `state.rs` (925 lines). Deliberately
+   `paint_cell` (~78 lines), `renderer.rs` (1,369 lines), `state.rs` (924 lines). Deliberately
    deferred: these are structural refactors with real regression risk, not cleanup.
+
+### Phase 2 follow-ups
+
+9. **[High] Confirm the phantom-glyph fix on the affected machine** — *OPEN, awaiting user*.
+   Run `?r=2d` vs `?r=gl` and select/copy a phantom. Clipboard contains it → real terminal
+   state from OpenCode, not a rendering bug. WebGL-only and absent from the clipboard → fixed
+   by bugs A/B above.
+10. **[Medium] Make `render-check.sh` degrade honestly when WebGL2 is unavailable** — *OPEN*.
+    The script currently reports `renderer=gl: FAIL` for what is an environment gap, which reads
+    as a regression. It should detect the missing context and either skip the GL mode explicitly
+    or fall back to a browser that has software WebGL. Until then, treat a GL failure here as
+    inconclusive and confirm with Firefox before believing it.
+11. **[Medium] Surface WebGL errors instead of swallowing them** — *OPEN, not started*.
+    `krust_runtime.js` calls `bufferData` / `texSubImage2D` / `drawArraysInstanced` and never
+    calls `getError`, so every GL error is silent. Bug A was reachable precisely because a
+    failed upload was indistinguishable from a successful one. A single `glGetError` check after
+    the atlas upload loop in `ensure_glyphs` would close the remaining half of that hole: a GL
+    error there can still leave a reserved slot pointing at a stale texel, which `release_slots`
+    does not currently catch because it only triggers on a short rasterize result.
+12. **[Low] Guard the raw-WASM export list** — *PARTIAL*. The one-liner in the Phase 2 process
+    note documents how to dump the export section, and `AGENTS.md` now records that
+    `client/src/exports.rs` is the only file where an export is defined. Not yet wired into
+    `render-check.sh` or `smoke-test.sh` as an automated assertion, which is where it belongs.
 

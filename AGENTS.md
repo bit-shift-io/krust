@@ -67,6 +67,17 @@ Krust is a Rust terminal emulator with a two-crate workspace:
   as `(ptr, len)` pairs allocated with `alloc` and freed with `free_string` /
   `free_result`; the runtime keeps `i32` handles into a heap registry
   (0 = null).
+- **Panics must stay visible.** Every wasm call site in `server.html` /
+  `render-test.html` wraps the exports in `try { ... } catch (_) {}`, and a
+  wasm panic reaches JS as a bare `RuntimeError: unreachable` with no message —
+  so a panic in the render path used to be completely silent while the WebGL
+  framebuffer went on presenting the last frame that finished drawing (which
+  looks like stale text that no longer matches the terminal state).
+  `install_panic_hook` in `client/src/exports.rs` logs message + source
+  location through `krust_console_log` on every wasm build; `init` also
+  panics with the underlying `TerminalState::new` error rather than a generic
+  string. Keep new entry points calling `install_panic_hook`, and keep real
+  error text in `unwrap_or_else`/`expect` messages.
 - **Glyph atlas:** no font is embedded and no font crate is linked. The
   WebGL2 atlas is baked with the browser's own Canvas 2D `fillText` via the
   shared FFI: fixed Unicode ranges at init plus a dynamic region for

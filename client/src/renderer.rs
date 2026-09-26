@@ -563,6 +563,31 @@ impl GlyphAtlas {
         out
     }
 
+    /// Roll back the slot reservations made for a chunk whose rasterization or
+    /// texture upload failed.
+    ///
+    /// `assign_slots` registers a char in `dynamic_index` *before* its pixels
+    /// reach the GPU. If the upload then fails, leaving the reservation in
+    /// place makes `uv_for` hand back a texel that still holds whichever glyph
+    /// previously occupied that slot — so the cell would paint a character that
+    /// is not in the terminal state, and `plan_missing` would never re-bake it
+    /// (it looks present). Releasing the reservation instead puts the char back
+    /// in the "not baked yet" state, so the next frame retries it.
+    // Only the wasm `ensure_glyphs` calls this in production; host builds
+    // reach it through the tests below.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn release_slots(&mut self, assigned: &[(char, u32)]) {
+        for &(ch, slot) in assigned {
+            let i = slot as usize;
+            if i < self.dynamic_slots.len() && self.dynamic_slots[i] == Some(ch) {
+                self.dynamic_slots[i] = None;
+                if self.dynamic_index.get(&ch) == Some(&slot) {
+                    self.dynamic_index.remove(&ch);
+                }
+            }
+        }
+    }
+
     /// Bake codepoints outside [`ATLAS_RANGES`] into the dynamic region using
     /// the same browser Canvas 2D engine as the static pass, then upload the
     /// results with `texSubImage2D`. Bounded work: only newly seen chars are
@@ -584,6 +609,9 @@ impl GlyphAtlas {
         for chunk in assignments.chunks(128) {
             let bitmaps = Self::rasterize_dynamic(chunk, gw, gh, font_px);
             if bitmaps.len() != chunk.len() {
+                // The slots above are already registered; drop them again so a
+                // failed bake can't surface a stale glyph. See `release_slots`.
+                self.release_slots(chunk);
                 continue;
             }
             for ((_, slot), bmp) in chunk.iter().zip(bitmaps) {
@@ -1098,8 +1126,7 @@ impl WebGL2Renderer {
                             sel, cur,
                         ]);
                     }
-                } else {
-                    let (u0, v0, u1, v1) = atlas.uv_for(ch).unwrap_or((0.0, 0.0, 0.0, 0.0));
+                } else if let Some((u0, v0, u1, v1)) = atlas.uv_for(ch) {
                     text.extend_from_slice(&[
                         px as f32, py as f32,   // offset
                         cell_wf, cell_hf,       // size
@@ -1109,6 +1136,11 @@ impl WebGL2Renderer {
                         sel, cur,
                     ]);
                 }
+                // No atlas entry for this codepoint: draw no glyph quad at all.
+                // Falling back to a default UV would sample whatever happens to
+                // sit at that texel and paint an unrelated character. Skipping
+                // leaves the cell background, and the next frame re-bakes it
+                // (see `ensure_glyphs`).
             }
         }
         (bg, text)
@@ -1210,6 +1242,73 @@ mod tests {
         assert!(atlas.uv_for(extra).is_some(), "new char was not baked");
         assert!(atlas.uv_for(chars[0]).is_some(), "recently used char was evicted");
         assert!(atlas.uv_for(chars[1]).is_none(), "LRU char was not evicted");
+    }
+
+    /// A char whose bake never reached the GPU must not keep its slot
+    /// reservation. Otherwise `uv_for` hands `build_instances` a texel still
+    /// holding the *previous* occupant's glyph, so the cell paints a character
+    /// that isn't in the terminal state — and `plan_missing` sees the char as
+    /// present, so it is never re-baked. That is the "phantom letters" glitch.
+    #[test]
+    fn a_failed_upload_releases_the_slot_instead_of_showing_a_stale_glyph() {
+        let mut atlas = scratch_atlas();
+        // Fill every slot so the next char is forced to evict the LRU one.
+        let cap = atlas.dynamic_slots.len();
+        let fillers: Vec<char> = (0..cap as u32)
+            .map(|i| char::from_u32(0x4E00 + i).unwrap())
+            .collect();
+        atlas.ensure_glyphs(0, &fillers).unwrap();
+        let evicted = fillers[0];
+        assert!(atlas.uv_for(evicted).is_some(), "precondition: atlas is full");
+
+        // This char claims the LRU slot, but its rasterization fails.
+        let fresh = '\u{9FA5}';
+        let assigned = atlas.assign_slots(&[fresh]);
+        assert!(
+            atlas.uv_for(fresh).is_some(),
+            "precondition: slot is reserved before the upload is attempted"
+        );
+
+        atlas.release_slots(&assigned);
+
+        assert!(
+            atlas.uv_for(fresh).is_none(),
+            "a char that failed to bake must not resolve to the evicted slot's \
+             stale texel, or the cell renders {} instead of {}",
+            evicted,
+            fresh
+        );
+        assert!(
+            atlas.plan_missing(&[fresh]).contains(&fresh),
+            "the char must go back on the to-bake list so the next frame retries it"
+        );
+    }
+
+    /// Releasing slots must not clobber a *different* char that has since taken
+    /// over the same slot, which is what happens when one frame's failure races
+    /// a later frame's re-bake.
+    #[test]
+    fn release_slots_leaves_a_reassigned_slot_alone() {
+        let mut atlas = scratch_atlas();
+        let first = '\u{4E00}';
+        let second = '\u{4E01}';
+        atlas.ensure_glyphs(0, &[first]).unwrap();
+        let slot = atlas.dynamic_index[&first];
+
+        // A stale chunk from an earlier frame still refers to `first`/`slot`,
+        // but `second` now owns that slot.
+        atlas.dynamic_slots[slot as usize] = Some(second);
+        atlas.dynamic_index.insert(second, slot);
+        atlas.dynamic_index.remove(&first);
+
+        atlas.release_slots(&[(first, slot)]);
+
+        assert_eq!(
+            atlas.dynamic_index.get(&second),
+            Some(&slot),
+            "rollback must not evict the char that currently owns the slot"
+        );
+        assert!(atlas.uv_for(second).is_some());
     }
 
     /// Without a DOM (host tests) the browser rasterizer must be a no-op: it

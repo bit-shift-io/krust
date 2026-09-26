@@ -151,6 +151,50 @@ pub extern "C" fn set_renderer_mode(mode: i32) {
 /// * `canvas_id_len` - Length of canvas element ID string
 ///
 /// Returns a JSON string pointer/len pair (caller must free).
+// --- Panic reporting ------------------------------------------------------
+
+/// Report Rust panics to the browser console instead of losing them.
+///
+/// A wasm panic reaches JS as a bare `RuntimeError: unreachable` with no
+/// message, and every call site in `server.html` wraps the wasm exports in
+/// `try { ... } catch (_) {}` so the throw is swallowed. A panic inside the
+/// render path is therefore completely invisible: the WebGL framebuffer keeps
+/// presenting the last frame that finished drawing, which reads on screen as
+/// stale text that no longer matches the terminal state. Logging the message
+/// and source location makes that failure mode diagnosable.
+#[cfg(target_arch = "wasm32")]
+fn install_panic_hook() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            let location = match info.location() {
+                Some(l) => format!("{}:{}:{}", l.file(), l.line(), l.column()),
+                None => "<unknown location>".to_string(),
+            };
+            let payload = info.payload();
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            ffi::console_log(&format!("krust panic: {} (at {})", message, location));
+        }));
+    });
+}
+
+/// No-op off wasm: the console import does not exist in host builds, and host
+/// tests rely on the default hook to report their own failures.
+#[cfg(not(target_arch = "wasm32"))]
+fn install_panic_hook() {}
+
+/// Initialize the terminal module and receive terminal config JSON.
+///
+/// # Parameters
+/// * `canvas_id_ptr` - Pointer to canvas element ID string
+/// * `canvas_id_len` - Length of canvas element ID string
+///
+/// Returns a JSON string pointer/len pair (caller must free).
 #[no_mangle]
 pub extern "C" fn init(
     canvas_id_ptr: *const u8,
@@ -158,6 +202,7 @@ pub extern "C" fn init(
     cached_dims_ptr: *const u8,
     cached_dims_len: usize,
 ) -> *mut u8 {
+    install_panic_hook();
     if canvas_id_ptr.is_null() || canvas_id_len == 0 {
         return write_string_to_wasm("".to_string()).0 as *mut u8;
     }
@@ -179,7 +224,7 @@ pub extern "C" fn init(
     };
 
     let term_state = TerminalState::new(&canvas_id, cached)
-        .unwrap_or_else(|_| panic!("terminal init failed"));
+        .unwrap_or_else(|e| panic!("terminal init failed: {}", e));
 
     let state_json = format!(
         "{{\"canvas_id\":{},\"rows\":{},\"cols\":{},\"cell_width\":{},\"cell_height\":{}}}",
