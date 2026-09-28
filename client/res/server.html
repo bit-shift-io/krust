@@ -702,15 +702,43 @@
             }
         });
 
+        // Wheel deltas are not one-event-per-notch everywhere: clicky mice send a
+        // single event per detent, but high-resolution wheels and trackpads send a
+        // burst of small-delta events for the same physical rotation. A terminal
+        // app scrolls 3 lines per button-64/65 report, so forwarding every event
+        // verbatim turns one notch into a screenful on those devices. Accumulate
+        // the deltas into lines (cell height is the pixel/line ratio) and emit
+        // only whole 3-line reports, carrying the remainder into the next event so
+        // slow scrolling still advances one report at a time.
+        const WHEEL_LINES_PER_REPORT = 3;
+        const WHEEL_MAX_REPORTS = 5;
+        let wheelAccLines = 0;
+
+        function wheelDeltaLines(e) {
+            if (e.deltaMode === 1) return e.deltaY;           // DOM_DELTA_LINE
+            if (e.deltaMode === 2) return e.deltaY * gridRows; // DOM_DELTA_PAGE
+            return e.deltaY / (cellH > 0 ? cellH : 16);        // DOM_DELTA_PIXEL
+        }
+
         window.addEventListener('wheel', (e) => {
             e.preventDefault();
-            if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b[?1000h'));
+            wheelAccLines += wheelDeltaLines(e);
+            const limit = WHEEL_MAX_REPORTS * WHEEL_LINES_PER_REPORT;
+            if (wheelAccLines > limit) wheelAccLines = limit;
+            else if (wheelAccLines < -limit) wheelAccLines = -limit;
+            const reports = Math.trunc(wheelAccLines / WHEEL_LINES_PER_REPORT);
+            if (reports === 0) return;
+            wheelAccLines -= reports * WHEEL_LINES_PER_REPORT;
+            if (!ws || ws.readyState !== 1) return;
+            ws.send(new TextEncoder().encode('\x1b[?1000h'));
             const rect = canvas.getBoundingClientRect();
             const x = Math.floor((e.clientX - rect.left) / cellW) + 1;
             const y = Math.floor((e.clientY - rect.top) / cellH) + 1;
-            const button = e.deltaY < 0 ? 64 : 65;
-            const seq = '\x1b[<' + button + ';' + x + ';' + y + 'M';
-            if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode(seq));
+            const button = reports < 0 ? 64 : 65;
+            for (let i = 0; i < Math.abs(reports); i++) {
+                const seq = '\x1b[<' + button + ';' + x + ';' + y + 'M';
+                ws.send(new TextEncoder().encode(seq));
+            }
         }, { passive: false });
 
         scrollbarEl.addEventListener('wheel', (e) => {
