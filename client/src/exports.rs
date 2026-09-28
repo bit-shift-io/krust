@@ -314,6 +314,41 @@ pub extern "C" fn repaint() {
     });
 }
 
+/// Whether the WebGL context is currently lost. `1` when a renderer exists
+/// and its context is gone, `0` otherwise.
+///
+/// The page checks this when the tab becomes visible again: a `repaint` into a
+/// lost context silently paints nothing, so without this check a tab that
+/// lost its context while hidden and then never saw
+/// `webglcontextrestored` (e.g. because the page was frozen) stays blank.
+#[no_mangle]
+pub extern "C" fn webgl_context_lost() -> i32 {
+    TERM_STATE.with(|cell| {
+        let guard = cell.borrow();
+        match guard.as_ref() {
+            Some(state) if state.webgl_is_lost() => 1,
+            _ => 0,
+        }
+    })
+}
+
+/// Drop the parser's state and start over from a blank screen.
+///
+/// Driven by the server's `{"type":"Reset"}` control frame, sent when this
+/// client has fallen so far behind that the bytes it is missing have already
+/// aged out of the retained window, so no contiguous tail can be sent.
+#[no_mangle]
+pub extern "C" fn reset_terminal() {
+    install_panic_hook();
+    TERM_STATE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(state) = guard.as_mut() {
+            state.reset();
+            ffi::console_log("KRUST: terminal reset after server-side resync");
+        }
+    });
+}
+
 /// Handle window/canvas resize - called from JS with new pixel dimensions.
 #[no_mangle]
 pub extern "C" fn handle_resize(width: i32, height: i32) {

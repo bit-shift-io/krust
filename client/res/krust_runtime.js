@@ -128,6 +128,7 @@ window.KRUST_RUNTIME = (function () {
     },
     krust_gl_get_shader_parameter: (gl, sh, pname) =>
       getObject(gl).getShaderParameter(getObject(sh), pname) ? 1 : 0,
+    krust_gl_is_context_lost: (gl) => (getObject(gl).isContextLost() ? 1 : 0),
     krust_gl_get_shader_info_log: (gl, sh, outPtr, outCap) =>
       writeStringTo(outPtr, outCap, getObject(gl).getShaderInfoLog(getObject(sh)) || ""),
     krust_gl_get_program_parameter: (gl, pr, pname) =>

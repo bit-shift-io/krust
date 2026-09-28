@@ -931,6 +931,18 @@ impl WebGL2Renderer {
         self.atlas.rebuild(self.ctx, css_w, css_h, self.dpr)
     }
 
+    /// Whether the WebGL context has been lost.
+    ///
+    /// Browsers drop a context when a tab is hidden or under memory pressure
+    /// (Firefox does this routinely), which invalidates every GL object this
+    /// renderer holds — after that, `render` silently no-ops and the terminal
+    /// stays frozen on the last frame. The page checks this when the tab comes
+    /// back so it can rebuild even if `webglcontextrestored` never arrived
+    /// (e.g. the page was frozen while hidden).
+    pub fn is_lost(&self) -> bool {
+        ffi::gl_is_context_lost(self.ctx)
+    }
+
     pub fn render(
         &mut self,
         screen: &vt100::Screen,

@@ -29,6 +29,7 @@
         );
         window.KRUST_RUNTIME.install(wasm.instance.exports.memory);
         const { init, set_renderer_mode, rebuild_webgl, process_bytes, query_replies, handle_resize, repaint,
+                webgl_context_lost, reset_terminal,
                 key_to_bytes, set_selection, selected_text, clear_selection,
                 scroll, scroll_to, scroll_to_bottom, scroll_to_top,
                 scroll_offset, scrollback_len, is_alt_screen, grid_metrics, version,
@@ -97,6 +98,14 @@
         // Render loop for frame coalescing
         let renderScheduled = false;
         function scheduleRender() {
+            // Browsers suspend requestAnimationFrame for hidden tabs, so a
+            // frame scheduled while hidden paints long after the fact, for
+            // nothing. Skip it: the focus/visibilitychange handlers already
+            // do a full repaint on the way back. Staying out of the way also
+            // leaves the main thread free to drain the WebSocket, and a
+            // client that drains promptly is what keeps the server from
+            // dropping frames on it.
+            if (document.hidden) return;
             if (!renderScheduled) {
                 renderScheduled = true;
                 requestAnimationFrame(() => {
@@ -178,27 +187,41 @@
 
         let lastTitle = 'krust | terminal';
         let lastRenderTime = 0;
+
+        // Full repaint of everything when the tab comes back. `repaint` is
+        // mark_all_dirty + render, i.e. a complete redraw from the parser
+        // state rather than a diff — which is what we want after a stretch
+        // where nothing was drawn. Rebuild the renderer first if the WebGL
+        // context was dropped while hidden: painting into a lost context is a
+        // silent no-op, so without this the tab can come back blank.
+        function repaintOnReturn() {
+            try {
+                if (webgl_context_lost() === 1) rebuild_webgl();
+            } catch (_) {}
+            try { repaint(); } catch (_) {}
+        }
+
         window.addEventListener('focus', () => {
             document.title = lastTitle;
             fit();
             const now = performance.now();
             if (now - lastRenderTime > 32) {
                 lastRenderTime = now;
-                try { repaint(); } catch (_) {}
+                repaintOnReturn();
             }
         });
         document.addEventListener('visibilitychange', () => {
             if (!document.hidden) {
                 fit();
-                try { repaint(); } catch (_) {}
+                repaintOnReturn();
             }
         });
         if ('IntersectionObserver' in window) {
             const observer = new IntersectionObserver((entries) => {
                 const entry = entries[entries.length - 1];
                 if (entry.isIntersecting && entry.intersectionRatio > 0) {
-                    try { fit(); } catch (_) {}
-                    try { repaint(); } catch (_) {}
+                    fit();
+                    repaintOnReturn();
                 }
             }, { threshold: 0 });
             observer.observe(canvas);
@@ -448,7 +471,7 @@
         // before the wasm module is ready, so the first history-replay burst
         // can race init) were queued instead of being fed to process_bytes.
         // Flush them now that the terminal state exists.
-        for (let i = 0; i < wsQueue.length; i++) handleWsData({ data: wsQueue[i] });
+        for (let i = 0; i < wsQueue.length; i++) handleIncoming(wsQueue[i]);
         wsQueue = [];
 
         const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -476,6 +499,70 @@
             console.log('SELFTEST', JSON.stringify({ rows, gridRows, gridCols, innerW: window.innerWidth, innerH: window.innerHeight, dpr: window.devicePixelRatio, N, maxMs: mx, avgMs: sum / N, wallMs: performance.now() - t0, bytesIn: bytesIn, scrollbackLen: scrollback_len(), offset: scroll_offset() }));
         }
 
+        // Route one inbound WebSocket payload. Control frames arrive as text;
+        // PTY output as binary. Both can land before init() has finished, in
+        // which case the payload is queued and replayed through here once the
+        // terminal state exists. Declared at this scope (not inside
+        // connectPrimary) because the post-init queue flush needs it too.
+        function handleIncoming(data) {
+            if (typeof data === 'string') {
+                let msg = null;
+                try { msg = JSON.parse(data); } catch (_) {}
+                if (!msg || msg.type !== 'Reset') return;
+                // The server's retained window has moved past this client's
+                // position, so no contiguous tail exists to bring the grid up
+                // to date. Drop the parser state; the retained log that
+                // follows starts on an ESC boundary and rebuilds the screen.
+                if (wasmReady) {
+                    try { reset_terminal(); } catch (_) {}
+                    scheduleRender();
+                } else {
+                    wsQueue.push(data);
+                }
+                return;
+            }
+            if (!wasmReady) {
+                wsQueue.push(data);
+                return;
+            }
+            handleWsData(data);
+        }
+
+        function handleWsData(ev) {
+            bytesIn += ev.byteLength;
+            const inData = new Uint8Array(ev);
+            const byteLen = inData.length;
+            const bytePtr = alloc(byteLen);
+            const wasmBuf = new Uint8Array(mem.buffer, bytePtr, byteLen);
+            wasmBuf.set(inData);
+            const boxPtr = query_replies(bytePtr, byteLen);
+            dealloc(bytePtr, byteLen);
+            if (boxPtr !== 0) {
+                const { dataPtr, dataLen, box } = exportBoxedPair(boxPtr);
+                const reps = readBytesCopy(dataPtr, dataLen);
+                free_memory(dataPtr, dataLen);
+                free_result(box);
+                if (reps.length && ws && ws.readyState === 1) ws.send(reps);
+            }
+            const t0 = performance.now();
+            if (params.get('benchskip') !== '1') {
+                const inPtr = alloc(inData.length);
+                new Uint8Array(mem.buffer, inPtr, inData.length).set(inData);
+                const summaryPtr = process_bytes(inPtr, inData.length);
+                dealloc(inPtr, inData.length);
+                if (summaryPtr !== 0) free_result(summaryPtr);
+                scheduleRender();
+            }
+            benchSample(performance.now() - t0);
+            curScroll = scroll_offset();
+            updateScrollbar();
+            const title = extractTitle(inData);
+            if (title) {
+                lastTitle = title + ' | terminal';
+                document.title = lastTitle;
+            }
+        }
+
         function connectPrimary(url) {
             ws = new WebSocket(url);
             ws.binaryType = 'arraybuffer';
@@ -498,52 +585,8 @@
                     ws.send(new TextEncoder().encode('seq 1 ' + b + '\r'));
                 }
             };
-            ws.onmessage = (ev) => {
-                if (!wasmReady) {
-                    // init() not called yet (the WebSocket opens before the
-                    // wasm module is ready) — hold the frame and feed it after
-                    // the terminal state exists, or the first history-replay
-                    // burst would be dropped and the prompt would never paint.
-                    wsQueue.push(ev.data);
-                    return;
-                }
-                handleWsData(ev);
-            };
+            ws.onmessage = (ev) => handleIncoming(ev.data);
 
-            function handleWsData(ev) {
-                bytesIn += ev.data.byteLength;
-                const inData = new Uint8Array(ev.data);
-                const byteLen = inData.length;
-                const bytePtr = alloc(byteLen);
-                const wasmBuf = new Uint8Array(mem.buffer, bytePtr, byteLen);
-                wasmBuf.set(inData);
-                const boxPtr = query_replies(bytePtr, byteLen);
-                dealloc(bytePtr, byteLen);
-                if (boxPtr !== 0) {
-                    const { dataPtr, dataLen, box } = exportBoxedPair(boxPtr);
-                    const reps = readBytesCopy(dataPtr, dataLen);
-                    free_memory(dataPtr, dataLen);
-                    free_result(box);
-                    if (reps.length) ws.send(reps);
-                }
-                const t0 = performance.now();
-                if (params.get('benchskip') !== '1') {
-                    const inPtr = alloc(inData.length);
-                    new Uint8Array(mem.buffer, inPtr, inData.length).set(inData);
-                    const summaryPtr = process_bytes(inPtr, inData.length);
-                    dealloc(inPtr, inData.length);
-                    if (summaryPtr !== 0) free_result(summaryPtr);
-                    scheduleRender();
-                }
-                benchSample(performance.now() - t0);
-                curScroll = scroll_offset();
-                updateScrollbar();
-                const title = extractTitle(inData);
-                if (title) {
-                    lastTitle = title + ' | terminal';
-                    document.title = lastTitle;
-                }
-            }
             ws.onerror = () => { showStatus('ws error'); };
             ws.onclose = () => {
                 showStatus('ws closed');

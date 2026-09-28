@@ -1021,10 +1021,146 @@ impl TerminalState {
     pub(crate) fn resize_screen(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows, cols);
     }
+
+    /// Throw away all parser state and start from a blank screen.
+    ///
+    /// Used when the server reports this client has fallen out of the
+    /// retained output window: a contiguous byte tail can no longer bring the
+    /// grid up to date, so the only correct move is to forget the old state
+    /// and rebuild it from the log that follows. The renderer is kept —
+    /// canvas, cell pitch and GL objects are all still valid — and the next
+    /// `render` is a full redraw because `mark_all_dirty` forces one.
+    pub(crate) fn reset(&mut self) {
+        self.parser = Parser::new(self.rows, self.cols, SCROLLBACK_LEN);
+        self.scroll = ScrollState::new();
+        self.selection = SelectionState::new();
+        self.prev_screen = None;
+        self.prev_cursor = None;
+        self.csi_su_carry.clear();
+        self.mark_all_dirty();
+    }
+
+    /// Whether the WebGL context has been lost, which leaves every GL object
+    /// krust holds invalid until the renderer is rebuilt.
+    pub(crate) fn webgl_is_lost(&self) -> bool {
+        self.webgl.as_ref().is_some_and(renderer::WebGL2Renderer::is_lost)
+    }
 }
 
 thread_local! {
     /// Global terminal state, initialized once by [`crate::init`]
     pub(crate) static TERM_STATE: RefCell<Option<TerminalState>> =
         const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+mod resync_tests {
+    use vt100::Parser;
+
+    /// The whole visible content of the screen, as text.
+    ///
+    /// A blank cell reports empty contents (vt100 stores `len: 0` rather than
+    /// a space), so render those as spaces to keep columns meaningful.
+    fn screen_text(p: &Parser) -> String {
+        let (rows, cols) = p.screen().size();
+        let mut out = String::new();
+        for row in 0..rows {
+            let mut line = String::new();
+            for col in 0..cols {
+                match p.screen().cell(row, col) {
+                    Some(c) if !c.contents().is_empty() => line.push_str(c.contents()),
+                    _ => line.push(' '),
+                }
+            }
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Regression: a resumed stream that begins mid-escape-sequence makes the
+    /// parser print the orphaned tail as literal text. This is what put
+    /// `;255m`, `25h` and `6l156;245m` in the input field — the server
+    /// replayed a history buffer trimmed at an arbitrary byte offset, so the
+    /// tail of an SGR/DECSET sequence was parsed as ground text in cells the
+    /// application never wrote.
+    #[test]
+    fn mid_sequence_resume_prints_orphaned_escape_text() {
+        let mut p = Parser::new(6, 80, 0);
+        p.process(b"\x1b[1;1Hfield");
+        // Resumed in the middle of "\x1b[38;5;255m".
+        p.process(b";255m");
+        let text = screen_text(&p);
+        assert!(
+            text.contains(";255m"),
+            "expected the orphaned tail to be painted:\n{}",
+            text
+        );
+    }
+
+    /// The fix: the server trims the retained log on an ESC boundary, so a
+    /// fresh client replaying it never starts mid-sequence and never prints
+    /// escape-sequence text into the grid.
+    #[test]
+    fn esc_boundary_resume_prints_no_escape_text() {
+        let mut p = Parser::new(6, 80, 0);
+        // A replay that begins on an ESC, as the boundary-aligned trim
+        // guarantees, including the sequences the bug report showed up in.
+        p.process(b"\x1b[?1006l\x1b[38;5;255m\x1b[?25htext");
+        let text = screen_text(&p);
+        assert!(
+            !text.contains(";255m") && !text.contains("25h") && !text.contains("6l"),
+            "no escape-sequence fragments may reach the grid:\n{}",
+            text
+        );
+        assert!(text.contains("text"), "content should still render:\n{}", text);
+    }
+
+    /// A delta resync continues the client's own byte stream, so the parser
+    /// resumes mid-sequence exactly where it left off and nothing is lost.
+    #[test]
+    fn delta_resync_is_invisible_to_the_parser() {
+        let stream: &[u8] = b"\x1b[2J\x1b[1;1Halpha\x1b[38;2;156;245mbeta";
+
+        // Whole stream in one go.
+        let mut whole = Parser::new(6, 80, 0);
+        whole.process(stream);
+        let expected = screen_text(&whole);
+
+        // Same stream, delivered as a prefix plus a delta tail, with the
+        // split landing in the middle of the SGR parameter list.
+        let split = stream.len() - 6;
+        let mut split_parser = Parser::new(6, 80, 0);
+        split_parser.process(&stream[..split]);
+        split_parser.process(&stream[split..]);
+        assert_eq!(
+            screen_text(&split_parser),
+            expected,
+            "a delta resync must not change the resulting screen"
+        );
+    }
+
+    /// A duplicated resync (the old drop-then-replay-everything behaviour)
+    /// does change the result, which is why the tail is sent instead.
+    ///
+    /// The stream uses relative cursor motion, which is what a TUI emits
+    /// between full repaints. Replaying it runs those relative moves twice, so
+    /// the second copy of the glyph lands further along the row — and lands in
+    /// cells the application's own model has no knowledge of, which is exactly
+    /// the reported symptom (arrow keys skip them, typing overwrites them, and
+    /// a copy still yields them).
+    #[test]
+    fn duplicated_replay_is_not_equivalent() {
+        let stream: &[u8] = b"\x1b[3CX";
+        let mut whole = Parser::new(6, 80, 0);
+        whole.process(stream);
+        let expected = screen_text(&whole);
+        assert_eq!(expected, "   X\n\n\n\n\n\n");
+
+        let mut replayed = Parser::new(6, 80, 0);
+        replayed.process(stream);
+        replayed.process(stream);
+        assert_eq!(screen_text(&replayed), "   X   X\n\n\n\n\n\n");
+        assert_ne!(screen_text(&replayed), expected);
+    }
 }
