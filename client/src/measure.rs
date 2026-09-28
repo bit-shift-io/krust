@@ -14,8 +14,7 @@ pub(crate) const CELL_EPSILON: f64 = 0.5;
 /// atlas and the Canvas 2D reference resolve identical families and per-glyph
 /// fallback. Only the wasm atlas rasterizer consumes it.
 #[cfg(target_arch = "wasm32")]
-pub(crate) const FONT_FAMILIES: &str =
-    "'JetBrains Mono', 'Fira Code', Menlo, Consolas, monospace";
+pub(crate) const FONT_FAMILIES: &str = "'JetBrains Mono', 'Fira Code', Menlo, Consolas, monospace";
 
 /// CSS font size (px) the Canvas 2D renderer draws text at. The WebGL2 atlas
 /// rasterizes glyphs at `FONT_SIZE_CSS * dpr` device px to match.
@@ -67,7 +66,14 @@ fn rasterized_glyph_height_max(probes: &[&str], _font_ctx: JsHandle) -> Option<f
         ffi::ctx_set_fill_style(ctx, "#ffffff");
         ffi::ctx_set_text_baseline(ctx, "alphabetic");
         ffi::ctx_fill_text(ctx, ch, 8.0, 40.0);
-        let written = ffi::ctx_get_image_data(ctx, 0.0, 0.0, SCRATCH_SIZE as f64, SCRATCH_SIZE as f64, &mut px);
+        let written = ffi::ctx_get_image_data(
+            ctx,
+            0.0,
+            0.0,
+            SCRATCH_SIZE as f64,
+            SCRATCH_SIZE as f64,
+            &mut px,
+        );
         if written < px.len() {
             ffi::release(ctx);
             ffi::release(scratch);
@@ -137,7 +143,10 @@ fn measure_text_advance(ctx: JsHandle) -> (f64, Option<f64>) {
 /// the painted glyphs for whatever font the system resolves the stack to.
 pub(crate) fn measure_cell_dimensions(ctx: JsHandle) -> (f64, f64) {
     let (width, fallback) = measure_text_advance(ctx);
-    finish_cell_dims(width, rasterized_glyph_height_max(MEASURE_PROBES, ctx).or(fallback))
+    finish_cell_dims(
+        width,
+        rasterized_glyph_height_max(MEASURE_PROBES, ctx).or(fallback),
+    )
 }
 
 /// Measure cell dimensions using a throwaway scratch canvas, so the real
@@ -175,20 +184,108 @@ pub(crate) fn measure_cell_dimensions_scratch() -> Option<(f64, f64)> {
     result
 }
 
-/// Round the measured width/height to whole device pixels and sanity-guard them.
+/// Round the measured width/height to whole CSS pixels and sanity-guard them.
 ///
-/// Snap to whole device pixels (xterm-style): every cell starts on an integer
-/// coordinate, so adjacent glyphs share exact pixel boundaries instead of
-/// leaving anti-aliased hairline seams at fractional advances. Columns/rows are
-/// then `floor(canvas / cell)` and any leftover pixels become background
-/// padding around the terminal.
+/// This is a coarse first pass: a whole number of CSS pixels is only a whole
+/// number of *device* pixels when `devicePixelRatio` is an integer, so it is
+/// not by itself enough to keep cells pixel-exact. [`device_pitch`] does the
+/// real snapping, in device pixels, and the CSS size callers draw with is
+/// derived back from it. Columns/rows then come from `fit_grid` and any
+/// leftover pixels become padding around the terminal.
 fn finish_cell_dims(width: f64, height: Option<f64>) -> (f64, f64) {
     let width = width.round().max(1.0);
     let height = height.unwrap_or(20.0).round().max(1.0);
     (width, height)
 }
 
+/// Cell pitch in whole device pixels for a CSS-pixel cell size.
+///
+/// Both renderers and the grid fit have to agree on one pitch, because the fit
+/// multiplies a cell count by it and each renderer multiplies that same count
+/// by it again — if they disagreed, the grid would be laid out at one width and
+/// drawn at another, and the wider one runs off the canvas edge.
+///
+/// The pitch must be a whole number of device pixels: the WebGL2 glyph atlas is
+/// a 1:1 texel-to-device-pixel bitmap, so a fractional cell would resample
+/// every glyph on every frame. Canvas 2D has no such constraint (it draws under
+/// a scaled transform) and would happily use the fractional pitch, which is
+/// exactly how the two paths drifted apart. Ceiling rather than rounding keeps
+/// the atlas slot at least as wide as the font's real advance, so a wide glyph
+/// is never clipped at the right edge of its cell.
+pub(crate) fn device_pitch(css: f64, dpr: f64) -> i64 {
+    (css.max(1.0) * dpr.max(1.0)).ceil().max(1.0) as i64
+}
+
+/// Fit a cell grid inside `avail` device pixels and center it in the leftover.
+///
+/// Returns `(count, origin)`: how many whole cells fit — never more than
+/// `avail / cell`, so the grid can always be drawn entirely inside the canvas —
+/// and the pixel offset of the grid from the canvas origin. The leftover is
+/// split evenly, so the grid ends up centered with a small margin on each side
+/// rather than hugging one edge. Both values are whole device pixels, which is
+/// what keeps every cell boundary pixel-exact.
+pub(crate) fn fit_grid(avail: i64, cell: i64) -> (i64, i64) {
+    let avail = avail.max(0);
+    let cell = cell.max(1);
+    let count = avail / cell;
+    (count, (avail - count * cell) / 2)
+}
+
 /// Format a `0xRRGGBB` integer as an HTML/CSS `#rrggbb` string.
 pub(crate) fn css_color(rgb: u32) -> String {
     format!("#{:06x}", rgb)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_grid_never_lays_out_wider_than_the_canvas() {
+        // The regression this guards: columns were counted in CSS pixels but
+        // drawn at a wider device-pixel pitch, so the grid ran off the right
+        // edge of the window.
+        for avail in 0..600i64 {
+            for cell in 1..40i64 {
+                let (count, origin) = fit_grid(avail, cell);
+                assert!(count >= 0);
+                assert!(origin >= 0);
+                assert!(
+                    origin * 2 + count * cell <= avail,
+                    "grid {count}x{cell} at {origin} overflows {avail}"
+                );
+                // The leftover is split as evenly as whole pixels allow.
+                let right = avail - (origin + count * cell);
+                assert!(right.abs_diff(origin) <= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn fit_grid_uses_every_whole_cell_that_fits() {
+        assert_eq!(fit_grid(1500, 11), (136, 2));
+        assert_eq!(fit_grid(1000, 8), (125, 0));
+        // Too small for a single cell: the caller's minimum (2 cols, 1 row)
+        // takes over rather than the fit inventing negative space.
+        assert_eq!(fit_grid(5, 11), (0, 2));
+        assert_eq!(fit_grid(0, 11), (0, 0));
+    }
+
+    #[test]
+    fn device_pitch_is_whole_pixels_and_round_trips_through_css() {
+        for dpr in [1.0, 1.25, 1.5, 2.0, 3.0] {
+            for css in [1.0, 7.0, 8.4, 9.0, 14.0] {
+                let dev = device_pitch(css, dpr);
+                assert!(dev >= 1);
+                assert_eq!(dev as f64, (css * dpr).ceil());
+                // The atlas slot must never be narrower than the font's real
+                // advance, or wide glyphs get clipped at the cell edge.
+                assert!(dev as f64 >= css * dpr);
+                // Deriving the CSS size from the integer pitch must round-trip,
+                // or the page's hit-testing drifts away from what is drawn.
+                let snapped = dev as f64 / dpr;
+                assert_eq!(device_pitch(snapped, dpr), dev);
+            }
+        }
+    }
 }

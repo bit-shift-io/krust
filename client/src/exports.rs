@@ -235,9 +235,9 @@ pub extern "C" fn init(
         json_f64(term_state.cell_height),
     );
 
-TERM_STATE.with(|s| *s.borrow_mut() = Some(term_state));
-     let (ptr, len) = write_string_to_wasm(state_json);
-     return_pair(ptr as *mut u8, len)
+    TERM_STATE.with(|s| *s.borrow_mut() = Some(term_state));
+    let (ptr, len) = write_string_to_wasm(state_json);
+    return_pair(ptr as *mut u8, len)
 }
 
 /// Process incoming ANSI bytes from the WebSocket.
@@ -328,28 +328,48 @@ pub extern "C" fn handle_resize(width: i32, height: i32) {
                 (s.cell_width, s.cell_height)
             };
             s.set_cell_dims(cw, ch);
-            let dpr = ffi::window_dpr(ffi::window());
-            let phys_w = (width as f64) * dpr;
-            let phys_h = (height as f64) * dpr;
+            let dpr = ffi::window_dpr(ffi::window()).max(1.0);
+            // Round, don't truncate: the buffer size and the fit below have to
+            // agree to the pixel or the grid's margins end up lopsided.
+            let phys_w = ((width as f64) * dpr).round();
+            let phys_h = ((height as f64) * dpr).round();
             ffi::canvas_set_width(s.canvas_handle(), phys_w as u32);
             ffi::canvas_set_height(s.canvas_handle(), phys_h as u32);
-            let cols = ((width as f64) / cw).floor() as u16;
-            let rows = ((height as f64) / ch).floor() as u16;
-            let cols = cols.max(2);
-            let rows = rows.max(1);
+            // Fit the grid to the canvas in whole device pixels and center it in
+            // the leftover, so the terminal never draws past the window edge.
+            s.refit(phys_w as i64, phys_h as i64);
+            let (rows, cols) = s.size();
             s.resize_screen(rows, cols);
-            s.set_dims(rows, cols);
             s.mark_all_dirty();
             if let Some(w) = s.webgl_mut() {
-                w.cell_w = (cw * dpr).ceil() as u32;
-                w.cell_h = (ch * dpr).ceil() as u32;
-                w.rows = rows;
-                w.cols = cols;
                 let _ = w.rebuild_atlas();
             }
             s.trigger_resize(rows, cols);
         }
     });
+}
+
+/// Grid geometry after the last fit: `{"rows":R,"cols":C,"x":X,"y":Y}`.
+///
+/// `x`/`y` are the CSS-pixel origin of the centered grid, which the page needs
+/// to map mouse coordinates onto cells.
+#[no_mangle]
+pub extern "C" fn grid_metrics() -> *mut u8 {
+    let json = TERM_STATE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|s| {
+                let dpr = ffi::window_dpr(ffi::window()).max(1.0);
+                let (x, y) = s.origin_css(dpr);
+                format!(
+                    "{{\"rows\":{},\"cols\":{},\"x\":{},\"y\":{}}}",
+                    s.rows, s.cols, x, y
+                )
+            })
+            .unwrap_or_else(|| "{\"rows\":0,\"cols\":0,\"x\":0,\"y\":0}".to_string())
+    });
+    let (ptr, len) = write_string_to_wasm(json);
+    return_pair(ptr as *mut u8, len)
 }
 
 /// Get the version info for the terminal module.
@@ -422,8 +442,7 @@ pub extern "C" fn handle_click(x: i32, y: i32) -> *mut u8 {
         if let Some(state) = guard.as_mut() {
             state.clear_selection();
             let _ = state.render();
-            let col = (x as f64 / state.cell_width).floor() as u16;
-            let row = (y as f64 / state.cell_height).floor() as u16;
+            let (row, col) = state.cell_at(x as f64, y as f64);
             format!("{{\"row\":{},\"col\":{}}}", row, col)
         } else {
             String::new()
@@ -506,6 +525,20 @@ pub extern "C" fn scrollback_len() -> u32 {
         cell.borrow_mut()
             .as_mut()
             .map(|s| s.scrollback_len() as u32)
+            .unwrap_or(0)
+    })
+}
+
+/// Whether the alternate screen is active (1 = alt screen, 0 = normal).
+///
+/// The page uses this to suppress the scrollback scrollbar while a full-screen
+/// TUI owns the screen, since such apps manage their own scrolling.
+#[no_mangle]
+pub extern "C" fn is_alt_screen() -> i32 {
+    TERM_STATE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|s| i32::from(s.is_alt_screen()))
             .unwrap_or(0)
     })
 }

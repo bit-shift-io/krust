@@ -86,6 +86,27 @@ Krust is a Rust terminal emulator with a two-crate workspace:
   is `&mut self` so it can bake newly seen glyphs before drawing. `▣`
   (`graphics.rs`) and braille (`renderer.rs`) are synthesized, not
   font-rendered.
+- **Grid geometry is device-pixel-exact.** `measure::finish_cell_dims` rounds the
+  measured CSS cell to whole device pixels (`device_pitch = ceil(css * dpr)`) and
+  the CSS pitch is derived back as `device_pitch / dpr`, so browser zoom
+  produces slightly fractional CSS cell sizes on purpose — never re-round those,
+  or the grid drifts off the pixel grid. `grid_metrics` exports the grid origin
+  and cell box so the page can center the grid inside the canvas at that pitch.
+  `window_dpr` only floors at 1.0; the page must not clamp DPR independently
+  (a `Math.min(3, ...)` once made the JS cell size and the Rust buffer size
+  disagree above 3x).
+- **Scrollbar:** shown only when there is real scrollback and the parser is not
+  on the alternate screen (`scrollable = max > 0 && !is_alt_screen()`), and it
+  is display-gated with `pointer-events: none` so it never eats clicks. Note
+  `vt100` builds the alternate grid with `Grid::new(size, 0)`, so alt-mode
+  `scrollback_len()` is already 0 — the `is_alt_screen()` check is a readable
+  guard on that invariant, not the thing that makes hiding work.
+- **Terminal capability replies:** `query_replies` must answer what a shell
+  probes at startup or the PTY appears dead. It covers DA1/DA2/CPR/OSC-11 plus
+  XTVERSION (`CSI > 0 q`), TERM (`DCS > | … ST`), and XTGETTCAP
+  (`DCS + q … ST`, answered as `DCS 0 + r … ST`). `TERM_NAME`/`TERM_VERSION`
+  in `query.rs` are the single source for those. An unterminated or
+  non-hex XTGETTCAP body is deliberately not answered, rather than guessed at.
 - **Tests:** Unit tests live alongside code in `#[cfg(test)] mod tests`.
   Server tests use `tower::util::ServiceExt` for one-shot HTTP requests.
 - **CORS:** `tower-http::cors::CorsLayer::permissive()` is enabled on all
@@ -142,6 +163,8 @@ the `krust` FFI registry.
 | `clear_selection()` | Clear active selection |
 | `handle_click(x, y)` | Clear selection, return clicked cell (boxed pair) |
 | `scroll_to*`, `scroll_offset`, `scrollback_len`, `selection_mode` | Scrollback/selection introspection |
+| `is_alt_screen()` | `1` while the parser owns the alternate screen (alt buffer) |
+| `grid_metrics()` | Grid origin, cell box, and row/col counts as JSON (boxed pair) |
 | `version()` | Module version string (boxed pair) |
 
 Memory: `alloc`/`dealloc` (caller buffers), `free_memory`, `free_string`,
