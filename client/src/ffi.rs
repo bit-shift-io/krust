@@ -58,6 +58,7 @@ extern "C" {
     fn krust_gl_get_program_info_log(gl: i32, pr: i32, out: *mut u8, cap: usize) -> usize;
     fn krust_gl_attach_shader(gl: i32, pr: i32, sh: i32);
     fn krust_gl_link_program(gl: i32, pr: i32);
+    fn krust_gl_is_context_lost(gl: i32) -> u32;
     fn krust_gl_use_program(gl: i32, pr: i32);
     fn krust_gl_create_buffer(gl: i32) -> i32;
     fn krust_gl_bind_buffer(gl: i32, target: u32, buf: i32);
@@ -194,6 +195,12 @@ pub(crate) fn console_log(s: &str) {
 /// Release a JS object handle from the registry.
 pub(crate) fn release(h: JsHandle) {
     unsafe { krust_release(h) }
+}
+
+/// Check if the WebGL context has been lost (e.g., after the tab was hidden).
+pub(crate) fn gl_is_context_lost(gl: JsHandle) -> bool {
+    let lost = unsafe { krust_gl_is_context_lost(gl) };
+    lost != 0
 }
 
 // --- Canvas 2D ------------------------------------------------------------

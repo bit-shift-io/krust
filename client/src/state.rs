@@ -502,6 +502,24 @@ impl TerminalState {
     /// when WebGL2 was unavailable. Honors the `needs_render` flag set by
     /// `schedule_render` to enable frame coalescing.
     pub(crate) fn render(&mut self) -> Result<(), String> {
+        // Browsers may drop the WebGL context while a tab or iframe is hidden
+        // (notably on Firefox under memory pressure, but also Chrome when the
+        // browser is under pressure). When the context is lost, all GL calls
+        // become silent no-ops and the terminal freezes as a blank canvas
+        // until a page reload. Detect this here and rebuild the renderer so
+        // the next frame paints correctly as soon as the context is restored.
+        if let Some(w) = self.webgl.as_mut() {
+            // Check if the underlying WebGL context has been lost. If so,
+            // rebuild the renderer to restore drawing.
+            if ffi::gl_is_context_lost(w.ctx) {
+                let rebuilt = self.rebuild_webgl();
+                if rebuilt.is_err() {
+                    // If we cannot rebuild (no GL context available), fall back
+                    // to Canvas 2D renderer which is more resilient.
+                    return self.render_canvas2d();
+                }
+            }
+        }
         // Always render (caller decides when to invoke). The `needs_render`
         // flag only controls full vs selective strategy inside render_canvas2d.
         self.needs_render = false;

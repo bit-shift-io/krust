@@ -118,6 +118,13 @@ window.KRUST_RUNTIME = (function () {
     },
 
     // --- WebGL2 -----------------------------------------------------------
+    krust_gl_is_context_lost: (gl) => {
+      try {
+        return getObject(gl).isContextLost() ? 1 : 0;
+      } catch (_) {
+        return 0;
+      }
+    },
     krust_gl_create_program: (gl) => addObject(getObject(gl).createProgram()),
     krust_gl_create_shader: (gl, kind) => addObject(getObject(gl).createShader(kind)),
     krust_gl_shader_source: (gl, sh, p, l) => {
