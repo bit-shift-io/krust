@@ -385,6 +385,20 @@ pub extern "C" fn handle_resize(width: i32, height: i32) {
     });
 }
 
+/// Reset the previous screen state to None, forcing a full redraw on the
+/// next `compute_dirty_cells()` call. This is useful after the terminal has
+/// been hidden for a period, to ensure the dirty cell mechanism starts with a
+/// fresh state rather than comparing against stale state from before the hide.
+#[no_mangle]
+pub extern "C" fn reset_prev_screen() {
+    TERM_STATE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(state) = guard.as_mut() {
+            state.reset_prev_screen();
+        }
+    });
+}
+
 /// Grid geometry after the last fit: `{"rows":R,"cols":C,"x":X,"y":Y}`.
 ///
 /// `x`/`y` are the CSS-pixel origin of the centered grid, which the page needs

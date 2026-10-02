@@ -1070,6 +1070,16 @@ impl TerminalState {
         self.mark_all_dirty();
     }
 
+    /// Reset only the previous screen state to None, forcing a full redraw
+    /// on the next `compute_dirty_cells()` call. This is useful after the
+    /// terminal has been hidden for a period, to ensure the dirty cell
+    /// mechanism starts with a fresh state rather than comparing against
+    /// stale state from before the hide.
+    pub(crate) fn reset_prev_screen(&mut self) {
+        self.prev_screen = None;
+        self.mark_all_dirty();
+    }
+
     /// Whether the WebGL context has been lost, which leaves every GL object
     /// krust holds invalid until the renderer is rebuilt.
     pub(crate) fn webgl_is_lost(&self) -> bool {
