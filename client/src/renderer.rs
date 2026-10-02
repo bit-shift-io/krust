@@ -25,6 +25,7 @@
 use crate::color::{cell_visual, CellOverride};
 use crate::ffi::{self, JsHandle};
 use crate::graphics::graphic_cell_rects;
+use crate::measure::device_pitch;
 #[cfg(target_arch = "wasm32")]
 use crate::measure::FONT_FAMILIES;
 use crate::measure::FONT_SIZE_CSS;
@@ -72,16 +73,56 @@ struct AtlasRange {
 /// Ranges baked into the glyph atlas. Kept sorted by `start` so
 /// `uv_for()` can scan linearly (the list is tiny).
 const ATLAS_RANGES: &[AtlasRange] = &[
-    AtlasRange { start: 0x0000, len: 128, offset: 0 },    // ASCII
-    AtlasRange { start: 0x2190, len: 112, offset: 128 },  // Arrows (spinner ↻ ↺ ← →)
-    AtlasRange { start: 0x2200, len: 256, offset: 240 },  // Math operators (⋯ ⊶ ⊷ ⇦ ⇨)
-    AtlasRange { start: 0x2580, len: 128, offset: 496 },  // Block parts (U+2581-259F) + Geometric shapes (U+25A0-25FF)
-    AtlasRange { start: 0x2700, len: 192, offset: 624 },  // Dingbats (✦ ✧ ✶ ✔)
-    AtlasRange { start: 0x2800, len: 256, offset: 816 },  // Braille
-    AtlasRange { start: 0x00A0, len: 96, offset: 1072 },  // Latin-1 Supplement (· ° ± « »)
-    AtlasRange { start: 0x2000, len: 112, offset: 1168 }, // General Punctuation (… – — ‘ ’ “ ”)
-    AtlasRange { start: 0x20A0, len: 48, offset: 1280 },  // Currency (€ £ ¥)
-    AtlasRange { start: 0x2600, len: 256, offset: 1328 }, // Misc Symbols (☀ ⚙ ⚠ ★)
+    AtlasRange {
+        start: 0x0000,
+        len: 128,
+        offset: 0,
+    }, // ASCII
+    AtlasRange {
+        start: 0x2190,
+        len: 112,
+        offset: 128,
+    }, // Arrows (spinner ↻ ↺ ← →)
+    AtlasRange {
+        start: 0x2200,
+        len: 256,
+        offset: 240,
+    }, // Math operators (⋯ ⊶ ⊷ ⇦ ⇨)
+    AtlasRange {
+        start: 0x2580,
+        len: 128,
+        offset: 496,
+    }, // Block parts (U+2581-259F) + Geometric shapes (U+25A0-25FF)
+    AtlasRange {
+        start: 0x2700,
+        len: 192,
+        offset: 624,
+    }, // Dingbats (✦ ✧ ✶ ✔)
+    AtlasRange {
+        start: 0x2800,
+        len: 256,
+        offset: 816,
+    }, // Braille
+    AtlasRange {
+        start: 0x00A0,
+        len: 96,
+        offset: 1072,
+    }, // Latin-1 Supplement (· ° ± « »)
+    AtlasRange {
+        start: 0x2000,
+        len: 112,
+        offset: 1168,
+    }, // General Punctuation (… – — ‘ ’ “ ”)
+    AtlasRange {
+        start: 0x20A0,
+        len: 48,
+        offset: 1280,
+    }, // Currency (€ £ ¥)
+    AtlasRange {
+        start: 0x2600,
+        len: 256,
+        offset: 1328,
+    }, // Misc Symbols (☀ ⚙ ⚠ ★)
 ];
 
 /// Per-instance floats: offset(2) + size(2) + uv(4) + fg(3) + bg(3) + sel(1) + cur(1) = 16
@@ -178,8 +219,8 @@ fn is_static_cp(cp: u32) -> bool {
 
 impl GlyphAtlas {
     pub fn new(gl: JsHandle, cell_w: f64, cell_h: f64, dpr: f64) -> Result<Self, String> {
-        let glyph_w = (cell_w * dpr).ceil() as u32;
-        let glyph_h = (cell_h * dpr).ceil() as u32;
+        let glyph_w = device_pitch(cell_w, dpr) as u32;
+        let glyph_h = device_pitch(cell_h, dpr) as u32;
 
         // Count total glyphs across all ranges.
         let total: u32 = ATLAS_RANGES.iter().map(|r| r.len).sum();
@@ -273,13 +314,7 @@ impl GlyphAtlas {
     /// No-op without a DOM (host tests): the atlas stays blank and the
     /// font-independent logic (UVs, braille, geometry) is what tests exercise.
     #[cfg(target_arch = "wasm32")]
-    fn rasterize_atlas(
-        data: &mut [u8],
-        atlas_w: u32,
-        glyph_w: u32,
-        glyph_h: u32,
-        font_px: f64,
-    ) {
+    fn rasterize_atlas(data: &mut [u8], atlas_w: u32, glyph_w: u32, glyph_h: u32, font_px: f64) {
         let win = ffi::window();
         if win == 0 {
             return;
@@ -353,9 +388,8 @@ impl GlyphAtlas {
                 let sy = slot_row * (glyph_h + ATLAS_PADDING);
                 for gy in 0..glyph_h {
                     for gx in 0..glyph_w {
-                        let a = px[(((slot_row * pitch_y + gy) * cw)
-                            + slot_col * pitch_x
-                            + gx) as usize
+                        let a = px[(((slot_row * pitch_y + gy) * cw) + slot_col * pitch_x + gx)
+                            as usize
                             * 4
                             + 3];
                         if a > 0 {
@@ -402,10 +436,7 @@ impl GlyphAtlas {
             glyph_h as f32 * 0.67,
             glyph_h as f32 * 0.92,
         ];
-        let cx = [
-            x + xs[0].round() as u32,
-            x + xs[1].round() as u32,
-        ];
+        let cx = [x + xs[0].round() as u32, x + xs[1].round() as u32];
         let cy = [
             y + ys[0].round() as u32,
             y + ys[1].round() as u32,
@@ -841,6 +872,11 @@ pub struct WebGL2Renderer {
     pub cell_h: u32,
     pub rows: u16,
     pub cols: u16,
+    /// Pixel offset of the grid inside the drawing buffer, in device pixels.
+    /// The grid holds only the whole cells that fit and is centered in the
+    /// leftover, so the buffer needs this to place cell (0,0).
+    pub origin_x: u32,
+    pub origin_y: u32,
     pub dpr: f64,
 }
 
@@ -879,10 +915,12 @@ impl WebGL2Renderer {
             ctx: gl,
             atlas,
             brush,
-            cell_w: (cell_w * dpr).ceil() as u32,
-            cell_h: (cell_h * dpr).ceil() as u32,
+            cell_w: device_pitch(cell_w, dpr) as u32,
+            cell_h: device_pitch(cell_h, dpr) as u32,
             rows,
             cols,
+            origin_x: 0,
+            origin_y: 0,
             dpr,
         })
     }
@@ -891,6 +929,18 @@ impl WebGL2Renderer {
         let css_w = self.cell_w as f64 / self.dpr;
         let css_h = self.cell_h as f64 / self.dpr;
         self.atlas.rebuild(self.ctx, css_w, css_h, self.dpr)
+    }
+
+    /// Whether the WebGL context has been lost.
+    ///
+    /// Browsers drop a context when a tab is hidden or under memory pressure
+    /// (Firefox does this routinely), which invalidates every GL object this
+    /// renderer holds — after that, `render` silently no-ops and the terminal
+    /// stays frozen on the last frame. The page checks this when the tab comes
+    /// back so it can rebuild even if `webglcontextrestored` never arrived
+    /// (e.g. the page was frozen while hidden).
+    pub fn is_lost(&self) -> bool {
+        ffi::gl_is_context_lost(self.ctx)
     }
 
     pub fn render(
@@ -931,8 +981,8 @@ impl WebGL2Renderer {
         // Use the full drawing buffer as the viewport so the destination rect
         // always matches it (avoids Firefox's "Drawing to a destination rect
         // smaller than the viewport rect" warning). The grid is laid out from
-        // pixel origin (0,0) downward (top-left convention), so it occupies
-        // the top-left corner of the buffer.
+        // its own pixel origin downward (top-left convention), so it occupies
+        // a centered block of the buffer with a small margin on each side.
         let buf_w = ffi::canvas_width(self.canvas);
         let buf_h = ffi::canvas_height(self.canvas);
 
@@ -949,8 +999,20 @@ impl WebGL2Renderer {
         ffi::gl_uniform1i(gl, self.brush.atlas_loc, 0);
 
         let (bg_instances, text_instances) = Self::build_instances(
-            rows, cols, self.cell_w, self.cell_h, &self.atlas, screen,
-            prows, pcols, selection, cursor, default_fg, default_bg,
+            rows,
+            cols,
+            self.cell_w,
+            self.cell_h,
+            self.origin_x,
+            self.origin_y,
+            &self.atlas,
+            screen,
+            prows,
+            pcols,
+            selection,
+            cursor,
+            default_fg,
+            default_bg,
             self.dpr,
         );
         let bg_count = bg_instances.len() / INSTANCE_FLOATS;
@@ -1035,11 +1097,14 @@ impl WebGL2Renderer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_instances(
         rows: u32,
         cols: u32,
         cell_w: u32,
         cell_h: u32,
+        origin_x: u32,
+        origin_y: u32,
         atlas: &GlyphAtlas,
         screen: &vt100::Screen,
         prows: u16,
@@ -1060,10 +1125,10 @@ impl WebGL2Renderer {
 
         for r in 0..rows {
             for c in 0..cols {
-                let px = c * cell_w;
+                let px = origin_x + c * cell_w;
                 // Both renderers share the top-down pixel convention: row 0 is
                 // the canvas top and each row steps one cell height downward.
-                let py = r * cell_h;
+                let py = origin_y + r * cell_h;
                 let is_selected = sel_set.contains(&(r as u16, c as u16));
                 let is_cursor = (r as u16, c as u16) == cursor;
 
@@ -1093,18 +1158,23 @@ impl WebGL2Renderer {
 
                 // Background pass: one full-cell quad per cell
                 bg.extend_from_slice(&[
-                    px as f32, py as f32,   // offset
-                    cell_wf, cell_hf,       // size
-                    0.0, 0.0, 0.0, 0.0,     // UV (ignored in mode 0)
-                    fg_r, fg_g, fg_b,       // foreground
-                    bg_r, bg_g, bg_b,       // background
+                    px as f32, py as f32, // offset
+                    cell_wf, cell_hf, // size
+                    0.0, 0.0, 0.0, 0.0, // UV (ignored in mode 0)
+                    fg_r, fg_g, fg_b, // foreground
+                    bg_r, bg_g, bg_b, // background
                     sel, cur,
                 ]);
 
                 // Text pass: glyph quad, or flat geometry for graphic cells
-                if let Some(rects) =
-                    graphic_cell_rects(ch, px as f64, py as f64, cell_wf as f64, cell_hf as f64, dpr)
-                {
+                if let Some(rects) = graphic_cell_rects(
+                    ch,
+                    px as f64,
+                    py as f64,
+                    cell_wf as f64,
+                    cell_hf as f64,
+                    dpr,
+                ) {
                     for (x, y, w, h, a) in rects {
                         let a = a as f32;
                         // Shaded blocks are pre-blended over the cell background;
@@ -1121,18 +1191,17 @@ impl WebGL2Renderer {
                         text.extend_from_slice(&[
                             x as f32, y as f32, w as f32, h as f32, // geometry rect
                             solid.0, solid.1, solid.2, solid.3, // flat sample
-                            tr, tg, tb,     // paint color
-                            bg_r, bg_g, bg_b,
-                            sel, cur,
+                            tr, tg, tb, // paint color
+                            bg_r, bg_g, bg_b, sel, cur,
                         ]);
                     }
                 } else if let Some((u0, v0, u1, v1)) = atlas.uv_for(ch) {
                     text.extend_from_slice(&[
-                        px as f32, py as f32,   // offset
-                        cell_wf, cell_hf,       // size
-                        u0, v0, u1, v1,         // UV
-                        fg_r, fg_g, fg_b,       // foreground
-                        bg_r, bg_g, bg_b,       // background
+                        px as f32, py as f32, // offset
+                        cell_wf, cell_hf, // size
+                        u0, v0, u1, v1, // UV
+                        fg_r, fg_g, fg_b, // foreground
+                        bg_r, bg_g, bg_b, // background
                         sel, cur,
                     ]);
                 }
@@ -1192,7 +1261,12 @@ mod tests {
             let uv = atlas
                 .uv_for(ch)
                 .unwrap_or_else(|| panic!("uv_for(U+{:04X}) = None", cp));
-            assert!(uv.0 < uv.2 && uv.1 < uv.3, "U+{:04X} got degenerate UV {:?}", cp, uv);
+            assert!(
+                uv.0 < uv.2 && uv.1 < uv.3,
+                "U+{:04X} got degenerate UV {:?}",
+                cp,
+                uv
+            );
         }
         // Out-of-range codepoints stay None (defaults to invisible).
         assert!(atlas.uv_for('\u{1F600}').is_none());
@@ -1204,13 +1278,26 @@ mod tests {
     fn uv_for_resolves_dynamically_baked_codepoints() {
         let mut atlas = scratch_atlas();
         for ch in ['\u{4E2D}', '\u{1F600}', '\u{FB01}'] {
-            assert!(atlas.uv_for(ch).is_none(), "{:?} resolved before baking", ch);
+            assert!(
+                atlas.uv_for(ch).is_none(),
+                "{:?} resolved before baking",
+                ch
+            );
         }
-        atlas.ensure_glyphs(0, &['\u{4E2D}', '\u{1F600}', '\u{FB01}']).unwrap();
+        atlas
+            .ensure_glyphs(0, &['\u{4E2D}', '\u{1F600}', '\u{FB01}'])
+            .unwrap();
         for ch in ['\u{4E2D}', '\u{1F600}', '\u{FB01}'] {
-            let uv = atlas.uv_for(ch).unwrap_or_else(|| panic!("{:?} = None", ch));
+            let uv = atlas
+                .uv_for(ch)
+                .unwrap_or_else(|| panic!("{:?} = None", ch));
             // (u_left, v_bottom, u_right, v_top): left < right, bottom > top.
-            assert!(uv.0 < uv.2 && uv.1 > uv.3, "{:?} got degenerate UV {:?}", ch, uv);
+            assert!(
+                uv.0 < uv.2 && uv.1 > uv.3,
+                "{:?} got degenerate UV {:?}",
+                ch,
+                uv
+            );
         }
     }
 
@@ -1218,8 +1305,13 @@ mod tests {
     #[test]
     fn static_codepoints_never_use_dynamic_slots() {
         let mut atlas = scratch_atlas();
-        atlas.ensure_glyphs(0, &['A', ' ', '\u{25A3}', '\u{2731}']).unwrap();
-        assert!(atlas.dynamic_index.is_empty(), "static chars entered the dynamic region");
+        atlas
+            .ensure_glyphs(0, &['A', ' ', '\u{25A3}', '\u{2731}'])
+            .unwrap();
+        assert!(
+            atlas.dynamic_index.is_empty(),
+            "static chars entered the dynamic region"
+        );
     }
 
     /// Filling the dynamic region then adding one more distinct char must evict
@@ -1240,7 +1332,10 @@ mod tests {
         let extra = '\u{9FA5}';
         atlas.ensure_glyphs(0, &[extra]).unwrap();
         assert!(atlas.uv_for(extra).is_some(), "new char was not baked");
-        assert!(atlas.uv_for(chars[0]).is_some(), "recently used char was evicted");
+        assert!(
+            atlas.uv_for(chars[0]).is_some(),
+            "recently used char was evicted"
+        );
         assert!(atlas.uv_for(chars[1]).is_none(), "LRU char was not evicted");
     }
 
@@ -1259,7 +1354,10 @@ mod tests {
             .collect();
         atlas.ensure_glyphs(0, &fillers).unwrap();
         let evicted = fillers[0];
-        assert!(atlas.uv_for(evicted).is_some(), "precondition: atlas is full");
+        assert!(
+            atlas.uv_for(evicted).is_some(),
+            "precondition: atlas is full"
+        );
 
         // This char claims the LRU slot, but its rasterization fails.
         let fresh = '\u{9FA5}';
@@ -1334,7 +1432,10 @@ mod tests {
                 break;
             }
         }
-        assert!(any_ink, "no braille codepoint rasterizes any ink in an 8x18 slot");
+        assert!(
+            any_ink,
+            "no braille codepoint rasterizes any ink in an 8x18 slot"
+        );
     }
 
     /// opencode's "thinking" spinner cycles U+280B U+2819 U+2839 U+2838 U+283C
@@ -1343,17 +1444,29 @@ mod tests {
     /// even though the screen updates.
     #[test]
     fn opencode_spinner_frames_rasterize_distinctly() {
-        let frames = ['\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}', '\u{2834}', '\u{2826}', '\u{2827}', '\u{2807}', '\u{280F}'];
+        let frames = [
+            '\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}', '\u{2834}', '\u{2826}',
+            '\u{2827}', '\u{2807}', '\u{280F}',
+        ];
         for (glyph_w, glyph_h) in [(8u32, 18u32), (16, 36)] {
             let mut slots: Vec<Vec<u8>> = Vec::new();
             for ch in frames {
                 let mut slot = vec![0u8; (glyph_w * glyph_h) as usize];
-                GlyphAtlas::rasterize_braille(ch as u32, glyph_w, glyph_h, &mut slot, 0, 0, glyph_w);
+                GlyphAtlas::rasterize_braille(
+                    ch as u32, glyph_w, glyph_h, &mut slot, 0, 0, glyph_w,
+                );
                 slots.push(slot);
             }
             for (i, a) in slots.iter().enumerate() {
                 let ink_a = a.iter().filter(|&&v| v > 20).count();
-                assert!(ink_a > 0, "frame {:?} (U+{:04X}) rasterizes blank at {}x{}", frames[i], frames[i] as u32, glyph_w, glyph_h);
+                assert!(
+                    ink_a > 0,
+                    "frame {:?} (U+{:04X}) rasterizes blank at {}x{}",
+                    frames[i],
+                    frames[i] as u32,
+                    glyph_w,
+                    glyph_h
+                );
                 for (j, b) in slots.iter().enumerate() {
                     if i < j {
                         assert_ne!(

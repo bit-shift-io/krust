@@ -64,6 +64,57 @@ mod tests {
     }
 
     #[test]
+    fn query_replies_kitty_keyboard_query() {
+        // `CSI ? u` asks whether the terminal speaks the extended keyboard
+        // protocol. Answering with flags 0 pins the shell to legacy keys so
+        // readline stops waiting for a reply that never comes.
+        assert_eq!(collect_query_replies(b"\x1b[?u", 0, 0), b"\x1b[?0u");
+    }
+
+    #[test]
+    fn query_replies_xtversion() {
+        assert_eq!(
+            collect_query_replies(b"\x1b[>0q", 0, 0),
+            b"\x1bP>|krust(0.1.0)\x1b\\"
+        );
+    }
+
+    #[test]
+    fn query_replies_xtgettcaps_known_and_unknown() {
+        // XTGETTCAP takes a space-separated list of hex-encoded capability
+        // names. `TN` (termname) and `Co` (number of colours) are answered
+        // with values; an unknown capability still gets an empty `=value` so
+        // the requester treats it as unsupported instead of blocking.
+        assert_eq!(
+            collect_query_replies(b"\x1bP+q544e 436f\x1b\\", 0, 0),
+            b"\x1bP0+r544e=krust;436f=256\x1b\\"
+        );
+        assert_eq!(
+            collect_query_replies(b"\x1bP+q7a7a7a\x1b\\", 0, 0),
+            b"\x1bP0+r7a7a7a=\x1b\\"
+        );
+        // A non-hex name is malformed; answering would be worse than silence.
+        assert_eq!(collect_query_replies(b"\x1bP+qZZ\x1b\\", 0, 0), b"");
+    }
+
+    #[test]
+    fn query_replies_shell_startup_handshake() {
+        // The exact prologue bash 5.2+ and fish emit at startup. Every one of
+        // these is a blocking query: unanswered, the shell never prints a
+        // prompt and the terminal looks dead.
+        let prologue = b"\x1b[?u\x1b[>0q\x1b]11;?\x1b\\\x1bP+q544e\x1b\\\x1bP+q71756572792d6f732d6e616d65\x1b\\";
+        let out = collect_query_replies(prologue, 0, 0);
+        assert_eq!(
+            out,
+            b"\x1b[?0u\
+              \x1bP>|krust(0.1.0)\x1b\\\
+              \x1b]11;rgb:2b2b/2b2b/2b2b\x1b\\\
+              \x1bP0+r544e=krust\x1b\\\
+              \x1bP0+r71756572792d6f732d6e616d65=\x1b\\"
+        );
+    }
+
+    #[test]
     fn query_replies_multiple_in_one_chunk() {
         assert_eq!(
             collect_query_replies(b"\x1b[c\x1b[6n", 1, 1),

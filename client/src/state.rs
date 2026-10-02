@@ -11,7 +11,8 @@ use crate::color::{cell_visual, color_to_rgb, CellOverride, DEFAULT_BG, DEFAULT_
 use crate::ffi::{self, JsHandle};
 use crate::graphics::draw_graphic_cell;
 use crate::measure::{
-    css_color, measure_cell_dimensions_scratch, CELL_EPSILON, FONT_STACK, FONT_STACK_BOLD,
+    css_color, device_pitch, fit_grid, measure_cell_dimensions_scratch, CELL_EPSILON, FONT_STACK,
+    FONT_STACK_BOLD,
 };
 use crate::renderer;
 use crate::selection::{cell_is_selected, normalized_bounds, SelectionMode};
@@ -34,14 +35,14 @@ pub(crate) fn normalize_save_restore(bytes: &[u8], carry: &mut Vec<u8>) -> Vec<u
     let mut feed = std::mem::take(carry);
     feed.extend_from_slice(bytes);
 
-    let carry_from = if feed.len() >= 2 && feed[feed.len() - 2] == 0x1b && feed[feed.len() - 1] == b'['
-    {
-        feed.len() - 2
-    } else if !feed.is_empty() && feed[feed.len() - 1] == 0x1b {
-        feed.len() - 1
-    } else {
-        feed.len()
-    };
+    let carry_from =
+        if feed.len() >= 2 && feed[feed.len() - 2] == 0x1b && feed[feed.len() - 1] == b'[' {
+            feed.len() - 2
+        } else if !feed.is_empty() && feed[feed.len() - 1] == 0x1b {
+            feed.len() - 1
+        } else {
+            feed.len()
+        };
 
     let mut out = Vec::with_capacity(feed.len());
     let mut i = 0;
@@ -142,7 +143,11 @@ impl SelectionState {
         let mut cells = Vec::new();
         for row in sr..=er {
             let c0 = if row == sr { sc } else { 0 };
-            let c1 = if row == er { ec.min(cols - 1) } else { cols - 1 };
+            let c1 = if row == er {
+                ec.min(cols - 1)
+            } else {
+                cols - 1
+            };
             for col in c0..=c1 {
                 cells.push((row, col));
             }
@@ -174,6 +179,12 @@ pub(crate) struct TerminalState {
     pub(crate) cell_width: f64,
     /// Measured cell height in CSS pixels
     pub(crate) cell_height: f64,
+    /// Pixel offset of the grid inside the canvas, in device pixels. The grid
+    /// holds as many whole cells as fit and is centered in the leftover, so
+    /// this is what keeps the terminal inside the window instead of running
+    /// off the right/bottom edge.
+    origin_x: i64,
+    origin_y: i64,
     /// Scroll-related state
     scroll: ScrollState,
     /// Selection-related state
@@ -201,8 +212,7 @@ pub(crate) struct TerminalState {
 /// Renderer selection override, set from JS before `init()` via
 /// `set_renderer_mode`. 0 = auto (WebGL2 first, Canvas 2D fallback),
 /// 1 = force WebGL2 (error if unavailable), 2 = force Canvas 2D.
-pub static RENDERER_MODE: std::sync::atomic::AtomicI32 =
-    std::sync::atomic::AtomicI32::new(0);
+pub static RENDERER_MODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 impl TerminalState {
     /// Create a new terminal state with a Canvas 2D rendering context
@@ -213,7 +223,11 @@ impl TerminalState {
         let parser = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
 
         let win = ffi::window();
-        let doc = if win != 0 { ffi::window_document(win) } else { 0 };
+        let doc = if win != 0 {
+            ffi::window_document(win)
+        } else {
+            0
+        };
         let canvas = if doc != 0 {
             ffi::document_get_element_by_id(doc, canvas_id)
         } else {
@@ -228,11 +242,15 @@ impl TerminalState {
 
         // Use cached cell dims when available (avoids scratch canvas measurement
         // on repeat visits). Fall back to a scratch canvas measurement, then to
-        // sensible defaults.
+        // sensible defaults. Snap to a whole device-pixel pitch so the CSS size,
+        // the GL cell size and the column/row fit all agree.
+        let dpr_eff = dpr.max(1.0);
         let (cell_width, cell_height) = cached
             .filter(|(w, h)| *w > 0.0 && *h > 0.0)
             .or_else(measure_cell_dimensions_scratch)
             .unwrap_or((14.0, 20.0));
+        let cell_width = device_pitch(cell_width, dpr_eff) as f64 / dpr_eff;
+        let cell_height = device_pitch(cell_height, dpr_eff) as f64 / dpr_eff;
 
         // Try WebGL2 first for GPU-accelerated rendering; fall back to Canvas 2D.
         // `?r=gl`/`?r=2d` (via set_renderer_mode) force one renderer for A/B
@@ -276,32 +294,26 @@ impl TerminalState {
             None
         };
         if ctx.is_none() && webgl.is_none() {
-            return Err("no rendering context available (WebGL2 and Canvas 2D both failed)".to_string());
+            return Err(
+                "no rendering context available (WebGL2 and Canvas 2D both failed)".to_string(),
+            );
         }
 
         let canvas_w = ffi::element_offset_width(canvas);
         let canvas_h = ffi::element_offset_height(canvas);
-        let cols = if canvas_w > 0.0 {
-            (canvas_w / cell_width).floor() as u16
-        } else {
-            DEFAULT_COLS
-        };
-        let rows = if canvas_h > 0.0 {
-            (canvas_h / cell_height).floor() as u16
-        } else {
-            DEFAULT_ROWS
-        };
 
-        Ok(TerminalState {
+        let mut state = TerminalState {
             parser,
             ctx,
             webgl,
             canvas,
             canvas_id: canvas_id.to_string(),
-            rows,
-            cols,
+            rows: DEFAULT_ROWS,
+            cols: DEFAULT_COLS,
             cell_width,
             cell_height,
+            origin_x: 0,
+            origin_y: 0,
             scroll: ScrollState::new(),
             selection: SelectionState::new(),
             prev_screen: None,
@@ -310,7 +322,15 @@ impl TerminalState {
             prev_cursor: None,
             needs_render: false,
             csi_su_carry: Vec::new(),
-        })
+        };
+        if canvas_w > 0.0 && canvas_h > 0.0 {
+            state.refit(
+                (canvas_w * dpr_eff).round() as i64,
+                (canvas_h * dpr_eff).round() as i64,
+            );
+        }
+        state.parser.screen_mut().set_size(state.rows, state.cols);
+        Ok(state)
     }
 
     /// Process incoming ANSI bytes through the VT100 parser
@@ -332,7 +352,9 @@ impl TerminalState {
 
         if !screen_before && screen_after {
             self.scroll.saved_normal_offset_for_alt = Some(self.scroll.normal_offset);
-            self.parser.screen_mut().set_scrollback(self.scroll.normal_offset);
+            self.parser
+                .screen_mut()
+                .set_scrollback(self.scroll.normal_offset);
         } else if screen_before && !screen_after {
             if let Some(saved) = self.scroll.saved_normal_offset_for_alt.take() {
                 self.scroll.normal_offset = saved;
@@ -444,6 +466,16 @@ impl TerminalState {
         self.active_scrollback_len()
     }
 
+    /// Whether the alternate screen is active.
+    ///
+    /// Full-screen TUIs (opencode, vim, less, htop) own the screen and manage
+    /// their own scrolling, so the alt screen's grid — which vt100 keeps
+    /// separate from the normal screen, and which still accumulates rows when
+    /// the app scrolls the full region up — is not offered as scrollback.
+    pub(crate) fn is_alt_screen(&self) -> bool {
+        self.parser.screen().alternate_screen()
+    }
+
     /// Current scrollback view offset (0 = active screen at bottom, >0 = scrolled up).
     pub(crate) fn scroll_offset(&self) -> usize {
         self.active_scroll_offset()
@@ -487,13 +519,7 @@ impl TerminalState {
     fn apply_scrollback(&mut self) {
         let screen_alt = self.parser.screen().alternate_screen();
         let offset = self.scroll.offset(screen_alt);
-        let old_offset = self.parser.screen().scrollback();
-        if old_offset != offset {
-            ffi::console_log(&format!(
-                "APPLY_SCROLLBACK: screen_alt={} old_off={} new_off={} normal={} alt={}",
-                screen_alt, old_offset, offset,
-                self.scroll.normal_offset, self.scroll.alternate_offset
-            ));
+        if self.parser.screen().scrollback() != offset {
             self.parser.screen_mut().set_scrollback(offset);
         }
     }
@@ -538,13 +564,7 @@ impl TerminalState {
             };
             let screen = self.parser.screen();
             if let Some(w) = self.webgl.as_mut() {
-                return w.render(
-                    screen,
-                    DEFAULT_FG,
-                    DEFAULT_BG,
-                    &selection,
-                    cursor,
-                );
+                return w.render(screen, DEFAULT_FG, DEFAULT_BG, &selection, cursor);
             }
         }
         self.render_canvas2d()
@@ -586,15 +606,17 @@ impl TerminalState {
 
         ffi::ctx_set_transform(ctx, dpr.max(1.0), 0.0, 0.0, dpr.max(1.0), 0.0, 0.0);
 
+        let (ox, oy) = self.origin_css(dpr);
         if full {
-            self.render_full_grid(ctx, rows, cols, cw, ch, dpr)
+            self.render_full_grid(ctx, rows, cols, cw, ch, dpr, ox, oy)
         } else {
-            self.render_dirty_cells(ctx, rows, cols, cw, ch, dpr, dirty)
+            self.render_dirty_cells(ctx, rows, cols, cw, ch, dpr, ox, oy, dirty)
         }?;
         Ok(())
     }
 
     /// Repaint the entire grid (first frame, resize, scroll, selection change).
+    #[allow(clippy::too_many_arguments)]
     fn render_full_grid(
         &mut self,
         ctx: JsHandle,
@@ -603,6 +625,8 @@ impl TerminalState {
         cw: f64,
         ch: f64,
         dpr: f64,
+        ox: f64,
+        oy: f64,
     ) -> Result<(), String> {
         let screen = self.parser.screen();
         let (prows, pcols) = screen.size();
@@ -620,18 +644,21 @@ impl TerminalState {
         // Paint each cell
         for row in 0..rows {
             for col in 0..cols {
-                self.paint_cell(ctx, screen, row, col, cw, ch, prows, pcols, &mut font);
+                self.paint_cell(
+                    ctx, screen, row, col, cw, ch, prows, pcols, &mut font, ox, oy,
+                );
             }
         }
 
         // Cursor: background then text (hidden when scrolled into history)
         let cur = self.visible_cursor(screen, rows, cols);
-        let cursor_pos = self.draw_cursor(ctx, cur, cw, ch)?;
+        let cursor_pos = self.draw_cursor(ctx, cur, cw, ch, ox, oy)?;
         self.prev_cursor = cursor_pos;
         Ok(())
     }
 
     /// Redraw only cells that changed since the last render, plus the cursor.
+    #[allow(clippy::too_many_arguments)]
     fn render_dirty_cells(
         &mut self,
         ctx: JsHandle,
@@ -640,6 +667,8 @@ impl TerminalState {
         cw: f64,
         ch: f64,
         dpr: f64,
+        ox: f64,
+        oy: f64,
         mut dirty: Vec<(u16, u16)>,
     ) -> Result<(), String> {
         let screen = self.parser.screen();
@@ -669,12 +698,14 @@ impl TerminalState {
         ffi::ctx_set_font(ctx, &font);
 
         for &(row, col) in dirty.iter() {
-            self.paint_cell(ctx, screen, row, col, cw, ch, prows, pcols, &mut font);
+            self.paint_cell(
+                ctx, screen, row, col, cw, ch, prows, pcols, &mut font, ox, oy,
+            );
         }
 
         // Cursor drawn last, on top of the regular cell content.
         let cur = self.visible_cursor(screen, rows, cols);
-        let cursor_pos = self.draw_cursor(ctx, cur, cw, ch)?;
+        let cursor_pos = self.draw_cursor(ctx, cur, cw, ch, ox, oy)?;
         self.prev_cursor = cursor_pos;
         Ok(())
     }
@@ -702,25 +733,32 @@ impl TerminalState {
 
     /// Draw the block cursor (swapped fg/bg + glyph) on top of a cell.
     /// `cursor` is the cell to draw, or `None` to skip cursor drawing.
+    /// `ox`/`oy` are the grid origin in CSS pixels.
+    #[allow(clippy::too_many_arguments)]
     fn draw_cursor(
         &mut self,
         ctx: JsHandle,
         cursor: Option<(u16, u16)>,
         cw: f64,
         ch: f64,
+        ox: f64,
+        oy: f64,
     ) -> Result<Option<(u16, u16)>, String> {
-        let Some((cr, cc)) = cursor else { return Ok(None) };
+        let Some((cr, cc)) = cursor else {
+            return Ok(None);
+        };
         let screen = self.parser.screen();
         let cell = screen.cell(cr, cc);
+        let (x, y) = (ox + cc as f64 * cw, oy + cr as f64 * ch);
         // Shared cursor decision: swap original fg/bg (block cursor).
         let (fg, bg) = cell_visual(cell, DEFAULT_FG, DEFAULT_BG, CellOverride::Cursor);
         ffi::ctx_set_fill_style(ctx, &css_color(bg));
-        ffi::ctx_fill_rect(ctx, cc as f64 * cw, cr as f64 * ch, cw, ch);
+        ffi::ctx_fill_rect(ctx, x, y, cw, ch);
         ffi::ctx_set_fill_style(ctx, &css_color(fg));
         if let Some(c) = cell {
             let s = c.contents();
-            if !s.is_empty() && !draw_graphic_cell(ctx, cc, cr, cw, ch, s, fg) {
-                ffi::ctx_fill_text(ctx, s, cc as f64 * cw, cr as f64 * ch + ch * 0.5);
+            if !s.is_empty() && !draw_graphic_cell(ctx, x, y, cw, ch, s, fg) {
+                ffi::ctx_fill_text(ctx, s, x, y + ch * 0.5);
             }
         }
         Ok(Some((cr, cc)))
@@ -734,6 +772,10 @@ impl TerminalState {
 
     /// Paint a single cell: clear to default bg, paint non-default bg,
     /// paint selection bg, and draw text glyph.
+    ///
+    /// `ox`/`oy` are the grid origin in CSS pixels; every rect is placed
+    /// relative to it so the grid can be centered inside the canvas.
+    #[allow(clippy::too_many_arguments)]
     fn paint_cell(
         &self,
         ctx: JsHandle,
@@ -745,10 +787,14 @@ impl TerminalState {
         prows: u16,
         pcols: u16,
         font: &mut String,
+        ox: f64,
+        oy: f64,
     ) {
+        let (x, y) = (ox + col as f64 * cw, oy + row as f64 * ch);
+
         // 1. Clear cell to default background
         ffi::ctx_set_fill_style(ctx, &css_color(DEFAULT_BG));
-        ffi::ctx_fill_rect(ctx, col as f64 * cw, row as f64 * ch, cw, ch);
+        ffi::ctx_fill_rect(ctx, x, y, cw, ch);
 
         let cell = if row < prows && col < pcols {
             screen.cell(row, col)
@@ -769,7 +815,7 @@ impl TerminalState {
         };
         if base_bg != DEFAULT_BG && !selected {
             ffi::ctx_set_fill_style(ctx, &css_color(base_bg));
-            ffi::ctx_fill_rect(ctx, col as f64 * cw, row as f64 * ch, cw, ch);
+            ffi::ctx_fill_rect(ctx, x, y, cw, ch);
         }
 
         // 3. Selection background rect (before text)
@@ -778,8 +824,8 @@ impl TerminalState {
             ffi::ctx_set_fill_style(ctx, &css_color(sel_bg));
             ffi::ctx_fill_rect(
                 ctx,
-                col as f64 * cw - CELL_EPSILON,
-                row as f64 * ch - CELL_EPSILON,
+                x - CELL_EPSILON,
+                y - CELL_EPSILON,
                 cw + CELL_EPSILON * 2.0,
                 ch + CELL_EPSILON * 2.0,
             );
@@ -791,29 +837,27 @@ impl TerminalState {
             if !s.is_empty() {
                 let (draw_fg, _bg) = cell_visual(Some(c), DEFAULT_FG, DEFAULT_BG, override_);
                 if draw_fg != DEFAULT_BG {
-                    if draw_graphic_cell(ctx, col, row, cw, ch, s, draw_fg) {
+                    if draw_graphic_cell(ctx, x, y, cw, ch, s, draw_fg) {
                         return;
                     }
-                    let want = if c.bold() { FONT_STACK_BOLD } else { FONT_STACK };
+                    let want = if c.bold() {
+                        FONT_STACK_BOLD
+                    } else {
+                        FONT_STACK
+                    };
                     if font.as_str() != want {
                         *font = want.to_string();
                         ffi::ctx_set_font(ctx, font);
                     }
                     ffi::ctx_set_fill_style(ctx, &css_color(draw_fg));
-                    ffi::ctx_fill_text(
-                        ctx,
-                        s,
-                        col as f64 * cw,
-                        row as f64 * ch + ch * 0.5,
-                    );
+                    ffi::ctx_fill_text(ctx, s, x, y + ch * 0.5);
                 }
             }
         }
     }
 
     /// Trigger resize callback
-    pub(crate) fn trigger_resize(&mut self, _new_rows: u16, _new_cols: u16) {
-    }
+    pub(crate) fn trigger_resize(&mut self, _new_rows: u16, _new_cols: u16) {}
 
     /// Handle selection start
     pub(crate) fn handle_selection_start(&mut self, row: u16, col: u16) {
@@ -905,12 +949,72 @@ impl TerminalState {
     pub(crate) fn set_cell_dims(&mut self, cw: f64, ch: f64) {
         self.cell_width = cw;
         self.cell_height = ch;
+        self.snap_cell_dims();
     }
 
-    /// Set parsed terminal dimensions (used on resize).
-    pub(crate) fn set_dims(&mut self, rows: u16, cols: u16) {
-        self.rows = rows;
-        self.cols = cols;
+    /// Snap the cell dimensions to a whole device-pixel pitch.
+    ///
+    /// The page hit-tests against the CSS-pixel size while both renderers draw
+    /// at the integer device-pixel pitch, so the CSS size has to be exactly
+    /// `device_pitch / dpr` — otherwise the two drift apart and a click near
+    /// the right edge of a wide terminal lands in the wrong column.
+    fn snap_cell_dims(&mut self) {
+        let dpr = ffi::window_dpr(ffi::window()).max(1.0);
+        self.cell_width = device_pitch(self.cell_width, dpr) as f64 / dpr;
+        self.cell_height = device_pitch(self.cell_height, dpr) as f64 / dpr;
+    }
+
+    /// Resize the grid to fit a canvas of `w` x `h` device pixels, dropping
+    /// whole columns/rows until it fits and centering what is left.
+    ///
+    /// The count comes from the *device-pixel* cell pitch — the same number the
+    /// renderers draw with — so the grid can never be laid out wider than the
+    /// canvas. The leftover pixels are split evenly, giving a small equal margin
+    /// instead of a ragged strip down one side.
+    ///
+    /// Also syncs the WebGL2 renderer's cell pitch and origin, which is the
+    /// other half of the same fit.
+    pub(crate) fn refit(&mut self, w_dev: i64, h_dev: i64) {
+        let dpr = ffi::window_dpr(ffi::window()).max(1.0);
+        let cell_w = device_pitch(self.cell_width, dpr);
+        let cell_h = device_pitch(self.cell_height, dpr);
+        let (cols, origin_x) = fit_grid(w_dev, cell_w);
+        let (rows, origin_y) = fit_grid(h_dev, cell_h);
+        self.cols = cols.clamp(2, u16::MAX as i64) as u16;
+        self.rows = rows.clamp(1, u16::MAX as i64) as u16;
+        self.origin_x = origin_x;
+        self.origin_y = origin_y;
+        let (rows, cols) = (self.rows, self.cols);
+        if let Some(w) = self.webgl.as_mut() {
+            w.cell_w = cell_w as u32;
+            w.cell_h = cell_h as u32;
+            w.origin_x = origin_x as u32;
+            w.origin_y = origin_y as u32;
+            w.rows = rows;
+            w.cols = cols;
+        }
+    }
+
+    /// Grid origin in CSS pixels, for the Canvas 2D render path.
+    pub(crate) fn origin_css(&self, dpr: f64) -> (f64, f64) {
+        let dpr = dpr.max(1.0);
+        (self.origin_x as f64 / dpr, self.origin_y as f64 / dpr)
+    }
+
+    /// Map a canvas-relative CSS-pixel point onto a cell, clamped to the grid.
+    ///
+    /// The grid is centered in the canvas, so points in the surrounding margin
+    /// have to be clamped to the nearest cell rather than running off the edge.
+    pub(crate) fn cell_at(&self, x: f64, y: f64) -> (u16, u16) {
+        let dpr = ffi::window_dpr(ffi::window()).max(1.0);
+        let (ox, oy) = self.origin_css(dpr);
+        let col = (((x - ox) * dpr).max(0.0) / device_pitch(self.cell_width, dpr).max(1) as f64)
+            .floor()
+            .min(self.cols.saturating_sub(1) as f64) as u16;
+        let row = (((y - oy) * dpr).max(0.0) / device_pitch(self.cell_height, dpr).max(1) as f64)
+            .floor()
+            .min(self.rows.saturating_sub(1) as f64) as u16;
+        (row, col)
     }
 
     /// Recreate the entire WebGL2 renderer (shader program, buffers and glyph
@@ -928,7 +1032,7 @@ impl TerminalState {
             return Ok(());
         };
         let dpr = ffi::window_dpr(ffi::window());
-        let fresh = renderer::WebGL2Renderer::new(
+        let mut fresh = renderer::WebGL2Renderer::new(
             &self.canvas_id,
             self.cell_width,
             self.cell_height,
@@ -936,6 +1040,8 @@ impl TerminalState {
             self.cols,
             dpr,
         )?;
+        fresh.origin_x = self.origin_x as u32;
+        fresh.origin_y = self.origin_y as u32;
         self.webgl = Some(fresh);
         self.mark_all_dirty();
         Ok(())
@@ -945,10 +1051,146 @@ impl TerminalState {
     pub(crate) fn resize_screen(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows, cols);
     }
+
+    /// Throw away all parser state and start from a blank screen.
+    ///
+    /// Used when the server reports this client has fallen out of the
+    /// retained output window: a contiguous byte tail can no longer bring the
+    /// grid up to date, so the only correct move is to forget the old state
+    /// and rebuild it from the log that follows. The renderer is kept —
+    /// canvas, cell pitch and GL objects are all still valid — and the next
+    /// `render` is a full redraw because `mark_all_dirty` forces one.
+    pub(crate) fn reset(&mut self) {
+        self.parser = Parser::new(self.rows, self.cols, SCROLLBACK_LEN);
+        self.scroll = ScrollState::new();
+        self.selection = SelectionState::new();
+        self.prev_screen = None;
+        self.prev_cursor = None;
+        self.csi_su_carry.clear();
+        self.mark_all_dirty();
+    }
+
+    /// Whether the WebGL context has been lost, which leaves every GL object
+    /// krust holds invalid until the renderer is rebuilt.
+    pub(crate) fn webgl_is_lost(&self) -> bool {
+        self.webgl.as_ref().is_some_and(renderer::WebGL2Renderer::is_lost)
+    }
 }
 
 thread_local! {
     /// Global terminal state, initialized once by [`crate::init`]
     pub(crate) static TERM_STATE: RefCell<Option<TerminalState>> =
         const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+mod resync_tests {
+    use vt100::Parser;
+
+    /// The whole visible content of the screen, as text.
+    ///
+    /// A blank cell reports empty contents (vt100 stores `len: 0` rather than
+    /// a space), so render those as spaces to keep columns meaningful.
+    fn screen_text(p: &Parser) -> String {
+        let (rows, cols) = p.screen().size();
+        let mut out = String::new();
+        for row in 0..rows {
+            let mut line = String::new();
+            for col in 0..cols {
+                match p.screen().cell(row, col) {
+                    Some(c) if !c.contents().is_empty() => line.push_str(c.contents()),
+                    _ => line.push(' '),
+                }
+            }
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Regression: a resumed stream that begins mid-escape-sequence makes the
+    /// parser print the orphaned tail as literal text. This is what put
+    /// `;255m`, `25h` and `6l156;245m` in the input field — the server
+    /// replayed a history buffer trimmed at an arbitrary byte offset, so the
+    /// tail of an SGR/DECSET sequence was parsed as ground text in cells the
+    /// application never wrote.
+    #[test]
+    fn mid_sequence_resume_prints_orphaned_escape_text() {
+        let mut p = Parser::new(6, 80, 0);
+        p.process(b"\x1b[1;1Hfield");
+        // Resumed in the middle of "\x1b[38;5;255m".
+        p.process(b";255m");
+        let text = screen_text(&p);
+        assert!(
+            text.contains(";255m"),
+            "expected the orphaned tail to be painted:\n{}",
+            text
+        );
+    }
+
+    /// The fix: the server trims the retained log on an ESC boundary, so a
+    /// fresh client replaying it never starts mid-sequence and never prints
+    /// escape-sequence text into the grid.
+    #[test]
+    fn esc_boundary_resume_prints_no_escape_text() {
+        let mut p = Parser::new(6, 80, 0);
+        // A replay that begins on an ESC, as the boundary-aligned trim
+        // guarantees, including the sequences the bug report showed up in.
+        p.process(b"\x1b[?1006l\x1b[38;5;255m\x1b[?25htext");
+        let text = screen_text(&p);
+        assert!(
+            !text.contains(";255m") && !text.contains("25h") && !text.contains("6l"),
+            "no escape-sequence fragments may reach the grid:\n{}",
+            text
+        );
+        assert!(text.contains("text"), "content should still render:\n{}", text);
+    }
+
+    /// A delta resync continues the client's own byte stream, so the parser
+    /// resumes mid-sequence exactly where it left off and nothing is lost.
+    #[test]
+    fn delta_resync_is_invisible_to_the_parser() {
+        let stream: &[u8] = b"\x1b[2J\x1b[1;1Halpha\x1b[38;2;156;245mbeta";
+
+        // Whole stream in one go.
+        let mut whole = Parser::new(6, 80, 0);
+        whole.process(stream);
+        let expected = screen_text(&whole);
+
+        // Same stream, delivered as a prefix plus a delta tail, with the
+        // split landing in the middle of the SGR parameter list.
+        let split = stream.len() - 6;
+        let mut split_parser = Parser::new(6, 80, 0);
+        split_parser.process(&stream[..split]);
+        split_parser.process(&stream[split..]);
+        assert_eq!(
+            screen_text(&split_parser),
+            expected,
+            "a delta resync must not change the resulting screen"
+        );
+    }
+
+    /// A duplicated resync (the old drop-then-replay-everything behaviour)
+    /// does change the result, which is why the tail is sent instead.
+    ///
+    /// The stream uses relative cursor motion, which is what a TUI emits
+    /// between full repaints. Replaying it runs those relative moves twice, so
+    /// the second copy of the glyph lands further along the row — and lands in
+    /// cells the application's own model has no knowledge of, which is exactly
+    /// the reported symptom (arrow keys skip them, typing overwrites them, and
+    /// a copy still yields them).
+    #[test]
+    fn duplicated_replay_is_not_equivalent() {
+        let stream: &[u8] = b"\x1b[3CX";
+        let mut whole = Parser::new(6, 80, 0);
+        whole.process(stream);
+        let expected = screen_text(&whole);
+        assert_eq!(expected, "   X\n\n\n\n\n\n");
+
+        let mut replayed = Parser::new(6, 80, 0);
+        replayed.process(stream);
+        replayed.process(stream);
+        assert_eq!(screen_text(&replayed), "   X   X\n\n\n\n\n\n");
+        assert_ne!(screen_text(&replayed), expected);
+    }
 }

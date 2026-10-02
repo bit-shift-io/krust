@@ -9,13 +9,14 @@
         canvas { display: block; width: 100%; height: 100%; background: #2b2b2b; touch-action: none; }
         #status { position: fixed; top: 8px; right: 8px; z-index: 10; font: 12px monospace; color: #f0f0f0; background: rgba(0,0,0,0.7); padding: 4px 8px; opacity: 1; transition: opacity 0.5s ease-in-out; }
         #scrollbar { position: fixed; top: 0; right: 0; width: 10px; height: 100%; z-index: 8; background: rgba(255,255,255,0.06); opacity: 0; transition: opacity 0.2s ease-in-out; }
+        #scrollbar.hidden { visibility: hidden; pointer-events: none; }
         #scrollbar:hover, body.scrolling #scrollbar { opacity: 1; }
         #scrollbar-thumb { position: absolute; left: 1px; right: 1px; border-radius: 4px; background: rgba(255,255,255,0.4); }
     </style>
 </head>
 <body>
     <canvas id="terminal-canvas"></canvas>
-    <div id="scrollbar"><div id="scrollbar-thumb"></div></div>
+    <div id="scrollbar" class="hidden"><div id="scrollbar-thumb"></div></div>
     <div id="status">connecting...</div>
     <script src="/krust_runtime.js"></script>
     <script type="module">
@@ -28,9 +29,10 @@
         );
         window.KRUST_RUNTIME.install(wasm.instance.exports.memory);
         const { init, set_renderer_mode, rebuild_webgl, process_bytes, query_replies, handle_resize, repaint,
+                webgl_context_lost, reset_terminal,
                 key_to_bytes, set_selection, selected_text, clear_selection,
                 scroll, scroll_to, scroll_to_bottom, scroll_to_top,
-                scroll_offset, scrollback_len, version,
+                scroll_offset, scrollback_len, is_alt_screen, grid_metrics, version,
                 free_memory, free_string, free_result, alloc, dealloc } = wasm.instance.exports;
 
         // WASM memory. Views are constructed fresh from mem.buffer on every
@@ -96,6 +98,14 @@
         // Render loop for frame coalescing
         let renderScheduled = false;
         function scheduleRender() {
+            // Browsers suspend requestAnimationFrame for hidden tabs, so a
+            // frame scheduled while hidden paints long after the fact, for
+            // nothing. Skip it: the focus/visibilitychange handlers already
+            // do a full repaint on the way back. Staying out of the way also
+            // leaves the main thread free to drain the WebSocket, and a
+            // client that drains promptly is what keeps the server from
+            // dropping frames on it.
+            if (document.hidden) return;
             if (!renderScheduled) {
                 renderScheduled = true;
                 requestAnimationFrame(() => {
@@ -177,27 +187,41 @@
 
         let lastTitle = 'krust | terminal';
         let lastRenderTime = 0;
+
+        // Full repaint of everything when the tab comes back. `repaint` is
+        // mark_all_dirty + render, i.e. a complete redraw from the parser
+        // state rather than a diff — which is what we want after a stretch
+        // where nothing was drawn. Rebuild the renderer first if the WebGL
+        // context was dropped while hidden: painting into a lost context is a
+        // silent no-op, so without this the tab can come back blank.
+        function repaintOnReturn() {
+            try {
+                if (webgl_context_lost() === 1) rebuild_webgl();
+            } catch (_) {}
+            try { repaint(); } catch (_) {}
+        }
+
         window.addEventListener('focus', () => {
             document.title = lastTitle;
             fit();
             const now = performance.now();
             if (now - lastRenderTime > 32) {
                 lastRenderTime = now;
-                try { repaint(); } catch (_) {}
+                repaintOnReturn();
             }
         });
         document.addEventListener('visibilitychange', () => {
             if (!document.hidden) {
                 fit();
-                try { repaint(); } catch (_) {}
+                repaintOnReturn();
             }
         });
         if ('IntersectionObserver' in window) {
             const observer = new IntersectionObserver((entries) => {
                 const entry = entries[entries.length - 1];
                 if (entry.isIntersecting && entry.intersectionRatio > 0) {
-                    try { fit(); } catch (_) {}
-                    try { repaint(); } catch (_) {}
+                    fit();
+                    repaintOnReturn();
                 }
             }, { threshold: 0 });
             observer.observe(canvas);
@@ -223,6 +247,8 @@
         let cellH = 18;
         let gridCols = 80;
         let gridRows = 24;
+        let gridX = 0;
+        let gridY = 0;
         let wasmReady = false;
         let wsQueue = [];
         let selAnchor = null;
@@ -276,26 +302,45 @@
         }
         let reconnectAttempts = 0;
 
+        // `window.devicePixelRatio` already folds in browser zoom (a 120% zoom
+        // makes a 1x display report 1.2), and the wasm module reads the same
+        // value. Do not clamp it here: the canvas backing store and the grid
+        // fit have to be derived from the same number, or a clamped buffer with
+        // an unclamped fit lays the grid out wider than the canvas.
+        const devicePixelRatio = () => Math.max(1, window.devicePixelRatio || 1);
+
         function fit() {
-            const dpr = Math.min(3, window.devicePixelRatio || 1);
+            const dpr = devicePixelRatio();
             canvas.width = Math.round(window.innerWidth * dpr);
             canvas.height = Math.round(window.innerHeight * dpr);
             canvas.style.width = window.innerWidth + 'px';
             canvas.style.height = window.innerHeight + 'px';
             handle_resize(window.innerWidth, window.innerHeight);
+            syncGrid();
+        }
+
+        // Pull the fitted grid size and centered origin back from the wasm
+        // module, which owns the fit so the renderers and the PTY agree.
+        function syncGrid() {
+            const raw = callStringExport(grid_metrics);
+            if (!raw) return;
+            const m = JSON.parse(raw);
+            gridRows = m.rows;
+            gridCols = m.cols;
+            gridX = m.x;
+            gridY = m.y;
         }
 
         function sendResize() {
             if (!wasmReady || !ws || ws.readyState !== 1) return;
-            const cols = Math.max(2, Math.floor(window.innerWidth / cellW));
-            const rows = Math.max(1, Math.floor(window.innerHeight / cellH));
-            const msg = { type: 'Resize', cols, rows, pixel_width: window.innerWidth, pixel_height: window.innerHeight };
+            const msg = { type: 'Resize', cols: gridCols, rows: gridRows, pixel_width: window.innerWidth, pixel_height: window.innerHeight };
             ws.send(JSON.stringify(msg));
         }
 
         function cellFromPoint(px, py) {
-            const col = Math.max(0, Math.min(gridCols - 1, Math.floor(px / cellW)));
-            const row = Math.max(0, Math.min(gridRows - 1, Math.floor(py / cellH)));
+            const rect = canvas.getBoundingClientRect();
+            const col = Math.max(0, Math.min(gridCols - 1, Math.floor((px - rect.left - gridX) / cellW)));
+            const row = Math.max(0, Math.min(gridRows - 1, Math.floor((py - rect.top - gridY) / cellH)));
             return { row, col };
         }
 
@@ -307,15 +352,27 @@
             const cur = curScroll;
             const total = max + gridRows;
             const viewport = gridRows;
-            const scrollFrac = total > viewport ? max / (total - viewport) : 0;
-            const frac = total > viewport ? (total - viewport - cur) / (total - viewport) : 0;
             const thumbH = Math.max(24, viewport / total * 100);
             const trackH = 100 - thumbH;
             const pos = cur === 0 ? 100 - thumbH : (total - viewport - cur) / (total - viewport) * trackH;
             scrollbarThumb.style.height = thumbH + '%';
             scrollbarThumb.style.top = pos + '%';
-            scrollbarVisible = max > 0;
             scrollbarEl.style.height = 'calc(100% - 2px)';
+            // Only offer the scrollbar when there is genuinely something to
+            // scroll to, and never while a full-screen TUI owns the alternate
+            // screen — those apps manage their own scrolling. (vt100 also builds
+            // the alternate grid with zero scrollback, so `max` is already 0
+            // there; the explicit check keeps the intent readable and holds if
+            // that ever changes.)
+            const scrollable = max > 0 && !is_alt_screen();
+            if (scrollable !== scrollbarVisible) {
+                scrollbarVisible = scrollable;
+                scrollbarEl.classList.toggle('hidden', !scrollable);
+                if (!scrollable) {
+                    document.body.classList.remove('scrolling');
+                    clearTimeout(scrollbarEl._hideTimer);
+                }
+            }
         }
 
         function showScrollbarTemporarily() {
@@ -353,7 +410,7 @@
         }
 
         // Read init result: init returns a pointer to [u32; 2] containing (json_ptr, json_len)
-        const dpr = Math.min(3, window.devicePixelRatio || 1);
+        const dpr = devicePixelRatio();
         const cacheKey = 'krust_cells_dpr';
         let cachedDims = null;
         try {
@@ -408,7 +465,7 @@
 
         fit();
         updateScrollbar();
-        window.addEventListener('resize', () => { fit(); sendResize(); });
+        window.addEventListener('resize', () => { fit(); sendResize(); updateScrollbar(); });
         showStatus('krust terminal' + (rendererName ? ' (' + (rendererName === 'gl' ? 'GL' : '2D') + ')' : ''));
         wasmReady = true;
         sendResize(); // fire if ws is already connected
@@ -416,7 +473,7 @@
         // before the wasm module is ready, so the first history-replay burst
         // can race init) were queued instead of being fed to process_bytes.
         // Flush them now that the terminal state exists.
-        for (let i = 0; i < wsQueue.length; i++) handleWsData({ data: wsQueue[i] });
+        for (let i = 0; i < wsQueue.length; i++) handleIncoming(wsQueue[i]);
         wsQueue = [];
 
         const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -444,6 +501,70 @@
             console.log('SELFTEST', JSON.stringify({ rows, gridRows, gridCols, innerW: window.innerWidth, innerH: window.innerHeight, dpr: window.devicePixelRatio, N, maxMs: mx, avgMs: sum / N, wallMs: performance.now() - t0, bytesIn: bytesIn, scrollbackLen: scrollback_len(), offset: scroll_offset() }));
         }
 
+        // Route one inbound WebSocket payload. Control frames arrive as text;
+        // PTY output as binary. Both can land before init() has finished, in
+        // which case the payload is queued and replayed through here once the
+        // terminal state exists. Declared at this scope (not inside
+        // connectPrimary) because the post-init queue flush needs it too.
+        function handleIncoming(data) {
+            if (typeof data === 'string') {
+                let msg = null;
+                try { msg = JSON.parse(data); } catch (_) {}
+                if (!msg || msg.type !== 'Reset') return;
+                // The server's retained window has moved past this client's
+                // position, so no contiguous tail exists to bring the grid up
+                // to date. Drop the parser state; the retained log that
+                // follows starts on an ESC boundary and rebuilds the screen.
+                if (wasmReady) {
+                    try { reset_terminal(); } catch (_) {}
+                    scheduleRender();
+                } else {
+                    wsQueue.push(data);
+                }
+                return;
+            }
+            if (!wasmReady) {
+                wsQueue.push(data);
+                return;
+            }
+            handleWsData(data);
+        }
+
+        function handleWsData(ev) {
+            bytesIn += ev.byteLength;
+            const inData = new Uint8Array(ev);
+            const byteLen = inData.length;
+            const bytePtr = alloc(byteLen);
+            const wasmBuf = new Uint8Array(mem.buffer, bytePtr, byteLen);
+            wasmBuf.set(inData);
+            const boxPtr = query_replies(bytePtr, byteLen);
+            dealloc(bytePtr, byteLen);
+            if (boxPtr !== 0) {
+                const { dataPtr, dataLen, box } = exportBoxedPair(boxPtr);
+                const reps = readBytesCopy(dataPtr, dataLen);
+                free_memory(dataPtr, dataLen);
+                free_result(box);
+                if (reps.length && ws && ws.readyState === 1) ws.send(reps);
+            }
+            const t0 = performance.now();
+            if (params.get('benchskip') !== '1') {
+                const inPtr = alloc(inData.length);
+                new Uint8Array(mem.buffer, inPtr, inData.length).set(inData);
+                const summaryPtr = process_bytes(inPtr, inData.length);
+                dealloc(inPtr, inData.length);
+                if (summaryPtr !== 0) free_result(summaryPtr);
+                scheduleRender();
+            }
+            benchSample(performance.now() - t0);
+            curScroll = scroll_offset();
+            updateScrollbar();
+            const title = extractTitle(inData);
+            if (title) {
+                lastTitle = title + ' | terminal';
+                document.title = lastTitle;
+            }
+        }
+
         function connectPrimary(url) {
             ws = new WebSocket(url);
             ws.binaryType = 'arraybuffer';
@@ -466,52 +587,8 @@
                     ws.send(new TextEncoder().encode('seq 1 ' + b + '\r'));
                 }
             };
-            ws.onmessage = (ev) => {
-                if (!wasmReady) {
-                    // init() not called yet (the WebSocket opens before the
-                    // wasm module is ready) — hold the frame and feed it after
-                    // the terminal state exists, or the first history-replay
-                    // burst would be dropped and the prompt would never paint.
-                    wsQueue.push(ev.data);
-                    return;
-                }
-                handleWsData(ev);
-            };
+            ws.onmessage = (ev) => handleIncoming(ev.data);
 
-            function handleWsData(ev) {
-                bytesIn += ev.data.byteLength;
-                const inData = new Uint8Array(ev.data);
-                const byteLen = inData.length;
-                const bytePtr = alloc(byteLen);
-                const wasmBuf = new Uint8Array(mem.buffer, bytePtr, byteLen);
-                wasmBuf.set(inData);
-                const boxPtr = query_replies(bytePtr, byteLen);
-                dealloc(bytePtr, byteLen);
-                if (boxPtr !== 0) {
-                    const { dataPtr, dataLen, box } = exportBoxedPair(boxPtr);
-                    const reps = readBytesCopy(dataPtr, dataLen);
-                    free_memory(dataPtr, dataLen);
-                    free_result(box);
-                    if (reps.length) ws.send(reps);
-                }
-                const t0 = performance.now();
-                if (params.get('benchskip') !== '1') {
-                    const inPtr = alloc(inData.length);
-                    new Uint8Array(mem.buffer, inPtr, inData.length).set(inData);
-                    const summaryPtr = process_bytes(inPtr, inData.length);
-                    dealloc(inPtr, inData.length);
-                    if (summaryPtr !== 0) free_result(summaryPtr);
-                    scheduleRender();
-                }
-                benchSample(performance.now() - t0);
-                curScroll = scroll_offset();
-                updateScrollbar();
-                const title = extractTitle(inData);
-                if (title) {
-                    lastTitle = title + ' | terminal';
-                    document.title = lastTitle;
-                }
-            }
             ws.onerror = () => { showStatus('ws error'); };
             ws.onclose = () => {
                 showStatus('ws closed');
@@ -704,15 +781,43 @@
             }
         });
 
+        // Wheel deltas are not one-event-per-notch everywhere: clicky mice send a
+        // single event per detent, but high-resolution wheels and trackpads send a
+        // burst of small-delta events for the same physical rotation. A terminal
+        // app scrolls 3 lines per button-64/65 report, so forwarding every event
+        // verbatim turns one notch into a screenful on those devices. Accumulate
+        // the deltas into lines (cell height is the pixel/line ratio) and emit
+        // only whole 3-line reports, carrying the remainder into the next event so
+        // slow scrolling still advances one report at a time.
+        const WHEEL_LINES_PER_REPORT = 3;
+        const WHEEL_MAX_REPORTS = 5;
+        let wheelAccLines = 0;
+
+        function wheelDeltaLines(e) {
+            if (e.deltaMode === 1) return e.deltaY;           // DOM_DELTA_LINE
+            if (e.deltaMode === 2) return e.deltaY * gridRows; // DOM_DELTA_PAGE
+            return e.deltaY / (cellH > 0 ? cellH : 16);        // DOM_DELTA_PIXEL
+        }
+
         window.addEventListener('wheel', (e) => {
             e.preventDefault();
-            if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode('\x1b[?1000h'));
+            wheelAccLines += wheelDeltaLines(e);
+            const limit = WHEEL_MAX_REPORTS * WHEEL_LINES_PER_REPORT;
+            if (wheelAccLines > limit) wheelAccLines = limit;
+            else if (wheelAccLines < -limit) wheelAccLines = -limit;
+            const reports = Math.trunc(wheelAccLines / WHEEL_LINES_PER_REPORT);
+            if (reports === 0) return;
+            wheelAccLines -= reports * WHEEL_LINES_PER_REPORT;
+            if (!ws || ws.readyState !== 1) return;
+            ws.send(new TextEncoder().encode('\x1b[?1000h'));
             const rect = canvas.getBoundingClientRect();
-            const x = Math.floor((e.clientX - rect.left) / cellW) + 1;
-            const y = Math.floor((e.clientY - rect.top) / cellH) + 1;
-            const button = e.deltaY < 0 ? 64 : 65;
-            const seq = '\x1b[<' + button + ';' + x + ';' + y + 'M';
-            if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode(seq));
+            const x = Math.max(1, Math.min(gridCols, Math.floor((e.clientX - rect.left - gridX) / cellW) + 1));
+            const y = Math.max(1, Math.min(gridRows, Math.floor((e.clientY - rect.top - gridY) / cellH) + 1));
+            const button = reports < 0 ? 64 : 65;
+            for (let i = 0; i < Math.abs(reports); i++) {
+                const seq = '\x1b[<' + button + ';' + x + ';' + y + 'M';
+                ws.send(new TextEncoder().encode(seq));
+            }
         }, { passive: false });
 
         scrollbarEl.addEventListener('wheel', (e) => {

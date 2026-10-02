@@ -53,12 +53,12 @@ extern "C" {
     fn krust_gl_shader_source(gl: i32, sh: i32, ptr: *const u8, len: usize);
     fn krust_gl_compile_shader(gl: i32, sh: i32);
     fn krust_gl_get_shader_parameter(gl: i32, sh: i32, pname: u32) -> u32;
+    fn krust_gl_is_context_lost(gl: i32) -> u32;
     fn krust_gl_get_shader_info_log(gl: i32, sh: i32, out: *mut u8, cap: usize) -> usize;
     fn krust_gl_get_program_parameter(gl: i32, pr: i32, pname: u32) -> u32;
     fn krust_gl_get_program_info_log(gl: i32, pr: i32, out: *mut u8, cap: usize) -> usize;
     fn krust_gl_attach_shader(gl: i32, pr: i32, sh: i32);
     fn krust_gl_link_program(gl: i32, pr: i32);
-    fn krust_gl_is_context_lost(gl: i32) -> u32;
     fn krust_gl_use_program(gl: i32, pr: i32);
     fn krust_gl_create_buffer(gl: i32) -> i32;
     fn krust_gl_bind_buffer(gl: i32, target: u32, buf: i32);
@@ -197,12 +197,6 @@ pub(crate) fn release(h: JsHandle) {
     unsafe { krust_release(h) }
 }
 
-/// Check if the WebGL context has been lost (e.g., after the tab was hidden).
-pub(crate) fn gl_is_context_lost(gl: JsHandle) -> bool {
-    let lost = unsafe { krust_gl_is_context_lost(gl) };
-    lost != 0
-}
-
 // --- Canvas 2D ------------------------------------------------------------
 
 pub(crate) fn ctx_set_transform(ctx: JsHandle, a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) {
@@ -282,6 +276,13 @@ pub(crate) fn gl_compile_shader(gl: JsHandle, sh: JsHandle) {
 
 pub(crate) fn gl_get_shader_parameter(gl: JsHandle, sh: JsHandle, pname: u32) -> u32 {
     unsafe { krust_gl_get_shader_parameter(gl, sh, pname) }
+}
+
+/// Whether the GL context has been lost. Non-zero means every GL object
+/// handle held by the renderer is now invalid and the renderer must be
+/// rebuilt before it can draw anything.
+pub(crate) fn gl_is_context_lost(gl: JsHandle) -> bool {
+    unsafe { krust_gl_is_context_lost(gl) != 0 }
 }
 
 /// Copy the shader info log into `buf`; returns the byte length written.

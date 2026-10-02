@@ -45,9 +45,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::util::ServiceExt;
 
-    use crate::handlers::{binary_frame, index, ClientMessage};
+    use crate::handlers::{
+        binary_frame, index, resync_plan, ClientMessage, Resync, ResyncStreak,
+        MAX_CONSECUTIVE_RESYNCS,
+    };
     use crate::session::{
-        binary_chunks, drop_connection, pty_size, pty_write, AppState, BINARY_FRAME_MAX,
+        binary_chunks, drop_connection, pty_size, pty_write, AppState, History, BINARY_FRAME_MAX,
     };
 
     #[test]
@@ -192,4 +195,226 @@ mod tests {
             "krust must emit CORS headers (cross-origin fetch from Grit web UI)"
         );
     }
+
+    // --- Resync correctness -------------------------------------------------
+    //
+    // The client is a stateful VT parser and can only be fed a contiguous,
+    // duplicate-free byte stream. These pin the property that the old
+    // drop-then-replay-the-whole-log backpressure path violated.
+
+    #[test]
+    fn resync_plan_is_up_to_date_at_and_past_the_window_end() {
+        let log = b"hello".to_vec();
+        assert_eq!(resync_plan(0, &log, 5), Resync::UpToDate);
+        assert_eq!(resync_plan(0, &log, 9), Resync::UpToDate);
+        assert_eq!(resync_plan(0, &log, 0), Resync::Tail(log.clone()));
+    }
+
+    #[test]
+    fn resync_plan_sends_only_the_missing_tail() {
+        // Client already has "he"; the log now holds "hello". It must get
+        // exactly "llo" — sending the whole log would re-run bytes it has
+        // already parsed, which is what desynced the grid.
+        let log = b"hello".to_vec();
+        assert_eq!(resync_plan(0, &log, 2), Resync::Tail(b"llo".to_vec()));
+    }
+
+    #[test]
+    fn resync_plan_tail_continues_the_clients_own_bytes() {
+        // Client sits mid-window, having consumed a prefix.
+        let log = b"\x1b[?1006l\x1b[38;5;255mtext".to_vec();
+        let sent = 6; // past "\x1b[?10"
+        let Resync::Tail(tail) = resync_plan(0, &log, sent) else {
+            panic!("expected a tail resync");
+        };
+        let mut whole = log[..sent as usize].to_vec();
+        whole.extend_from_slice(&tail);
+        assert_eq!(whole, log, "tail must rejoin the stream seamlessly");
+    }
+
+    #[test]
+    fn resync_plan_requests_a_reset_when_the_client_aged_out() {
+        let log = b"recent".to_vec();
+        // Window starts at 100; the client only ever saw up to 50.
+        assert_eq!(
+            resync_plan(100, &log, 50),
+            Resync::FullReset(log.clone())
+        );
+    }
+
+    #[test]
+    fn resync_plan_at_the_window_start_sends_a_tail_not_a_reset() {
+        let log = b"recent".to_vec();
+        assert_eq!(resync_plan(100, &log, 100), Resync::Tail(log));
+    }
+
+    // --- Retained log boundary safety --------------------------------------
+
+    #[test]
+    fn history_trim_never_starts_mid_escape_sequence() {
+        // A log whose trim point would land inside "\x1b[?1006l" and
+        // "\x1b[38;5;255m". Trimming used to cut at an arbitrary byte, so a
+        // replay began with the orphaned tail ("6l", ";255m") which the
+        // client parsed as ground text and painted into the grid.
+        let mut h = History::new();
+        let data = b"aaaa\x1b[?1006lbbbb\x1b[38;5;255mcccc".to_vec();
+        h.push(0, &data, 1024);
+        let (_, retained) = h.snapshot();
+        assert_eq!(retained, data);
+
+        // Now force a trim, then check the retained window starts on an ESC.
+        h.push(retained.len() as u64, b"dddd", 20);
+        let (start, retained) = h.snapshot();
+        assert!(
+            retained.first() == Some(&0x1b),
+            "retained log must start on an ESC, got {:?}",
+            &retained[..retained.len().min(8)]
+        );
+        assert_eq!(
+            start, 16,
+            "start offset must advance past the drained bytes"
+        );
+    }
+
+    #[test]
+    fn history_trim_never_splits_a_utf8_scalar() {
+        // "é" is two bytes; cutting between them would emit a replacement
+        // char on every replay.
+        let mut h = History::new();
+        let mut data = Vec::new();
+        for _ in 0..8 {
+            data.extend_from_slice("é".as_bytes());
+        }
+        assert!(data.len() > 8);
+        h.push(0, &data, 1024);
+        // No ESC anywhere, so the trim must still land on a char boundary.
+        h.push(data.len() as u64, "é".as_bytes(), 9);
+        let (_, retained) = h.snapshot();
+        assert!(
+            std::str::from_utf8(&retained).is_ok(),
+            "retained log must stay valid UTF-8, got {:?}",
+            retained
+        );
+    }
+
+    #[test]
+    fn history_keeps_the_window_under_its_budget() {
+        let mut h = History::new();
+        let mut offset = 0u64;
+        for _ in 0..200 {
+            let data = vec![b'x'; 1024];
+            h.push(offset, &data, 4096);
+            offset += data.len() as u64;
+        }
+        let (start, retained) = h.snapshot();
+        assert!(retained.len() <= 4096, "window grew to {}", retained.len());
+        assert_eq!(start + retained.len() as u64, offset);
+    }
+
+    #[test]
+    fn history_range_from_returns_only_the_missing_tail() {
+        let mut h = History::new();
+        h.push(0, b"abcdef", 4096);
+        h.push(6, b"ghijkl", 4096);
+        let (from, tail) = h.range_from(8).expect("tail is still retained");
+        assert_eq!(from, 8);
+        assert_eq!(tail, b"ijkl");
+    }
+
+    #[test]
+    fn history_range_from_is_none_once_aged_out() {
+        let mut h = History::new();
+        let mut offset = 0u64;
+        for _ in 0..200 {
+            let data = vec![b'x'; 1024];
+            h.push(offset, &data, 4096);
+            offset += data.len() as u64;
+        }
+        let (start, _) = h.snapshot();
+        assert!(start > 0, "window should have trimmed");
+        assert!(
+            h.range_from(start - 1).is_none(),
+            "a position before the window must not index the log"
+        );
+    }
+
+    #[test]
+    fn history_range_from_past_the_end_is_empty_not_a_panic() {
+        let mut h = History::new();
+        h.push(0, b"abcdef", 4096);
+        let (from, tail) = h.range_from(999).expect("not aged out");
+        assert_eq!(from, 999);
+        assert!(
+            tail.is_empty(),
+            "a client already at the end needs no bytes, got {}",
+            tail.len()
+        );
+    }
+
+    #[test]
+    fn resync_streak_tolerates_a_brief_stall() {
+        let mut streak = ResyncStreak::default();
+        for _ in 0..MAX_CONSECUTIVE_RESYNCS {
+            assert!(
+                !streak.attempt(),
+                "a short stall must still be served a tail"
+            );
+        }
+    }
+
+    #[test]
+    fn resync_streak_cuts_loose_a_client_that_never_catches_up() {
+        let mut streak = ResyncStreak::default();
+        let mut last = false;
+        for _ in 0..=MAX_CONSECUTIVE_RESYNCS {
+            last = streak.attempt();
+        }
+        assert!(last, "stalled client never reset");
+    }
+
+    #[test]
+    fn resync_streak_starts_over_after_a_clean_send() {
+        let mut streak = ResyncStreak::default();
+        for _ in 0..MAX_CONSECUTIVE_RESYNCS {
+            assert!(!streak.attempt());
+        }
+        streak.kept_up();
+        // A client that caught up gets the full budget again.
+        assert!(!streak.attempt());
+    }
+
+    #[test]
+    fn history_end_is_the_offset_past_the_last_byte() {
+        let mut h = History::new();
+        h.push(0, b"abc", 1024);
+        assert_eq!(h.end(), 3);
+        h.push(3, b"de", 1024);
+        assert_eq!(h.end(), 5);
+    }
+
+    #[test]
+    fn history_trim_searches_forward_to_the_next_esc() {
+        // 31 bytes total, budget 26 -> the naive cut would be byte 5, which
+        // is inside "0123456789". The trim must instead advance to the next
+        // ESC at byte 10 so the log restarts on a sequence boundary.
+        let mut h = History::new();
+        h.push(0, b"0123456789\x1b[1;1Hmored", 1024);
+        h.push(21, b"0123456789", 26);
+        let (start, retained) = h.snapshot();
+        assert_eq!(retained[0], 0x1b);
+        assert_eq!(&retained[1..], b"[1;1Hmored0123456789");
+        assert_eq!(start, 10);
+    }
+
+    #[test]
+    fn history_trim_lands_on_an_esc_sitting_exactly_at_the_cut() {
+        let mut h = History::new();
+        h.push(0, b"0123456789\x1b[1;1Hmored", 1024);
+        h.push(21, b"tail", 15);
+        let (start, retained) = h.snapshot();
+        assert_eq!(retained[0], 0x1b);
+        assert_eq!(&retained[1..], b"[1;1Hmoredtail");
+        assert_eq!(start, 10);
+    }
+
 }

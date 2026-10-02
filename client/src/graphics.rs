@@ -40,14 +40,14 @@ pub(crate) enum LineWeight {
 /// Fractional rect + alpha for a block element, in cell units.
 pub(crate) fn block_geometry(c: char) -> Option<(f64, f64, f64, f64, f64)> {
     let g = match c {
-        '\u{2580}' => (0.0, 0.0, 1.0, 0.5, 1.0),   // ▀ upper half
-        '\u{2584}' => (0.0, 0.5, 1.0, 1.0, 1.0),   // ▄ lower half
-        '\u{2588}' => (0.0, 0.0, 1.0, 1.0, 1.0),   // █ full block
-        '\u{258C}' => (0.0, 0.0, 0.5, 1.0, 1.0),   // ▌ left half
-        '\u{2590}' => (0.5, 0.0, 1.0, 1.0, 1.0),   // ▐ right half
-        '\u{2591}' => (0.0, 0.0, 1.0, 1.0, 0.25),  // ░ light shade
-        '\u{2592}' => (0.0, 0.0, 1.0, 1.0, 0.5),   // ▒ medium shade
-        '\u{2593}' => (0.0, 0.0, 1.0, 1.0, 0.75),  // ▓ dark shade
+        '\u{2580}' => (0.0, 0.0, 1.0, 0.5, 1.0),  // ▀ upper half
+        '\u{2584}' => (0.0, 0.5, 1.0, 1.0, 1.0),  // ▄ lower half
+        '\u{2588}' => (0.0, 0.0, 1.0, 1.0, 1.0),  // █ full block
+        '\u{258C}' => (0.0, 0.0, 0.5, 1.0, 1.0),  // ▌ left half
+        '\u{2590}' => (0.5, 0.0, 1.0, 1.0, 1.0),  // ▐ right half
+        '\u{2591}' => (0.0, 0.0, 1.0, 1.0, 0.25), // ░ light shade
+        '\u{2592}' => (0.0, 0.0, 1.0, 1.0, 0.5),  // ▒ medium shade
+        '\u{2593}' => (0.0, 0.0, 1.0, 1.0, 0.75), // ▓ dark shade
         _ => return None,
     };
     Some(g)
@@ -142,8 +142,8 @@ pub(crate) fn box_geometry(c: char) -> Option<(BarSide, StemSide, LineWeight)> {
         '\u{256F}' => (B::Left, S::Down, W::Light),   // ╯ rounded
         '\u{2570}' => (B::Right, S::Down, W::Light),  // ╰ rounded
         '\u{2504}' | '\u{2508}' | '\u{254C}' | '\u{254D}' => (B::Full, S::None, W::Light),
-        '\u{2505}' | '\u{2506}' | '\u{2507}' | '\u{2509}' | '\u{250A}' | '\u{250B}' | '\u{254E}'
-        | '\u{254F}' => (B::None, S::Full, W::Light),
+        '\u{2505}' | '\u{2506}' | '\u{2507}' | '\u{2509}' | '\u{250A}' | '\u{250B}'
+        | '\u{254E}' | '\u{254F}' => (B::None, S::Full, W::Light),
         _ => return None,
     };
     Some(g)
@@ -235,10 +235,13 @@ pub(crate) fn graphic_cell_rects(
 
 /// Paint a graphic glyph (block element or box-drawing) as geometry covering
 /// its cell. Returns `true` when handled (caller skips the font path).
+///
+/// `x`/`y` are the cell's top-left corner in CSS pixels, already offset by the
+/// grid origin.
 pub(crate) fn draw_graphic_cell(
     ctx: JsHandle,
-    col: u16,
-    row: u16,
+    x: f64,
+    y: f64,
     cw: f64,
     ch: f64,
     glyph: &str,
@@ -247,7 +250,7 @@ pub(crate) fn draw_graphic_cell(
     let Some(c) = glyph.chars().next() else {
         return false;
     };
-    let Some(rects) = graphic_cell_rects(c, col as f64 * cw, row as f64 * ch, cw, ch, 1.0) else {
+    let Some(rects) = graphic_cell_rects(c, x, y, cw, ch, 1.0) else {
         return false;
     };
     ffi::ctx_set_fill_style(ctx, &css_color(color));

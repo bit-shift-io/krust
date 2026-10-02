@@ -86,6 +86,40 @@ Krust is a Rust terminal emulator with a two-crate workspace:
   is `&mut self` so it can bake newly seen glyphs before drawing. `▣`
   (`graphics.rs`) and braille (`renderer.rs`) are synthesized, not
   font-rendered.
+- **Grid geometry is device-pixel-exact.** `measure::finish_cell_dims` rounds the
+  measured CSS cell to whole device pixels (`device_pitch = ceil(css * dpr)`) and
+  the CSS pitch is derived back as `device_pitch / dpr`, so browser zoom
+  produces slightly fractional CSS cell sizes on purpose — never re-round those,
+  or the grid drifts off the pixel grid. `grid_metrics` exports the grid origin
+  and cell box so the page can center the grid inside the canvas at that pitch.
+  `window_dpr` only floors at 1.0; the page must not clamp DPR independently
+  (a `Math.min(3, ...)` once made the JS cell size and the Rust buffer size
+  disagree above 3x).
+- **Rendering while hidden, and after a resync.** `scheduleRender` returns
+  early when `document.hidden`; the parser still consumes every byte (pausing
+  it would deepen the very lag it is avoiding, and the PTY can stall), only the
+  canvas work is skipped. `document.hidden` and `document.visibilityState`
+  disagree in the background tab, so the former is the one to test. Coming
+  back — `visibilitychange`, `focus`, or an `IntersectionObserver` fire — calls
+  `repaintOnReturn()`, which rebuilds WebGL if the context was lost and then
+  `repaint()`s. A `"Reset"` control frame calls `reset_terminal`, which
+  rebuilds the `vt100` `Parser` and clears scroll/selection/prev-screen state
+  before marking the whole grid dirty; without dropping the parser first the
+  retained log lands on top of the old screen. Keep `handleIncoming` and
+  `handleWsData` at the shared init scope, not nested in the socket closure:
+  the `wsQueue` flush needs them before the socket exists.
+- **Scrollbar:** shown only when there is real scrollback and the parser is not
+  on the alternate screen (`scrollable = max > 0 && !is_alt_screen()`), and it
+  is display-gated with `pointer-events: none` so it never eats clicks. Note
+  `vt100` builds the alternate grid with `Grid::new(size, 0)`, so alt-mode
+  `scrollback_len()` is already 0 — the `is_alt_screen()` check is a readable
+  guard on that invariant, not the thing that makes hiding work.
+- **Terminal capability replies:** `query_replies` must answer what a shell
+  probes at startup or the PTY appears dead. It covers DA1/DA2/CPR/OSC-11 plus
+  XTVERSION (`CSI > 0 q`), TERM (`DCS > | … ST`), and XTGETTCAP
+  (`DCS + q … ST`, answered as `DCS 0 + r … ST`). `TERM_NAME`/`TERM_VERSION`
+  in `query.rs` are the single source for those. An unterminated or
+  non-hex XTGETTCAP body is deliberately not answered, rather than guessed at.
 - **Tests:** Unit tests live alongside code in `#[cfg(test)] mod tests`.
   Server tests use `tower::util::ServiceExt` for one-shot HTTP requests.
 - **CORS:** `tower-http::cors::CorsLayer::permissive()` is enabled on all
@@ -117,8 +151,29 @@ Krust is a Rust terminal emulator with a two-crate workspace:
 - Binary frames (`ArrayBuffer`) containing raw PTY output bytes.
 - On connect, the server replays the session's scrollback history (up to 512 KB)
   as a sequence of ≤16 KB binary frames.
-- Backpressure: per-client `ByteBudget` (1 MB pending). When exceeded, stale
-  frames are dropped and the latest history is replayed.
+- `{"type":"Reset"}` (text frame) tells the client to drop its parser state
+  before the log that follows. See the resync note below.
+- **Resync, not replay.** The client's `vt100` parser is stateful, so it can
+  only consume a contiguous, duplicate-free byte stream. The server tags every
+  frame with the absolute `StreamOffset` it starts at and tracks a per-client
+  `sent_upto`; any gap (a dropped broadcast frame, an exceeded `ByteBudget`, a
+  `Lagged` receiver) is healed by resending only the missing tail from the
+  512 KB log, never the whole log. The old behavior — drop the queue, then
+  replay all of history on top of what the client already parsed — both
+  duplicated bytes and restarted the parser mid-escape-sequence, which is what
+  painted literal tails like `;255m` and `25h` into the grid. Never reintroduce
+  it. `resync_plan` is the pure function that decides between
+  `UpToDate`/`Tail`/`FullReset`.
+- **A client that never catches up gets restarted.** A stalled tab cannot be
+  brought up to date with tails forever: each catch-up is overtaken by new
+  output, so it would spin and re-copy the log indefinitely. After
+  `MAX_CONSECUTIVE_RESYNCS` consecutive attempts, `ResyncStreak` escalates to
+  `FullReset` — `{"type":"Reset"}` plus the retained window, which is bounded
+  and always leaves the client parsing a stream consistent with its own state.
+- The log is trimmed only at an ESC boundary (falling back to a UTF-8 boundary
+  when no ESC is in range) so a restart never orphans half a sequence.
+- `subscribe` happens *before* the history snapshot, otherwise output produced
+  in between is in neither copy and the client silently loses it.
 
 ---
 
@@ -142,6 +197,8 @@ the `krust` FFI registry.
 | `clear_selection()` | Clear active selection |
 | `handle_click(x, y)` | Clear selection, return clicked cell (boxed pair) |
 | `scroll_to*`, `scroll_offset`, `scrollback_len`, `selection_mode` | Scrollback/selection introspection |
+| `is_alt_screen()` | `1` while the parser owns the alternate screen (alt buffer) |
+| `grid_metrics()` | Grid origin, cell box, and row/col counts as JSON (boxed pair) |
 | `version()` | Module version string (boxed pair) |
 
 Memory: `alloc`/`dealloc` (caller buffers), `free_memory`, `free_string`,
