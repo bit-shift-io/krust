@@ -227,12 +227,13 @@ pub extern "C" fn init(
         .unwrap_or_else(|e| panic!("terminal init failed: {}", e));
 
     let state_json = format!(
-        "{{\"canvas_id\":{},\"rows\":{},\"cols\":{},\"cell_width\":{},\"cell_height\":{}}}",
+        "{{\"canvas_id\":{},\"rows\":{},\"cols\":{},\"cell_width\":{},\"cell_height\":{},\"renderer\":{}}}",
         json_string(term_state.canvas_id()),
         term_state.size().0,
         term_state.size().1,
         json_f64(term_state.cell_width),
         json_f64(term_state.cell_height),
+        json_string(term_state.renderer_name()),
     );
 
 TERM_STATE.with(|s| *s.borrow_mut() = Some(term_state));

@@ -383,6 +383,7 @@
         const boxPtr = init(canvasIdPtr, canvasIdBytes.length, cachedPtr, cachedLen);
         if (cachedPtr) dealloc(cachedPtr, cachedLen);
         dealloc(canvasIdPtr, canvasIdBytes.length);
+        let rendererName = null;
         if (boxPtr === 0) {
             gridCols = 80;
             gridRows = 24;
@@ -398,6 +399,7 @@
             gridRows = cfg.rows || 24;
             cellW = Math.max(1, cfg.cell_width || 8);
             cellH = Math.max(1, cfg.cell_height || 18);
+            rendererName = cfg.renderer || null;
             // Cache cell dimensions for next visit (skip expensive scratch measurement)
             try {
                 sessionStorage.setItem(cacheKey, JSON.stringify({ dpr, w: cellW, h: cellH }));
@@ -407,7 +409,7 @@
         fit();
         updateScrollbar();
         window.addEventListener('resize', () => { fit(); sendResize(); });
-        showStatus('krust terminal');
+        showStatus('krust terminal' + (rendererName ? ' (' + (rendererName === 'gl' ? 'GL' : '2D') + ')' : ''));
         wasmReady = true;
         sendResize(); // fire if ws is already connected
         // Frames that arrived before init() completed (the WebSocket opens

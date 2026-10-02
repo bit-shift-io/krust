@@ -889,6 +889,18 @@ impl TerminalState {
         self.ctx
     }
 
+    /// Short name of the renderer that actually ended up active: `"gl"` for
+    /// the WebGL2 path, `"2d"` for the Canvas 2D fallback. Reported in the
+    /// `init` config JSON so the page can show which mode won the fallback
+    /// race (and which `?r=` override is really in effect).
+    pub(crate) fn renderer_name(&self) -> &'static str {
+        if self.webgl.is_some() {
+            "gl"
+        } else {
+            "2d"
+        }
+    }
+
     /// Set measured cell dimensions (used on resize).
     pub(crate) fn set_cell_dims(&mut self, cw: f64, ch: f64) {
         self.cell_width = cw;
