@@ -716,11 +716,32 @@
             sendPaste(text);
         });
 
+        let mouseTracking = false;
+
+        function startMouseTracking() {
+            mouseTracking = true;
+        }
+
+        function stopMouseTracking() {
+            mouseTracking = false;
+        }
+
+        function sendMouseProtocol(button, x, y, isRelease) {
+            if (!mouseTracking) return;
+            const report = isRelease
+                ? `\x1b[${button}m`
+                : `\x1b[${button};${x};${y}M`;
+            if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode(report));
+        }
+
         window.addEventListener('mousedown', (e) => {
             if (e.button !== 0) return;
             selDragging = true;
             selMoved = false;
             selAnchor = cellFromPoint(e.clientX, e.clientY);
+            startMouseTracking();
+            const cur = cellFromPoint(e.clientX, e.clientY);
+            sendMouseProtocol(1, cur.col + 1, cur.row + 1, false);
         });
 
         window.addEventListener('mousemove', (e) => {
@@ -735,7 +756,10 @@
             selDragging = false;
             if (!selMoved) {
                 clear_selection();
-                repaint();
+                repaint(); // move cursor to clicked position
+                handle_click(e.clientX, e.clientY);
+                sendMouseProtocol(e.button, e.clientX, e.clientY, true);
+                stopMouseTracking();
                 selAnchor = null;
                 return;
             }
