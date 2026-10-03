@@ -5,15 +5,29 @@
 // PTY output into the history and fans it out to connected WebSockets.
 
 use axum::extract::ws::Message;
-use portable_pty::{
-    CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem,
-};
+use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::{
     collections::HashMap,
     io::{Read, Write},
     sync::{Arc, Mutex as StdMutex},
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
+use vt100::Parser;
+
+/// The mirror parser plus the absolute stream offset it has consumed.
+///
+/// Both live under one lock: the PTY reader thread advances them together
+/// (after the history append, before the broadcast), so a screen clone and
+/// its `upto` can never disagree. Replay callers compare `upto` against the
+/// retained-log snapshot to decide exactly which log bytes a screen image
+/// already covers — without that, bytes appended between the two lock
+/// acquisitions would be re-applied to the client twice.
+pub(crate) struct Mirror {
+    pub(crate) parser: Parser,
+    pub(crate) upto: StreamOffset,
+}
+
+pub(crate) type MirrorArc = std::sync::Arc<std::sync::Mutex<Mirror>>;
 
 /// Keep 512 KB scrollback buffer per session.
 pub(crate) const MAX_HISTORY_BYTES: usize = 1024 * 512;
@@ -154,6 +168,13 @@ pub(crate) struct Session {
     /// critical section is a few microseconds of vector work and is taken
     /// from both async and blocking contexts.
     pub(crate) history: Arc<StdMutex<History>>,
+    /// Mirror VT parser fed with every PTY byte (single writer: the PTY
+    /// reader thread). `replay_image` derives a screen-repainting stream
+    /// from it, so resets never depend on a mid-stream log window.
+    pub(crate) mirror: MirrorArc,
+    /// Resize notifications for the mirror; drained by the PTY reader thread
+    /// so the mirror size tracks the real PTY between reads.
+    pub(crate) resize_tx: tokio::sync::mpsc::UnboundedSender<(u16, u16)>,
     pub(crate) connections: std::sync::atomic::AtomicUsize,
 }
 
@@ -225,6 +246,15 @@ pub(crate) async fn get_or_create_session(
     let tx_clone = tx.clone();
     let history = Arc::new(StdMutex::new(History::new()));
     let history_clone = history.clone();
+    // The mirror starts at the openpty default; the client's first Resize
+    // message re-sizes both the PTY and, via the resize channel, the mirror.
+    let mirror: MirrorArc = StdMutex::new(Mirror {
+        parser: Parser::new(24, 80, 0),
+        upto: 0,
+    })
+    .into();
+    let mirror_clone = mirror.clone();
+    let (resize_tx, mut resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
     let mut stream_offset: StreamOffset = 0;
 
     tokio::task::spawn_blocking(move || {
@@ -232,6 +262,14 @@ pub(crate) async fn get_or_create_session(
         while let Ok(n) = reader.read(&mut buffer) {
             if n == 0 {
                 break;
+            }
+            // Apply any client-requested resizes before the bytes that follow
+            // them, so the mirror's wrap points match the real PTY.
+            while let Ok((cols, rows)) = resize_rx.try_recv() {
+                let mut m = mirror_clone.lock().expect("mirror lock poisoned");
+                if m.parser.screen().size() != (rows, cols) {
+                    m.parser.screen_mut().set_size(rows, cols);
+                }
             }
             let data = buffer[..n].to_vec();
 
@@ -241,7 +279,17 @@ pub(crate) async fn get_or_create_session(
                 hist.push(stream_offset, &data, MAX_HISTORY_BYTES);
             }
 
-            // 2. Broadcast output to active WebSocket listeners.
+            // 2. Fold the bytes into the mirror. Deliberately *after* the log
+            // append and *before* the broadcast: mirror.upto can never pass
+            // the log's end, and every byte is live-broadcast once its
+            // mirror state is in place.
+            {
+                let mut m = mirror_clone.lock().expect("mirror lock poisoned");
+                m.parser.process(&data);
+                m.upto = stream_offset + n as StreamOffset;
+            }
+
+            // 3. Broadcast output to active WebSocket listeners.
             // Fire-and-forget send: if receivers lag, the broadcast channel
             // drops the frame (bounded at 512) and recv() reports Lagged,
             // which clients resync from the log.
@@ -255,8 +303,10 @@ pub(crate) async fn get_or_create_session(
         master: Arc::new(Mutex::new(pair.master)),
         tx,
         history,
+        mirror,
+        resize_tx,
         connections: std::sync::atomic::AtomicUsize::new(0),
     });
-sessions.insert(session_id.to_string(), session.clone());
+    sessions.insert(session_id.to_string(), session.clone());
     session
 }

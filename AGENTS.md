@@ -26,6 +26,7 @@ Krust is a Rust terminal emulator with a two-crate workspace:
 | `server/src/main.rs` | Axum router + CORS layer, tests |
 | `server/src/session.rs` | PTY session management (spawn, scrollback history, broadcast fan-out) |
 | `server/src/handlers.rs` | HTTP/WS handler layer; embeds the client HTML, runtime JS, and WASM |
+| `server/src/replay.rs` | Builds the mirrored-screen ANSI image used on resets (`replay_image`) |
 | `client/src/lib.rs` | WASM terminal: VT100 parser, Canvas 2D renderer, input mapping, selection, tests |
 | `client/src/ffi.rs` | Raw `extern "C"` imports from the `krust` JS module + safe wrappers |
 | `client/res/krust_runtime.js` | Browser-side FFI runtime (`window.KRUST_RUNTIME`); embedded into the server binary (`include_str!` in `handlers.rs`) |
@@ -34,7 +35,7 @@ Krust is a Rust terminal emulator with a two-crate workspace:
 | `client/res/index.html` | Minimal smoke-test HTML |
 | `Cargo.toml` | Workspace manifest (`server`, `client`) |
 | `TASKS.md` | Implementation roadmap |
-| `NOTES.md` | Design rationale and key decisions (currently an empty stub) |
+| `NOTES.md` | Design rationale and key decisions |
 
 ---
 
@@ -149,10 +150,23 @@ Krust is a Rust terminal emulator with a two-crate workspace:
 ### Server → Client
 
 - Binary frames (`ArrayBuffer`) containing raw PTY output bytes.
-- On connect, the server replays the session's scrollback history (up to 512 KB)
-  as a sequence of ≤16 KB binary frames.
+- On connect, the server sends `{"type":"Reset"}`, then replays the session's
+  scrollback history (up to 512 KB) as a sequence of ≤16 KB binary frames,
+  then a **screen image** (see below) that repaints the true visible screen.
 - `{"type":"Reset"}` (text frame) tells the client to drop its parser state
-  before the log that follows. See the resync note below.
+  before the log that follows. See the resync notes below.
+- **Mirror + screen image, not log replay.** Replaying a *trimmed* byte log
+  into a stateful VT parser cannot reconstruct the true screen — a mid-stream
+  cut loses every cell the app drew before the window, which is exactly the
+  blank-region glitch that appeared after tab-switch/resets. The session keeps
+  a mirror `vt100::Parser` (`session.rs`, single writer = the PTY reader
+  thread, `mirror.upto` advanced under the same lock). On reset the server
+  sends `replay_image` (`server/src/replay.rs`): `mirror.screen().state_diff`
+  of a parser fed exactly the bytes the client will have re-parsed, plus an
+  `ESC[?1049h/l` prelude (DECSET 1049 always clears the alt grid, DECRST is a
+  no-op on the normal screen) and a final CUP pinning the cursor. The image is
+  plain ANSI — no client or protocol changes. Tail resyncs still replay the
+  log; only full resets use the image.
 - **Resync, not replay.** The client's `vt100` parser is stateful, so it can
   only consume a contiguous, duplicate-free byte stream. The server tags every
   frame with the absolute `StreamOffset` it starts at and tracks a per-client
@@ -167,11 +181,16 @@ Krust is a Rust terminal emulator with a two-crate workspace:
 - **A client that never catches up gets restarted.** A stalled tab cannot be
   brought up to date with tails forever: each catch-up is overtaken by new
   output, so it would spin and re-copy the log indefinitely. After
-  `MAX_CONSECUTIVE_RESYNCS` consecutive attempts, `ResyncStreak` escalates to
-  `FullReset` — `{"type":"Reset"}` plus the retained window, which is bounded
-  and always leaves the client parsing a stream consistent with its own state.
+  `MAX_CONSECUTIVE_RESYNCS` consecutive catch-ups that actually sent bytes,
+  `ResyncStreak` escalates to `FullReset` — `{"type":"Reset"}` plus a screen
+  image, which is bounded and always leaves the client parsing a stream
+  consistent with its own state. A no-op `UpToDate` pass never increments the
+  streak, so budget bookkeeping alone cannot force a healthy client to reset.
+- The reset path advances `sent_upto` to the mirror's `upto` (the log tail
+  path uses the log's end), keeping the subsequent live frames contiguous with
+  the image — bytes between the two are delivered live, never duplicated.
 - The log is trimmed only at an ESC boundary (falling back to a UTF-8 boundary
-  when no ESC is in range) so a restart never orphans half a sequence.
+  when no ESC is in range) so a tail replay never orphans half a sequence.
 - `subscribe` happens *before* the history snapshot, otherwise output produced
   in between is in neither copy and the client silently loses it.
 

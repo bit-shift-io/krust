@@ -369,6 +369,7 @@ dependencies = [
  "tokio",
  "tower",
  "tower-http",
+ "vt100",
 ]
 
 [[package]]

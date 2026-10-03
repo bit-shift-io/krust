@@ -4,10 +4,12 @@
 // bytes to WASM clients over the WebSocket protocol in `handlers::`.
 //
 // Module layout:
-// - `session.rs` — PTY session management (spawn, history, broadcast)
+// - `session.rs` — PTY session management (spawn, history, broadcast, mirror parser)
+// - `replay.rs` — synthesizes a screen-repainting ANSI stream from the mirror
 // - `handlers.rs` — HTTP/WS handler layer (router endpoints live in `main()`)
 
 mod handlers;
+mod replay;
 mod session;
 
 use axum::{routing::get, Router};
@@ -110,7 +112,9 @@ mod tests {
         let big = vec![b'a'; 200_000];
         let chunked = binary_chunks(big.clone());
         assert!(!chunked.is_empty());
-        assert!(chunked.iter().all(|m| matches!(m, Message::Binary(b) if !b.is_empty() && b.len() <= BINARY_FRAME_MAX)));
+        assert!(chunked.iter().all(
+            |m| matches!(m, Message::Binary(b) if !b.is_empty() && b.len() <= BINARY_FRAME_MAX)
+        ));
         let total: usize = chunked
             .iter()
             .map(|m| match m {
@@ -236,10 +240,7 @@ mod tests {
     fn resync_plan_requests_a_reset_when_the_client_aged_out() {
         let log = b"recent".to_vec();
         // Window starts at 100; the client only ever saw up to 50.
-        assert_eq!(
-            resync_plan(100, &log, 50),
-            Resync::FullReset(log.clone())
-        );
+        assert_eq!(resync_plan(100, &log, 50), Resync::FullReset(log.clone()));
     }
 
     #[test]
@@ -355,32 +356,51 @@ mod tests {
     fn resync_streak_tolerates_a_brief_stall() {
         let mut streak = ResyncStreak::default();
         for _ in 0..MAX_CONSECUTIVE_RESYNCS {
+            // `resync` gates the force decision *before* recording the
+            // attempt, so the first MAX stalls are served tails.
             assert!(
-                !streak.attempt(),
+                !streak.should_force(),
                 "a short stall must still be served a tail"
             );
+            streak.attempt();
         }
     }
 
     #[test]
     fn resync_streak_cuts_loose_a_client_that_never_catches_up() {
         let mut streak = ResyncStreak::default();
-        let mut last = false;
-        for _ in 0..=MAX_CONSECUTIVE_RESYNCS {
-            last = streak.attempt();
+        for _ in 0..MAX_CONSECUTIVE_RESYNCS {
+            streak.attempt();
         }
-        assert!(last, "stalled client never reset");
+        assert!(
+            streak.should_force(),
+            "a client that never catches up must be restarted, not fed more tails"
+        );
     }
 
     #[test]
     fn resync_streak_starts_over_after_a_clean_send() {
         let mut streak = ResyncStreak::default();
         for _ in 0..MAX_CONSECUTIVE_RESYNCS {
-            assert!(!streak.attempt());
+            streak.attempt();
         }
         streak.kept_up();
-        // A client that caught up gets the full budget again.
-        assert!(!streak.attempt());
+        // A client that caught up gets the full escalaton budget again.
+        streak.attempt();
+        assert!(!streak.should_force());
+    }
+
+    #[test]
+    fn resync_streak_only_counts_attempts_the_caller_records() {
+        // `resync` records `attempt` only after bytes went out, so streak
+        // bookkeeping alone (e.g. budget-bookkeeping passes that resolved to
+        // `UpToDate` and sent nothing) can never force a healthy client into
+        // a needless restart.
+        let mut streak = ResyncStreak::default();
+        for _ in 0..100 {
+            streak.kept_up();
+        }
+        assert!(!streak.should_force());
     }
 
     #[test]
@@ -416,5 +436,4 @@ mod tests {
         assert_eq!(&retained[1..], b"[1;1Hmoredtail");
         assert_eq!(start, 10);
     }
-
 }

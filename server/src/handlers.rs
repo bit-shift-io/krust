@@ -15,8 +15,10 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::broadcast;
 
+use crate::replay::replay_image;
 use crate::session::{
-    binary_chunks, get_or_create_session, pty_size, pty_write, AppState, History, StreamOffset,
+    binary_chunks, get_or_create_session, pty_size, pty_write, AppState, History, MirrorArc,
+    StreamOffset,
 };
 
 const INDEX_HTML: &str = include_str!("../../client/res/server.html");
@@ -86,37 +88,40 @@ pub(crate) fn resync_plan(start: StreamOffset, bytes: &[u8], sent_upto: StreamOf
 }
 
 /// Send a client whatever it is missing, and advance `sent_upto` to the end of
-/// the retained window.
+/// the retained window. Returns whether any bytes actually went out (a client
+/// that was already current gets nothing).
 ///
 /// `force_full` skips the "are you current?" test and always restarts the
-/// client from the whole window; it is the escape hatch for a client that has
-/// already spent `MAX_CONSECUTIVE_RESYNCS` attempts on catch-ups.
+/// client; it is the escape hatch for a client that has already spent
+/// `MAX_CONSECUTIVE_RESYNCS` attempts on catch-ups.
 ///
-/// `ws_sender` is `&mut` and the history lock is taken only long enough to
-/// clone, so neither is held across an await.
+/// A restart does NOT replay the retained log: that log is a mid-stream
+/// window once the session outgrows it, and a stateful parser cannot rebuild
+/// the true screen from it (the blank-region focus-loss glitch). It replays a
+/// screen image synthesized from the mirror parser instead, which repaints
+/// the exact current screen regardless of where the log window begins.
+///
+/// `ws_sender` is `&mut` and the history/mirror locks are taken only long
+/// enough to clone, so none are held across an await.
 async fn send_resync(
     ws_sender: &mut WsSender,
     history: &std::sync::Arc<std::sync::Mutex<History>>,
+    mirror: &MirrorArc,
     sent_upto: &mut StreamOffset,
     force_full: bool,
-) -> Result<(), ()> {
+) -> Result<bool, ()> {
     // A tail only needs the bytes the client is missing; a full restart needs
     // the whole window. Cloning the window for the common tail case would
     // copy the log once per resync, which is what made a slow client spin.
     let (from, bytes) = {
         let hist = history.lock().expect("history lock poisoned");
-        if force_full {
-            hist.snapshot()
-        } else {
-            hist.range_from(*sent_upto)
-                .unwrap_or_else(|| hist.snapshot())
-        }
+        resync_window(&hist, *sent_upto, force_full)
     };
     let start = from;
     let end = start + bytes.len() as StreamOffset;
     let plan = resync_plan(start, &bytes, *sent_upto);
     if matches!(plan, Resync::UpToDate) && !force_full {
-        return Ok(());
+        return Ok(false);
     }
     // A tail continues the client's own bytes, so the parser simply resumes
     // mid-sequence where it stopped. A full restart cannot: the client has
@@ -128,12 +133,43 @@ async fn send_resync(
             .send(axum::extract::ws::Message::Text(RESET_MESSAGE.to_string()))
             .await
             .map_err(|_| ())?;
+        // Screen image against a blank screen (no retained log ahead of it).
+        // The mirror offset advances with the screen, so continuing from it
+        // (rather than from the log snapshot) keeps the client's stream
+        // contiguous: bytes past it arrive as ordinary live frames.
+        let (image, mirror_upto) = {
+            let m = mirror.lock().expect("mirror lock poisoned");
+            (replay_image(m.parser.screen(), &[]), m.upto)
+        };
+        for frame in binary_chunks(image) {
+            ws_sender.send(frame).await.map_err(|_| ())?;
+        }
+        *sent_upto = mirror_upto;
+    } else {
+        for frame in binary_chunks(bytes) {
+            ws_sender.send(frame).await.map_err(|_| ())?;
+        }
     }
-    for frame in binary_chunks(bytes) {
-        ws_sender.send(frame).await.map_err(|_| ())?;
+    if !needs_reset {
+        *sent_upto = end;
     }
-    *sent_upto = end;
-    Ok(())
+    Ok(true)
+}
+
+/// The byte window a resync needs: the missing tail normally, the whole
+/// retained log when forcing a restart (its length drives `sent_upto`;
+/// the restart's *screen* comes from the mirror image, not these bytes).
+fn resync_window(
+    hist: &History,
+    sent_upto: StreamOffset,
+    force_full: bool,
+) -> (StreamOffset, Vec<u8>) {
+    if force_full {
+        hist.snapshot()
+    } else {
+        hist.range_from(sent_upto)
+            .unwrap_or_else(|| hist.snapshot())
+    }
 }
 
 /// Counts catch-up attempts for one client so a hopeless one can be cut loose.
@@ -151,16 +187,20 @@ pub(crate) struct ResyncStreak {
 }
 
 impl ResyncStreak {
-    /// Record a catch-up attempt; returns `true` when the client has spent too
-    /// many and should be restarted from the retained window instead.
-    pub(crate) fn attempt(&mut self) -> bool {
+    /// Record a catch-up that actually sent bytes.
+    pub(crate) fn attempt(&mut self) {
         self.consecutive += 1;
         if self.consecutive > MAX_CONSECUTIVE_RESYNCS {
             self.consecutive = 0;
-            true
-        } else {
-            false
         }
+    }
+
+    /// Whether the next catch-up should skip the trivial tail and restart the
+    /// client outright. A no-op `UpToDate` pass never even increments the
+    /// streak (see [`resync`]), so a client that merely crosses budget
+    /// bookkeeping can no longer be escalated into a needless restart.
+    pub(crate) fn should_force(&self) -> bool {
+        self.consecutive >= MAX_CONSECUTIVE_RESYNCS
     }
 
     /// Record a frame that went out live, i.e. a client that is keeping up.
@@ -174,11 +214,18 @@ impl ResyncStreak {
 async fn resync(
     ws_sender: &mut WsSender,
     history: &std::sync::Arc<std::sync::Mutex<History>>,
+    mirror: &MirrorArc,
     sent_upto: &mut StreamOffset,
     streak: &mut ResyncStreak,
 ) -> Result<(), ()> {
-    let force_full = streak.attempt();
-    send_resync(ws_sender, history, sent_upto, force_full).await
+    let force_full = streak.should_force();
+    let sent = send_resync(ws_sender, history, mirror, sent_upto, force_full).await?;
+    if sent {
+        // A resync that sent nothing (the client was already current) leaves
+        // the streak untouched so it can never escalate a healthy client.
+        streak.attempt();
+    }
+    Ok(())
 }
 
 /// Tracks how many bytes a single WebSocket client has queued since its last
@@ -292,24 +339,52 @@ async fn handle_socket(
     // client's stream. Subscribing first means those frames arrive on the
     // channel and are handled as ordinary live output.
     let history = session.history.clone();
+    let mirror = session.mirror.clone();
     let mut pty_rx = session.tx.subscribe();
 
+    // Mirror first, then the log snapshot. The reader thread appends to the
+    // log *before* advancing the mirror, so `mirror_upto` can never sit past
+    // the snapshot's effect yet: every byte past it is either inside the
+    // snapshot or arrives live on the subscription.
+    let (mirror_screen, mirror_upto) = {
+        let m = mirror.lock().expect("mirror lock poisoned");
+        (m.parser.screen().clone(), m.upto)
+    };
     let (hist_start, hist_bytes) = {
         let hist = history.lock().expect("history lock poisoned");
         hist.snapshot()
     };
-    // A fresh client has an empty parser, so the retained log — which always
-    // begins on an ESC boundary — is a safe restart point.
+    // Replay only the log bytes the image does not already account for;
+    // (keep, ..) continues as ordinary live frames, so the client's stream
+    // never duplicates and never gaps.
+    let keep = (mirror_upto.saturating_sub(hist_start) as usize).min(hist_bytes.len());
+    let log = &hist_bytes[..keep];
     let mut sent_upto = hist_start;
-    let hist_len = hist_bytes.len() as StreamOffset;
-    if hist_len > 0 {
-        for frame in binary_chunks(hist_bytes) {
-            if ws_sender.send(frame).await.is_err() {
-                return;
-            }
-        }
-        sent_upto += hist_len;
+    // Every attach — new page load or reconnect of a live parser — starts
+    // with a Reset so the server-side replay below is the client's whole
+    // history, never an overlay on old state. The retained log buys
+    // best-effort scrollback; the screen image that follows repaints the
+    // true visible screen from the mirror parser, which is exact even though
+    // the log window is (deliberately) a mid-stream cut.
+    if ws_sender
+        .send(axum::extract::ws::Message::Text(RESET_MESSAGE.to_string()))
+        .await
+        .is_err()
+    {
+        return;
     }
+    for frame in binary_chunks(log.to_vec()) {
+        if ws_sender.send(frame).await.is_err() {
+            return;
+        }
+    }
+    let image = replay_image(&mirror_screen, log);
+    for frame in binary_chunks(image) {
+        if ws_sender.send(frame).await.is_err() {
+            return;
+        }
+    }
+    sent_upto += keep as StreamOffset;
 
     // 2. Task: PTY output -> WebSocket
     let pty_read_task = tokio::spawn(async move {
@@ -321,9 +396,15 @@ async fn handle_socket(
                 // The bounded channel dropped frames. The bytes are still in
                 // the log, so hand the client exactly what it missed.
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    if resync(&mut ws_sender, &history, &mut sent_upto, &mut streak)
-                        .await
-                        .is_err()
+                    if resync(
+                        &mut ws_sender,
+                        &history,
+                        &mirror,
+                        &mut sent_upto,
+                        &mut streak,
+                    )
+                    .await
+                    .is_err()
                     {
                         break;
                     }
@@ -342,9 +423,15 @@ async fn handle_socket(
             // contiguous, which is the one thing its parser cannot tolerate.
             if offset != sent_upto {
                 budget.pending = 0;
-                if resync(&mut ws_sender, &history, &mut sent_upto, &mut streak)
-                    .await
-                    .is_err()
+                if resync(
+                    &mut ws_sender,
+                    &history,
+                    &mirror,
+                    &mut sent_upto,
+                    &mut streak,
+                )
+                .await
+                .is_err()
                 {
                     break;
                 }
@@ -356,9 +443,15 @@ async fn handle_socket(
                 // (a throttled or frozen browser tab). Rather than dropping
                 // the frame, catch it up from the log.
                 budget.pending = 0;
-                if resync(&mut ws_sender, &history, &mut sent_upto, &mut streak)
-                    .await
-                    .is_err()
+                if resync(
+                    &mut ws_sender,
+                    &history,
+                    &mirror,
+                    &mut sent_upto,
+                    &mut streak,
+                )
+                .await
+                .is_err()
                 {
                     break;
                 }
@@ -376,6 +469,7 @@ async fn handle_socket(
     // 3. Task: WebSocket input -> PTY writer & resize handlers
     let writer = session.writer.clone();
     let master = session.master.clone();
+    let resize_tx = session.resize_tx.clone();
 
     let ws_recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_receiver.next().await {
@@ -405,6 +499,10 @@ async fn handle_socket(
                                 }
                             })
                             .await;
+                            // Keep the mirror's wrap points aligned with the
+                            // real PTY so the next screen image is laid out
+                            // at the size the client is actually seeing.
+                            let _ = resize_tx.send((cols, rows));
                         }
                     }
                 }

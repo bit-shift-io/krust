@@ -11,6 +11,10 @@ tower-http = { version = "0.5", features = ["cors"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Mirror parser for the session screen: the server replays a synthesized
+# screen image (from vt100's own state diff) so a client replay never depends
+# on a byte log trimmed mid-stream.
+vt100 = "0.16"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
