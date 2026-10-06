@@ -18,6 +18,7 @@ mod ffi;
 mod graphics;
 mod input;
 mod measure;
+mod mouse;
 mod query;
 mod renderer;
 mod selection;

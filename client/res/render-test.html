@@ -25,7 +25,8 @@
         window.KRUST_RUNTIME.install(wasm.instance.exports.memory);
         const tInst = performance.now();
         const { init, set_renderer_mode, process_bytes, repaint, handle_resize, version,
-                grid_metrics, alloc, dealloc, free_memory, free_string, free_result } = wasm.instance.exports;
+                grid_metrics, alloc, dealloc, free_memory, free_string, free_result,
+                mouse_event, mouse_tracking, application_cursor } = wasm.instance.exports;
         const mem = wasm.instance.exports.memory;
 
         const canvas = document.getElementById('terminal-canvas');
@@ -358,6 +359,54 @@
             for (let i = 0; i < sig1.length; i++) if (sig1[i] !== sig2[i]) frameDeltas++;
             const animateOk = frameDeltas > 0 && f1Ink > 0 && f2Ink > 0;
 
+            // Mouse wiring probe: feed the private modes an app turns on
+            // (press/release + drag + SGR, as opencode's TUI does), then check
+            // that mouse_tracking()/mouse_event() see the modes on the screen
+            // and encode the reports the way xterm does. Kinds: 0 press,
+            // 1 release, 2 motion, 3 wheel; mods: 1 shift, 2 alt, 4 ctrl.
+            function feedStr(s) {
+                const b = new TextEncoder().encode(s);
+                const p = alloc(b.length);
+                new Uint8Array(mem.buffer, p, b.length).set(b);
+                const sum = process_bytes(p, b.length);
+                dealloc(p, b.length);
+                if (sum !== 0) free_result(sum);
+            }
+            function callBytes(fn, ...args) {
+                const boxPtr = fn(...args);
+                if (boxPtr === 0) return '';
+                const view = new Uint8Array(mem.buffer, boxPtr, 8);
+                const dataPtr = view[0] | (view[1] << 8) | (view[2] << 16) | (view[3] << 24);
+                const dataLen = view[4] | (view[5] << 8) | (view[6] << 16) | (view[7] << 24);
+                free_result(boxPtr);
+                const copy = new Uint8Array(new Uint8Array(mem.buffer, dataPtr, dataLen));
+                free_memory(dataPtr, dataLen);
+                return new TextDecoder().decode(copy);
+            }
+            feedStr('\x1b[?1000h\x1b[?1002h\x1b[?1006h');
+            const mouseOn = mouse_tracking() === 1;
+            const mouse = {
+                press: callBytes(mouse_event, 0, 0, 5, 3, 0),
+                release: callBytes(mouse_event, 1, 0, 5, 3, 0),
+                drag: callBytes(mouse_event, 2, 0, 6, 3, 0),
+                hover: callBytes(mouse_event, 2, 3, 6, 3, 0),
+                wheel: callBytes(mouse_event, 3, 0, 5, 3, 0),
+                ctrl: callBytes(mouse_event, 0, 0, 5, 3, 4),
+            };
+            feedStr('\x1b[?1000l\x1b[?1002l\x1b[?1006l');
+            const mouseOff = mouse_tracking() === 0 && callBytes(mouse_event, 0, 0, 5, 3, 0) === '';
+            feedStr('\x1b[?1h');
+            const appCursorOn = application_cursor() === 1;
+            feedStr('\x1b[?1l');
+            const appCursorOff = application_cursor() === 0;
+            const mouseOk = mouseOn && mouseOff && appCursorOn && appCursorOff
+                && mouse.press === '\x1b[<0;5;3M'
+                && mouse.release === '\x1b[<0;5;3m'
+                && mouse.drag === '\x1b[<32;6;3M'
+                && mouse.hover === ''
+                && mouse.wheel === '\x1b[<64;5;3M'
+                && mouse.ctrl === '\x1b[<16;5;3M';
+
             const res = {
                 metrics: { cell_width: cw, cell_height: ch, xoff, yoff, grid_rows: rows },
                 colors: { bright_blue_pixels: brightBlue, dark_blue_pixels: darkBlue },
@@ -383,6 +432,11 @@
                 punctuation: { cells_with_ink: punctInk.filter(n => n > 0).length },
                 ondemand: { cells_with_ink: cjkInk.filter(n => n > 0).length },
                 animate: { frame_deltas: frameDeltas, frame_ink: [f1Ink, f2Ink] },
+                mouse: {
+                    tracking_on: mouseOn, tracking_off: mouseOff,
+                    app_cursor_on: appCursorOn, app_cursor_off: appCursorOff,
+                    ...mouse,
+                },
                 version: (() => {
                     const v = callBoxedExport(version);
                     if (!v) return '';
@@ -407,6 +461,7 @@
                 && punctOk
                 && cjkOk
                 && animateOk
+                && mouseOk
                 && dash.dimCols.length === 0
                 && pipe.dimRows.length === 0
                 && blk.dimRows.length === 0 && blk.dimCols.length === 0;

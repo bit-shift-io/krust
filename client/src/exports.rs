@@ -593,6 +593,86 @@ pub extern "C" fn is_alt_screen() -> i32 {
     })
 }
 
+/// Whether the application has an xterm mouse-reporting protocol active
+/// (DECSET 9 / 1000 / 1002 / 1003). 1 = the pointer belongs to the app, so
+/// the page must forward events instead of doing its own selection.
+///
+/// The state lives on the vt100 screen that just parsed the app's output, so
+/// this is always current — the page asks on every mouse decision rather
+/// than caching, and gets 0 before `init` and after a reset.
+#[no_mangle]
+pub extern "C" fn mouse_tracking() -> i32 {
+    TERM_STATE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|s| {
+                i32::from(
+                    s.parser_screen().mouse_protocol_mode()
+                        != vt100::MouseProtocolMode::None,
+                )
+            })
+            .unwrap_or(0)
+    })
+}
+
+/// Encode one mouse event for the active protocol/encoding and return the
+/// report bytes as a (ptr, len) pair (caller must free).
+///
+/// Arguments: `kind` (`KIND_*`), `button` (0/1/2 = left/middle/right, 3 =
+/// no button for motion, wheel direction for wheel), `col`/`row` (1-based
+/// cell), `mods` (`MOD_*` bits).
+///
+/// Returns a null pair when the active protocol does not want the event —
+/// the page treats that as "this event is mine" and falls back to its own
+/// selection/scrolling behaviour, except for motion while a protocol is
+/// active, which it swallows like xterm does.
+#[no_mangle]
+pub extern "C" fn mouse_event(kind: i32, button: i32, col: i32, row: i32, mods: i32) -> *mut u8 {
+    TERM_STATE.with(|cell| {
+        let guard = cell.borrow();
+        let state = guard.as_ref();
+        let report = state.and_then(|s| {
+            let screen = s.parser_screen();
+            let (rows, cols) = screen.size();
+            crate::mouse::MouseKind::from_raw(kind).and_then(|kind| {
+                crate::mouse::mouse_report(
+                    screen.mouse_protocol_mode(),
+                    screen.mouse_protocol_encoding(),
+                    kind,
+                    button,
+                    col,
+                    row,
+                    i32::from(rows),
+                    i32::from(cols),
+                    mods,
+                )
+            })
+        });
+        match report {
+            Some(bytes) => {
+                let (ptr, len) = write_bytes_to_wasm(bytes);
+                return_pair(ptr, len)
+            }
+            None => return_null_pair(),
+        }
+    })
+}
+
+/// Whether DECCKM application cursor keys mode is on (1/0).
+///
+/// The page uses this to pick `ESC O A` vs `ESC [ A` when it converts wheel
+/// events into arrow keys (what xterm does when there is no scrollback for
+/// the wheel to scroll).
+#[no_mangle]
+pub extern "C" fn application_cursor() -> i32 {
+    TERM_STATE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|s| i32::from(s.parser_screen().application_cursor()))
+            .unwrap_or(0)
+    })
+}
+
 /// Map a browser keyboard event to raw PTY bytes.
 ///
 /// Returns bytes as (ptr, len) pair (caller must free).

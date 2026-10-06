@@ -33,6 +33,7 @@
                 key_to_bytes, set_selection, selected_text, clear_selection,
                 scroll, scroll_to, scroll_to_bottom, scroll_to_top,
                 scroll_offset, scrollback_len, is_alt_screen, grid_metrics, version,
+                mouse_event, mouse_tracking, application_cursor,
                 free_memory, free_string, free_result, alloc, dealloc } = wasm.instance.exports;
 
         // WASM memory. Views are constructed fresh from mem.buffer on every
@@ -262,6 +263,12 @@
         let selAnchor = null;
         let selDragging = false;
         let selMoved = false;
+        // Pointer-capture state for mouse reporting. Declared with the other
+        // shared state, not down with the mouse handlers: `handleIncoming`
+        // runs during the post-init queue flush, which is earlier in source
+        // order than the handlers, and its Reset branch touches these.
+        let mousePhase = 'idle'; // 'capture' | 'select' | 'idle'
+        let lastMotion = null;   // motion debounce: one report per cell/button/mods
         let curScroll = 0;
         let scrollbarVisible = false;
         let bytesIn = 0;
@@ -523,6 +530,11 @@
                 // position, so no contiguous tail exists to bring the grid up
                 // to date. Drop the parser state; the retained log that
                 // follows starts on an ESC boundary and rebuilds the screen.
+                // A reset also wipes the app's private modes, so any pointer
+                // capture ends here rather than waiting for a mouseup that
+                // may never come (the parser was rebuilt underneath us).
+                mousePhase = 'idle';
+                lastMotion = null;
                 if (wasmReady) {
                     try { reset_terminal(); } catch (_) {}
                     scheduleRender();
@@ -716,50 +728,115 @@
             sendPaste(text);
         });
 
-        let mouseTracking = false;
+        // --- Mouse reporting --------------------------------------------------
+        // Whether the pointer belongs to the application is decided by the
+        // xterm mouse modes the app enabled (9 / 1000 / 1002 / 1003) — state
+        // that lives on the vt100 screen inside the wasm module and is
+        // updated as the app's output is parsed. The page keeps no copy: it
+        // asks `mouse_tracking()` on every decision and asks `mouse_event()`
+        // for the report bytes of every event, falling back to its own
+        // selection/scrolling behaviour when no bytes come back. That split
+        // mirrors xterm, which disables its selection service outright while
+        // a protocol is active and offers Shift as the way back to native
+        // selection.
+        const MOUSE_PRESS = 0, MOUSE_RELEASE = 1, MOUSE_MOTION = 2, MOUSE_WHEEL = 3;
+        const MOD_SHIFT = 1, MOD_ALT = 2, MOD_CTRL = 4;
+        // mousePhase ('capture' = the app owns the pointer, 'select' = a
+        // native selection drag, 'idle' = nothing in progress) and
+        // lastMotion live with the shared selection state above.
 
-        function startMouseTracking() {
-            mouseTracking = true;
+        function mouseMods(e) {
+            return (e.shiftKey ? MOD_SHIFT : 0) | (e.altKey ? MOD_ALT : 0) | (e.ctrlKey ? MOD_CTRL : 0);
         }
 
-        function stopMouseTracking() {
-            mouseTracking = false;
+        // Held button from `e.buttons` (xterm derives the drag button the
+        // same way): 0/1/2 = left/middle/right, 3 = none.
+        function heldButton(e) {
+            const b = e.buttons || 0;
+            if (b & 1) return 0;
+            if (b & 4) return 1;
+            if (b & 2) return 2;
+            return 3;
         }
 
-        function sendMouseProtocol(button, x, y, isRelease) {
-            if (!mouseTracking) return;
-            const report = isRelease
-                ? `\x1b[${button}m`
-                : `\x1b[${button};${x};${y}M`;
-            if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode(report));
+        // Send one event to the app. Returns true when a report went out.
+        function sendMouseEvent(kind, button, cell, e) {
+            const bytes = callBytesExport(mouse_event, kind, button, cell.col + 1, cell.row + 1, mouseMods(e));
+            if (bytes.length === 0) return false;
+            // A press/release/wheel at a cell invalidates the motion
+            // debounce: the next move there carries new information.
+            if (kind !== MOUSE_MOTION) lastMotion = null;
+            if (ws && ws.readyState === 1) ws.send(bytes);
+            return true;
+        }
+
+        function sendMouseMotion(cell, e, button) {
+            const mods = mouseMods(e);
+            if (lastMotion && lastMotion.col === cell.col && lastMotion.row === cell.row &&
+                lastMotion.button === button && lastMotion.mods === mods) return;
+            lastMotion = { col: cell.col, row: cell.row, button, mods };
+            sendMouseEvent(MOUSE_MOTION, button, cell, e);
+        }
+
+        // xterm: Shift held on press bypasses mouse reporting and selects
+        // natively instead (its mac option only affects macOS and defaults
+        // to off, so Shift is the whole story).
+        function forceNativeSelection(e) {
+            return e.shiftKey;
         }
 
         window.addEventListener('mousedown', (e) => {
+            if (e.button > 2) return; // back/forward buttons: not reported, no selection
+            if (scrollbarEl.contains(e.target)) return; // the scrollbar owns its own drag
+            const cell = cellFromPoint(e.clientX, e.clientY);
+            if (mouse_tracking() === 1 && !forceNativeSelection(e)) {
+                e.preventDefault();
+                mousePhase = 'capture';
+                clear_selection(); // a click in the app dismisses any old highlight
+                sendMouseEvent(MOUSE_PRESS, e.button, cell, e);
+                return;
+            }
             if (e.button !== 0) return;
+            mousePhase = 'select';
             selDragging = true;
             selMoved = false;
-            selAnchor = cellFromPoint(e.clientX, e.clientY);
-            startMouseTracking();
-            const cur = cellFromPoint(e.clientX, e.clientY);
-            sendMouseProtocol(1, cur.col + 1, cur.row + 1, false);
+            selAnchor = cell;
         });
 
         window.addEventListener('mousemove', (e) => {
-            if (!selDragging || !selAnchor) return;
-            const cur = cellFromPoint(e.clientX, e.clientY);
-            if (cur.row !== selAnchor.row || cur.col !== selAnchor.col) selMoved = true;
-            if (selMoved) { set_selection(selAnchor.row, selAnchor.col, cur.row, cur.col); repaint(); }
+            const cell = cellFromPoint(e.clientX, e.clientY);
+            if (mousePhase === 'capture') {
+                // Report motion only while a button is actually held; the
+                // protocol filter in wasm drops it if the app did not ask
+                // for drag/hover reports.
+                if (e.buttons) sendMouseMotion(cell, e, heldButton(e));
+                return;
+            }
+            if (mousePhase === 'select') {
+                if (!selAnchor) return;
+                if (cell.row !== selAnchor.row || cell.col !== selAnchor.col) selMoved = true;
+                if (selMoved) { set_selection(selAnchor.row, selAnchor.col, cell.row, cell.col); repaint(); }
+                return;
+            }
+            // Hover: reported only when the app enabled any-motion tracking
+            // (1003); the wasm side drops it under every other protocol.
+            if (mouse_tracking() === 1) sendMouseMotion(cell, e, 3);
         });
 
         window.addEventListener('mouseup', (e) => {
+            if (mousePhase === 'capture') {
+                sendMouseEvent(MOUSE_RELEASE, e.button, cellFromPoint(e.clientX, e.clientY), e);
+                // Keep capturing while other buttons are still held down.
+                if (!e.buttons) mousePhase = 'idle';
+                return;
+            }
             if (e.button !== 0 || !selDragging) return;
             selDragging = false;
+            mousePhase = 'idle';
             if (!selMoved) {
                 clear_selection();
-                repaint(); // move cursor to clicked position
+                repaint();
                 handle_click(e.clientX, e.clientY);
-                sendMouseProtocol(e.button, e.clientX, e.clientY, true);
-                stopMouseTracking();
                 selAnchor = null;
                 return;
             }
@@ -774,9 +851,18 @@
             }
         });
 
+        // A right-click is reported to the app while a protocol is active, so
+        // keep the browser's context menu out of the way. Without a protocol
+        // the menu is harmless and stays.
+        window.addEventListener('contextmenu', (e) => {
+            if (mouse_tracking() === 1) e.preventDefault();
+        });
+
         window.addEventListener('auxclick', (e) => {
             if (e.button !== 1) return;
             e.preventDefault();
+            // Middle press/release already went to the app as mouse reports.
+            if (mouse_tracking() === 1) return;
             navigator.clipboard.readText().then((t) => {
                 if (t) sendPaste(t);
             }).catch(() => {});
@@ -846,15 +932,30 @@
             const reports = Math.trunc(wheelAccDetents);
             if (reports === 0) return;
             wheelAccDetents -= reports;
-            if (!ws || ws.readyState !== 1) return;
-            ws.send(new TextEncoder().encode('\x1b[?1000h'));
-            const rect = canvas.getBoundingClientRect();
-            const x = Math.max(1, Math.min(gridCols, Math.floor((e.clientX - rect.left - gridX) / cellW) + 1));
-            const y = Math.max(1, Math.min(gridRows, Math.floor((e.clientY - rect.top - gridY) / cellH) + 1));
-            const button = reports < 0 ? 64 : 65;
-            for (let i = 0; i < Math.abs(reports); i++) {
-                const seq = '\x1b[<' + button + ';' + x + ';' + y + 'M';
-                ws.send(new TextEncoder().encode(seq));
+            if (!wasmReady) return;
+            if (mouse_tracking() === 1) {
+                // The app asked for the pointer: one button-64/65 report per
+                // detent, at the cell under the pointer. The wasm side drops
+                // wheel reports under protocols that do not want them (X10).
+                const cell = cellFromPoint(e.clientX, e.clientY);
+                const dir = reports < 0 ? 0 : 1; // 0 = up, 1 = down
+                for (let i = 0; i < Math.abs(reports); i++) {
+                    sendMouseEvent(MOUSE_WHEEL, dir, cell, e);
+                }
+                return;
+            }
+            if (scrollback_len() > 0) {
+                // No protocol: scroll our own scrollback, the way xterm
+                // scrolls its viewport. Positive delta = back in history.
+                doScroll(-reports * WHEEL_LINES_PER_REPORT);
+                return;
+            }
+            // Nothing to scroll locally (a full-screen app that did not opt
+            // into mouse reporting): turn the wheel into arrow keys, exactly
+            // as xterm does — DECCKM picks the application-cursor form.
+            const arrow = (application_cursor() === 1 ? '\x1bO' : '\x1b[') + (reports < 0 ? 'A' : 'B');
+            if (ws && ws.readyState === 1) {
+                ws.send(new TextEncoder().encode(arrow.repeat(Math.abs(reports))));
             }
         }, { passive: false });
 
