@@ -315,6 +315,53 @@ pub extern "C" fn repaint() {
     });
 }
 
+/// Advance the DECSCUSR blink phase. Returns `1` when the active style
+/// blinks (so the caller repaints), `0` when there is nothing to do.
+#[no_mangle]
+pub extern "C" fn blink_tick() -> i32 {
+    TERM_STATE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        match guard.as_mut() {
+            Some(state) => {
+                if state.toggle_blink_phase() {
+                    state.mark_all_dirty();
+                    1
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        }
+    })
+}
+
+/// Whether bytes are currently withheld by the `?2026` synchronized-output
+/// gate (an open frame or a split start marker). The page arms a stall
+/// timer while this returns `1` and calls `flush_sync` from it.
+#[no_mangle]
+pub extern "C" fn sync_pending() -> i32 {
+    TERM_STATE.with(|cell| {
+        let guard = cell.borrow();
+        match guard.as_ref() {
+            Some(state) if state.sync_pending() => 1,
+            _ => 0,
+        }
+    })
+}
+
+/// Force-feed whatever the sync gate holds, for use by the page's stall
+/// timer when a frame's `?2026l` end marker never arrived.
+#[no_mangle]
+pub extern "C" fn flush_sync() {
+    TERM_STATE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(state) = guard.as_mut() {
+            state.flush_sync();
+            state.schedule_render();
+        }
+    });
+}
+
 /// Whether the WebGL context is currently lost. `1` when a renderer exists
 /// and its context is gone, `0` otherwise.
 ///

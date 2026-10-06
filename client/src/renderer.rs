@@ -23,6 +23,7 @@
 //   cursor:   fg = original bg, bg = original fg (block cursor)
 
 use crate::color::{cell_visual, CellOverride};
+use crate::cursor::{strip_rect, CursorStyle};
 use crate::ffi::{self, JsHandle};
 use crate::graphics::graphic_cell_rects;
 use crate::measure::device_pitch;
@@ -950,6 +951,7 @@ impl WebGL2Renderer {
         default_bg: u32,
         selection: &[(u16, u16)],
         cursor: (u16, u16),
+        cursor_style: CursorStyle,
     ) -> Result<(), String> {
         let (prows, pcols) = screen.size();
         let rrows = if self.rows > 0 { self.rows } else { prows };
@@ -1011,6 +1013,7 @@ impl WebGL2Renderer {
             pcols,
             selection,
             cursor,
+            cursor_style,
             default_fg,
             default_bg,
             self.dpr,
@@ -1111,6 +1114,7 @@ impl WebGL2Renderer {
         pcols: u16,
         selection: &[(u16, u16)],
         cursor: (u16, u16),
+        cursor_style: CursorStyle,
         default_fg: u32,
         default_bg: u32,
         dpr: f64,
@@ -1142,7 +1146,10 @@ impl WebGL2Renderer {
                     .unwrap_or(' ');
 
                 // Shared cursor/selection color decision (same as Canvas 2D).
-                let override_ = if is_cursor {
+                // A block/reverse cursor swaps colors across the whole cell;
+                // underline/bar cursors keep the cell's own colors and add a
+                // strip on top instead.
+                let override_ = if is_cursor && cursor_style.is_block() {
                     CellOverride::Cursor
                 } else if is_selected {
                     CellOverride::Selected
@@ -1165,6 +1172,26 @@ impl WebGL2Renderer {
                     bg_r, bg_g, bg_b, // background
                     sel, cur,
                 ]);
+
+                // Underline/bar cursor: a second background quad for the
+                // strip, painted in the cell's own foreground color.
+                if is_cursor {
+                    if let Some((sx, sy, sw, sh)) = strip_rect(
+                        cursor_style.shape,
+                        px as f64,
+                        py as f64,
+                        cell_wf as f64,
+                        cell_hf as f64,
+                    ) {
+                        let (strip_rgb, _) =
+                            cell_visual(cell, default_fg, default_bg, CellOverride::Normal);
+                        let (sr, sg, sb) = rgb_to_floats(strip_rgb);
+                        bg.extend_from_slice(&[
+                            sx as f32, sy as f32, sw as f32, sh as f32, 0.0, 0.0, 0.0, 0.0, sr, sg,
+                            sb, sr, sg, sb, 0.0, cur,
+                        ]);
+                    }
+                }
 
                 // Text pass: glyph quad, or flat geometry for graphic cells
                 if let Some(rects) = graphic_cell_rects(
@@ -1478,5 +1505,91 @@ mod tests {
                 }
             }
         }
+    }
+    /// Underline/bar cursors keep the cursor cell's own colors and add a
+    /// strip quad (bottom bar / left edge) in the cell's foreground color;
+    /// block cursors keep the single swapped cell and add nothing.
+    #[test]
+    fn build_instances_cursor_styles() {
+        let atlas = scratch_atlas();
+        let mut p = vt100::Parser::new(1, 2, 0);
+        p.process(b"AB");
+        let (prows, pcols) = p.screen().size();
+        let build = |style: CursorStyle| {
+            WebGL2Renderer::build_instances(
+                1,
+                2,
+                8,
+                18,
+                0,
+                0,
+                &atlas,
+                p.screen(),
+                prows,
+                pcols,
+                &[],
+                (0, 1),
+                style,
+                0xFF_FF_FF,
+                0x00_00_00,
+                1.0,
+            )
+        };
+
+        // Block: one bg quad per cell, cursor cell swapped, no extra quad.
+        let (bg, _) = build(CursorStyle::default());
+        assert_eq!(bg.len() / INSTANCE_FLOATS, 2);
+        let cursor_cell = &bg[INSTANCE_FLOATS..2 * INSTANCE_FLOATS];
+        assert_eq!(cursor_cell[15], 1.0, "cursor cell must carry a_cur=1");
+        // Cursor swap: cell background (floats 11..14) becomes the default fg.
+        let (fr, fg, fb) = rgb_to_floats(0xFF_FF_FF);
+        assert_eq!(&cursor_cell[11..14], &[fr, fg, fb]);
+
+        // Underline (DECSCUSR 4): same two cell quads — unswapped — plus a
+        // strip quad at the bottom of the cursor cell: x=8, w=8,
+        // h=18/8=2.25, y=18-2.25=15.75, painted in the cell's fg color.
+        let (bg, _) = build(CursorStyle::from_decscusr(4));
+        assert_eq!(bg.len() / INSTANCE_FLOATS, 3, "cells + strip");
+        let cursor_cell = &bg[INSTANCE_FLOATS..2 * INSTANCE_FLOATS];
+        assert_eq!(cursor_cell[15], 1.0);
+        let br = rgb_to_floats(0x00_00_00);
+        assert_eq!(&cursor_cell[11..14], &[br.0, br.1, br.2], "no swap");
+        let strip = &bg[2 * INSTANCE_FLOATS..3 * INSTANCE_FLOATS];
+        assert_eq!(
+            &strip[0..4],
+            &[8.0, 15.75, 8.0, 2.25],
+            "strip geometry (offset x,y + size w,h)"
+        );
+        assert_eq!(&strip[8..11], &[fr, fg, fb], "strip painted in cell fg");
+        assert_eq!(strip[15], 1.0);
+
+        // Bar (DECSCUSR 5): strip hugs the left edge of the cursor cell.
+        let (bg, _) = build(CursorStyle::from_decscusr(5));
+        assert_eq!(bg.len() / INSTANCE_FLOATS, 3);
+        let strip = &bg[2 * INSTANCE_FLOATS..3 * INSTANCE_FLOATS];
+        assert_eq!(&strip[0..4], &[8.0, 0.0, 1.0, 18.0]);
+
+        // Hidden cursor (the (u16::MAX, u16::MAX) sentinel): no a_cur=1
+        // anywhere, so no cell is swapped or given a strip.
+        let (bg, _) = WebGL2Renderer::build_instances(
+            1,
+            2,
+            8,
+            18,
+            0,
+            0,
+            &atlas,
+            p.screen(),
+            prows,
+            pcols,
+            &[],
+            (u16::MAX, u16::MAX),
+            CursorStyle::default(),
+            0xFF_FF_FF,
+            0x00_00_00,
+            1.0,
+        );
+        assert_eq!(bg.len() / INSTANCE_FLOATS, 2);
+        assert!(bg.chunks(INSTANCE_FLOATS).all(|i| i[15] == 0.0));
     }
 }

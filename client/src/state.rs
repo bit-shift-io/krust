@@ -4,10 +4,12 @@
 // fallback), cell dimensions, and selection state. Exposes the methods the
 // WASM exports mutate it through.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use vt100::Parser;
 
 use crate::color::{cell_visual, color_to_rgb, CellOverride, DEFAULT_BG, DEFAULT_FG};
+use crate::cursor::{apply_decscusr, strip_rect, CursorStyle, SyncGate};
 use crate::ffi::{self, JsHandle};
 use crate::graphics::draw_graphic_cell;
 use crate::measure::{
@@ -207,6 +209,17 @@ pub(crate) struct TerminalState {
     /// Incomplete tail of an ESC sequence from the previous `process_bytes`
     /// call that may yet form a `CSI s`/`CSI u` cursor save/restore.
     csi_su_carry: Vec<u8>,
+    /// Incomplete tail of a DECSCUSR (`CSI Ps SP q`) sequence from the
+    /// previous `process_bytes` call.
+    dscsr_carry: Vec<u8>,
+    /// Cursor shape/blink requested by the application via DECSCUSR.
+    cursor_style: CursorStyle,
+    /// Current blink phase for a blinking [`Self::cursor_style`] (toggled by
+    /// the page's `blink_tick` interval).
+    blink_on: bool,
+    /// Withholds the body of a `?2026`-synchronized frame until it is
+    /// complete, so a repaint never lands mid-frame.
+    sync: SyncGate,
 }
 
 /// Renderer selection override, set from JS before `init()` via
@@ -322,6 +335,10 @@ impl TerminalState {
             prev_cursor: None,
             needs_render: false,
             csi_su_carry: Vec::new(),
+            dscsr_carry: Vec::new(),
+            cursor_style: CursorStyle::default(),
+            blink_on: true,
+            sync: SyncGate::new(),
         };
         if canvas_w > 0.0 && canvas_h > 0.0 {
             state.refit(
@@ -335,8 +352,6 @@ impl TerminalState {
 
     /// Process incoming ANSI bytes through the VT100 parser
     pub(crate) fn process_bytes(&mut self, bytes: &[u8]) {
-        let screen_before = self.parser.screen().alternate_screen();
-
         // Clamp the current scroll offset to the (possibly shrunken) history
         // before new bytes arrive, so we always stay within valid range.
         self.clamp_scroll();
@@ -346,7 +361,21 @@ impl TerminalState {
             self.prev_screen = Some(self.parser.screen().clone());
         }
         let normalized = normalize_save_restore(bytes, &mut self.csi_su_carry);
-        self.parser.process(&normalized);
+        let gated = self.sync.push(&normalized);
+        self.feed_parser(gated);
+    }
+
+    /// Feed sync-gated bytes through the DECSCUSR scan into the parser,
+    /// keeping the alternate-screen bookkeeping and dirty-cell diff around
+    /// the transition. Split out so `flush_sync` goes through exactly the
+    /// same path.
+    fn feed_parser(&mut self, gated: Cow<[u8]>) {
+        let screen_before = self.parser.screen().alternate_screen();
+
+        let feed = apply_decscusr(&gated, &mut self.dscsr_carry, &mut self.cursor_style);
+        if !feed.is_empty() {
+            self.parser.process(&feed);
+        }
 
         let screen_after = self.parser.screen().alternate_screen();
 
@@ -363,6 +392,37 @@ impl TerminalState {
         }
 
         self.compute_dirty_cells();
+    }
+
+    /// Whether the sync gate is withholding bytes (an open `?2026` frame or
+    /// a partial start marker). The page arms a stall timer while this is 1.
+    pub(crate) fn sync_pending(&self) -> bool {
+        self.sync.pending()
+    }
+
+    /// Force-feed whatever the sync gate holds. Called by the page's stall
+    /// timer when a frame's end marker never arrived; feeding the whole
+    /// buffer in one go is still atomic, so the worst case is an
+    /// incomplete frame appearing at once rather than a frozen screen.
+    pub(crate) fn flush_sync(&mut self) {
+        if !self.sync.pending() {
+            return;
+        }
+        let gated = self.sync.flush();
+        if !gated.is_empty() {
+            self.feed_parser(Cow::Owned(gated));
+        }
+    }
+
+    /// Advance the blink phase. Returns true when the active style blinks
+    /// (so the caller knows a repaint was actually needed).
+    pub(crate) fn toggle_blink_phase(&mut self) -> bool {
+        if self.cursor_style.blink {
+            self.blink_on = !self.blink_on;
+            true
+        } else {
+            false
+        }
     }
 
     /// Mark every cell dirty so the next render is a full redraw.
@@ -555,16 +615,17 @@ impl TerminalState {
             // WebGL borrow, which may bake new glyphs into the atlas.
             let scroll_offset = self.active_scroll_offset();
             let selection = self.selection_cells();
-            let (cr, cc) = self.parser.screen().cursor_position();
-            // Hide the block cursor when scrolled into history.
-            let cursor = if scroll_offset == 0 {
-                (cr, cc)
-            } else {
-                (u16::MAX, u16::MAX)
-            };
+            let style = self.cursor_style;
             let screen = self.parser.screen();
+            // Sentinel when the cursor must not be drawn: scrolled into
+            // history, DECTCEM-hidden (TUIs hide it around every repaint),
+            // or in the off phase of a blinking style.
+            let cursor = match cursor_draw_pos(screen, scroll_offset, self.rows, self.cols) {
+                Some(pos) if style.blink_visible(self.blink_on) => pos,
+                _ => (u16::MAX, u16::MAX),
+            };
             if let Some(w) = self.webgl.as_mut() {
-                return w.render(screen, DEFAULT_FG, DEFAULT_BG, &selection, cursor);
+                return w.render(screen, DEFAULT_FG, DEFAULT_BG, &selection, cursor, style);
             }
         }
         self.render_canvas2d()
@@ -710,18 +771,14 @@ impl TerminalState {
         Ok(())
     }
 
-    /// The cursor cell to render, or `None` when scrolled into history.
+    /// The cursor cell to render, or `None` when it must not be drawn.
     fn visible_cursor(&self, screen: &vt100::Screen, rows: u16, cols: u16) -> Option<(u16, u16)> {
-        let active_offset = self.scroll.offset(screen.alternate_screen());
-        if active_offset != 0 {
-            return None;
-        }
-        let (cr, cc) = screen.cursor_position();
-        if cr < rows && cc < cols {
-            Some((cr, cc))
-        } else {
-            None
-        }
+        cursor_draw_pos(
+            screen,
+            self.scroll.offset(screen.alternate_screen()),
+            rows,
+            cols,
+        )
     }
 
     /// Schedule a render call for the next `requestAnimationFrame` callback.
@@ -731,7 +788,7 @@ impl TerminalState {
         self.needs_render = true;
     }
 
-    /// Draw the block cursor (swapped fg/bg + glyph) on top of a cell.
+    /// Draw the cursor on top of a cell in the active [`CursorStyle`].
     /// `cursor` is the cell to draw, or `None` to skip cursor drawing.
     /// `ox`/`oy` are the grid origin in CSS pixels.
     #[allow(clippy::too_many_arguments)]
@@ -747,10 +804,25 @@ impl TerminalState {
         let Some((cr, cc)) = cursor else {
             return Ok(None);
         };
+        let style = self.cursor_style;
+        // Blink phase off: the cell still tracks (so it is repainted when
+        // the phase flips) but nothing goes on top of it.
+        if !style.blink_visible(self.blink_on) {
+            return Ok(Some((cr, cc)));
+        }
         let screen = self.parser.screen();
         let cell = screen.cell(cr, cc);
         let (x, y) = (ox + cc as f64 * cw, oy + cr as f64 * ch);
-        // Shared cursor decision: swap original fg/bg (block cursor).
+        if let Some((sx, sy, sw, sh)) = strip_rect(style.shape, x, y, cw, ch) {
+            // Underline/bar: the cell itself was already painted normally
+            // (it is always in the dirty set), so only the strip goes on
+            // top, in the cell's own foreground color.
+            let (fg, _bg) = cell_visual(cell, DEFAULT_FG, DEFAULT_BG, CellOverride::Normal);
+            ffi::ctx_set_fill_style(ctx, &css_color(fg));
+            ffi::ctx_fill_rect(ctx, sx, sy, sw, sh);
+            return Ok(Some((cr, cc)));
+        }
+        // Block: swap original fg/bg + glyph.
         let (fg, bg) = cell_visual(cell, DEFAULT_FG, DEFAULT_BG, CellOverride::Cursor);
         ffi::ctx_set_fill_style(ctx, &css_color(bg));
         ffi::ctx_fill_rect(ctx, x, y, cw, ch);
@@ -1067,6 +1139,10 @@ impl TerminalState {
         self.prev_screen = None;
         self.prev_cursor = None;
         self.csi_su_carry.clear();
+        self.dscsr_carry.clear();
+        self.cursor_style = CursorStyle::default();
+        self.blink_on = true;
+        self.sync.reset();
         self.mark_all_dirty();
     }
 
@@ -1087,10 +1163,74 @@ impl TerminalState {
     }
 }
 
+/// The cursor cell to render, or `None` when the cursor must not be drawn:
+/// scrolled into history, positioned outside the visible grid, or hidden by
+/// the application's DECTCEM (`CSI ? 25 l`).
+///
+/// TUIs (opencode included) emit `?25l` …repaint… `?25h` around *every*
+/// frame, and a frame often spans several `process_bytes` calls — so a
+/// renderer that ignores the mode paints the block cursor at the end of each
+/// half-painted frame, marching down the screen as chunks arrive.
+pub(crate) fn cursor_draw_pos(
+    screen: &vt100::Screen,
+    scroll_offset: usize,
+    rows: u16,
+    cols: u16,
+) -> Option<(u16, u16)> {
+    if scroll_offset != 0 || screen.hide_cursor() {
+        return None;
+    }
+    let (cr, cc) = screen.cursor_position();
+    if cr < rows && cc < cols {
+        Some((cr, cc))
+    } else {
+        None
+    }
+}
+
 thread_local! {
     /// Global terminal state, initialized once by [`crate::init`]
     pub(crate) static TERM_STATE: RefCell<Option<TerminalState>> =
         const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+mod cursor_pos_tests {
+    use super::cursor_draw_pos;
+    use vt100::Parser;
+
+    #[test]
+    fn cursor_visible_by_default() {
+        let p = Parser::new(6, 80, 0);
+        assert_eq!(cursor_draw_pos(p.screen(), 0, 6, 80), Some((0, 0)));
+    }
+
+    #[test]
+    fn dectcem_hide_wins_over_screen_position() {
+        let mut p = Parser::new(6, 80, 0);
+        p.process(b"\x1b[?25l");
+        assert_eq!(cursor_draw_pos(p.screen(), 0, 6, 80), None);
+        p.process(b"\x1b[?25h");
+        assert_eq!(cursor_draw_pos(p.screen(), 0, 6, 80), Some((0, 0)));
+    }
+
+    /// The flicker regression: a TUI frame arrives chunk by chunk, and every
+    /// chunk up to the closing `?25h` renders with the cursor hidden — not
+    /// parked at the end of the half-painted diff.
+    #[test]
+    fn mid_frame_render_stays_hidden_until_show() {
+        let mut p = Parser::new(6, 80, 0);
+        p.process(b"\x1b[?25l\x1b[3;5Hpartial");
+        assert_eq!(cursor_draw_pos(p.screen(), 0, 6, 80), None);
+        p.process(b"\x1b[6;1Hdone\x1b[?25h");
+        assert_eq!(cursor_draw_pos(p.screen(), 0, 6, 80), Some((5, 4)));
+    }
+
+    #[test]
+    fn scrolled_into_history_hides_cursor() {
+        let p = Parser::new(6, 80, 0);
+        assert_eq!(cursor_draw_pos(p.screen(), 1, 6, 80), None);
+    }
 }
 
 #[cfg(test)]

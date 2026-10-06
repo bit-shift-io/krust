@@ -109,6 +109,19 @@ Krust is a Rust terminal emulator with a two-crate workspace:
   retained log lands on top of the old screen. Keep `handleIncoming` and
   `handleWsData` at the shared init scope, not nested in the socket closure:
   the `wsQueue` flush needs them before the socket exists.
+- **Cursor visibility, styles, and synchronized output.** Both renderers take
+  the cursor through `cursor_draw_pos` (`state.rs`), which returns `None`
+  while DECTCEM (`CSI ? 25 l`) hides it — TUIs bracket every frame with
+  `?25l`/`?25h`, so ignoring the mode paints the cursor wherever a chunk-split
+  frame stopped (the marching-block flicker). DECSCUSR (`CSI Ps SP q`) is not
+  modeled by `vt100`; `apply_decscusr` (`cursor.rs`) scans it out of the stream
+  (partial-sequence carry included) into a `CursorStyle`, rendered as a
+  full-cell swap (block) or a `strip_rect` strip in the cell's own fg color
+  (underline/bar), with the blink phase toggled by `blink_tick()`. `?2026`
+  synchronized frames are withheld by `SyncGate` so a render never lands
+  mid-frame; the page arms a 300 ms stall timer whenever `sync_pending()`
+  returns 1 and calls `flush_sync()` from it. Keep that backstop — a lost end
+  marker otherwise freezes the screen.
 - **Scrollbar:** shown only when there is real scrollback and the parser is not
   on the alternate screen (`scrollable = max > 0 && !is_alt_screen()`), and it
   is display-gated with `pointer-events: none` so it never eats clicks. Note
@@ -209,6 +222,9 @@ the `krust` FFI registry.
 | `query_replies(bytes_ptr, bytes_len)` | Detect DA1/DA2/CPR/OSC-11 queries, return reply bytes (boxed pair) |
 | `rebuild_webgl()` | Recreate WebGL2 renderer after `webglcontextrestored` (i32 result) |
 | `repaint()` | Force redraw from current parser state |
+| `blink_tick()` | Advance the DECSCUSR blink phase; `1` when it flipped (i32) |
+| `sync_pending()` | `1` while the `?2026` sync gate withholds bytes (i32) |
+| `flush_sync()` | Force-feed the gate's held bytes (stall-timer backstop) |
 | `handle_resize(w, h)` | Update canvas dimensions, notify server |
 | `key_to_bytes(key_ptr, key_len, ctrl, alt, shift, meta)` | Map keyboard event to PTY bytes (boxed pair) |
 | `set_selection(start_row, start_col, end_row, end_col)` | Set selection range |

@@ -29,6 +29,7 @@
         );
         window.KRUST_RUNTIME.install(wasm.instance.exports.memory);
         const { init, set_renderer_mode, rebuild_webgl, process_bytes, query_replies, handle_resize, repaint,
+                blink_tick, sync_pending, flush_sync,
                 webgl_context_lost, reset_terminal,
                 key_to_bytes, set_selection, selected_text, clear_selection,
                 scroll, scroll_to, scroll_to_bottom, scroll_to_top,
@@ -98,6 +99,8 @@
 
         // Render loop for frame coalescing
         let renderScheduled = false;
+        // Stall timer for ?2026 synchronized output (see handleWsData).
+        let syncFlushTimer = null;
         function scheduleRender() {
             // Browsers suspend requestAnimationFrame for hidden tabs, so a
             // frame scheduled while hidden paints long after the fact, for
@@ -237,7 +240,9 @@
         }
         setInterval(() => {
             if (!document.hidden) {
-                try { repaint(); } catch (_) {}
+                // Flip the DECSCUSR blink phase (no-op unless the app chose
+                // a blinking cursor style), then repaint the frame.
+                try { blink_tick(); repaint(); } catch (_) {}
             }
         }, 500);
 
@@ -574,6 +579,25 @@
                 dealloc(inPtr, inData.length);
                 if (summaryPtr !== 0) free_result(summaryPtr);
                 scheduleRender();
+                // ?2026 synchronized output: wasm holds a frame's bytes
+                // until its end marker arrives so a render never lands
+                // mid-frame. If that end marker never comes (torn frame,
+                // dropped chunks), force-feed after 300 ms instead of
+                // freezing the screen.
+                try {
+                    if (sync_pending()) {
+                        if (syncFlushTimer === null) {
+                            syncFlushTimer = setTimeout(() => {
+                                syncFlushTimer = null;
+                                try { flush_sync(); } catch (_) {}
+                                scheduleRender();
+                            }, 300);
+                        }
+                    } else if (syncFlushTimer !== null) {
+                        clearTimeout(syncFlushTimer);
+                        syncFlushTimer = null;
+                    }
+                } catch (_) {}
             }
             benchSample(performance.now() - t0);
             curScroll = scroll_offset();

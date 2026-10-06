@@ -13,6 +13,7 @@
 #![allow(missing_docs)]
 
 mod color;
+mod cursor;
 mod exports;
 mod ffi;
 mod graphics;
