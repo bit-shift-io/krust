@@ -63,6 +63,7 @@ extern "C" {
     fn krust_gl_create_buffer(gl: i32) -> i32;
     fn krust_gl_bind_buffer(gl: i32, target: u32, buf: i32);
     fn krust_gl_buffer_data_f32(gl: i32, target: u32, ptr: *const f32, count: usize, usage: u32);
+    fn krust_gl_buffer_sub_data_f32(gl: i32, target: u32, offset: usize, ptr: *const f32, count: usize);
     fn krust_gl_create_texture(gl: i32) -> i32;
     fn krust_gl_bind_texture(gl: i32, target: u32, tex: i32);
     fn krust_gl_tex_parameteri(gl: i32, target: u32, pname: u32, param: i32);
@@ -320,6 +321,15 @@ pub(crate) fn gl_bind_buffer(gl: JsHandle, target: u32, buf: JsHandle) {
 
 pub(crate) fn gl_buffer_data_f32(gl: JsHandle, target: u32, data: &[f32], usage: u32) {
     unsafe { krust_gl_buffer_data_f32(gl, target, data.as_ptr(), data.len(), usage) }
+}
+
+/// Replace the `data.len()` floats at `offset` (in floats) of the bound buffer.
+/// The buffer must already have been sized (via [`gl_buffer_data_f32`]) to at
+/// least `offset + data.len()` floats.
+pub(crate) fn gl_buffer_sub_data_f32(gl: JsHandle, target: u32, offset: usize, data: &[f32]) {
+    unsafe {
+        krust_gl_buffer_sub_data_f32(gl, target, offset, data.as_ptr(), data.len());
+    }
 }
 
 pub(crate) fn gl_create_texture(gl: JsHandle) -> JsHandle {

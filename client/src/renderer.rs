@@ -194,6 +194,9 @@ pub struct GlyphAtlas {
     pub glyph_width: u32,
     pub glyph_height: u32,
     pub uv_map: Vec<(f32, f32, f32, f32)>,
+    /// Direct UV lookup for ASCII (0..128), avoiding the range scan and hash
+    /// map on the hot path. Built once alongside `uv_map`.
+    ascii_uv: [Option<(f32, f32, f32, f32)>; 128],
     /// Device-pixel scale, kept so on-demand glyphs bake at the same size as
     /// the pre-baked static glyphs.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -216,6 +219,58 @@ fn is_static_cp(cp: u32) -> bool {
     ATLAS_RANGES
         .iter()
         .any(|r| cp >= r.start && cp < r.start + r.len)
+}
+
+/// Collect the on-grid codepoints that are not covered by the static atlas
+/// ranges and therefore need baking into the dynamic region.
+///
+/// Deduplicated with a set so the scan is O(cells), and returned in first-seen
+/// order so the atlas bakes them in a stable order across frames.
+fn collect_needed(
+    screen: &vt100::Screen,
+    rows: u32,
+    cols: u32,
+    prows: u16,
+    pcols: u16,
+) -> Vec<char> {
+    let mut seen = std::collections::HashSet::new();
+    let mut needed = Vec::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            if r < prows as u32 && c < pcols as u32 {
+                if let Some(cell) = screen.cell(r as u16, c as u16) {
+                    if let Some(ch) = cell.contents().chars().next() {
+                        if !is_static_cp(ch as u32) && seen.insert(ch) {
+                            needed.push(ch);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    needed
+}
+
+/// Minimal contiguous span of `cur` that differs from `prev`, for a partial
+/// `bufferSubData` upload. Returns `None` when the two are identical (nothing
+/// to upload) and the whole of `cur` when the lengths differ (instance layout
+/// shifted, so unchanged trailing entries may have moved). `cur` empty also
+/// yields `None`.
+fn changed_instance_range(prev: &[f32], cur: &[f32]) -> Option<std::ops::Range<usize>> {
+    if prev.len() != cur.len() {
+        return if cur.is_empty() { None } else { Some(0..cur.len()) };
+    }
+    let mut first: Option<usize> = None;
+    let mut last = 0usize;
+    for (i, (a, b)) in prev.iter().zip(cur).enumerate() {
+        if a.to_bits() != b.to_bits() {
+            if first.is_none() {
+                first = Some(i);
+            }
+            last = i + 1;
+        }
+    }
+    first.map(|f| f..last)
 }
 
 impl GlyphAtlas {
@@ -291,6 +346,16 @@ impl GlyphAtlas {
 
         let dynamic_base = static_rows * cols;
         let dynamic_capacity = (DYNAMIC_ROWS * cols) as usize;
+        let mut ascii_uv = [None; 128];
+        for cp in 0u32..128 {
+            if let Some(range) = ATLAS_RANGES
+                .iter()
+                .find(|r| cp >= r.start && cp < r.start + r.len)
+            {
+                let idx = (range.offset + (cp - range.start)) as usize;
+                ascii_uv[cp as usize] = uv_map.get(idx).copied();
+            }
+        }
         Ok(GlyphAtlas {
             texture,
             atlas_width: atlas_w,
@@ -298,6 +363,7 @@ impl GlyphAtlas {
             glyph_width: glyph_w,
             glyph_height: glyph_h,
             uv_map,
+            ascii_uv,
             dpr,
             dynamic_base,
             dynamic_slots: vec![None; dynamic_capacity],
@@ -527,6 +593,9 @@ impl GlyphAtlas {
 
     pub fn uv_for(&self, ch: char) -> Option<(f32, f32, f32, f32)> {
         let cp = ch as u32;
+        if cp < 128 {
+            return self.ascii_uv[cp as usize];
+        }
         for range in ATLAS_RANGES {
             if cp >= range.start && cp < range.start + range.len {
                 let idx = (range.offset + (cp - range.start)) as usize;
@@ -550,6 +619,7 @@ impl GlyphAtlas {
     /// the dynamic region are stamped as used.
     fn plan_missing(&mut self, needed: &[char]) -> Vec<char> {
         self.frame = self.frame.wrapping_add(1);
+        let mut seen = std::collections::HashSet::new();
         let mut to_bake: Vec<char> = Vec::new();
         for &ch in needed {
             if is_static_cp(ch as u32) {
@@ -559,7 +629,7 @@ impl GlyphAtlas {
                 self.dynamic_stamp[slot as usize] = self.frame;
                 continue;
             }
-            if !to_bake.contains(&ch) {
+            if seen.insert(ch) {
                 to_bake.push(ch);
             }
         }
@@ -766,11 +836,47 @@ pub struct GlyphBrush {
     pub resolution_loc: JsHandle,
     pub atlas_loc: JsHandle,
     pub mode_loc: JsHandle,
+    /// `glGetAttribLocation` results, resolved once when the program is built.
+    /// Attribute locations are fixed for the life of a linked program, so
+    /// re-querying all nine every frame is pure overhead.
+    pub attrs: AttrLocations,
+}
+
+/// Attribute locations for the brush's linked program.
+#[derive(Clone, Copy)]
+pub struct AttrLocations {
+    pub position: u32,
+    pub texcoord: u32,
+    pub offset: u32,
+    pub size: u32,
+    pub uv: u32,
+    pub fg: u32,
+    pub bg: u32,
+    pub sel: u32,
+    pub cur: u32,
+}
+
+impl AttrLocations {
+    fn resolve(gl: JsHandle, program: JsHandle) -> Self {
+        let get = |name: &str| ffi::gl_get_attrib_location(gl, program, name) as u32;
+        Self {
+            position: get("a_position"),
+            texcoord: get("a_texcoord"),
+            offset: get("a_offset"),
+            size: get("a_size"),
+            uv: get("a_uv"),
+            fg: get("a_fg"),
+            bg: get("a_bg"),
+            sel: get("a_sel"),
+            cur: get("a_cur"),
+        }
+    }
 }
 
 impl GlyphBrush {
     pub fn new(gl: JsHandle) -> Result<Self, String> {
         let program = Self::compile_program(gl)?;
+        let attrs = AttrLocations::resolve(gl, program);
 
         let pos_buffer = Self::new_buffer(gl, "pos_buffer")?;
         let uv_buffer = Self::new_buffer(gl, "uv_buffer")?;
@@ -799,6 +905,7 @@ impl GlyphBrush {
             resolution_loc,
             atlas_loc,
             mode_loc,
+            attrs,
         })
     }
 
@@ -879,6 +986,16 @@ pub struct WebGL2Renderer {
     pub origin_x: u32,
     pub origin_y: u32,
     pub dpr: f64,
+    /// Reused per-frame instance scratch buffers, cleared and refilled every
+    /// render. Keeping them on the renderer means the hot path stops
+    /// reallocating two `Vec<f32>` (and their high-water capacity) each frame.
+    bg_instances: Vec<f32>,
+    text_instances: Vec<f32>,
+    /// The instance data last uploaded to the GPU, one per pass. Compared
+    /// against the freshly built buffers so an unchanged grid uploads nothing
+    /// and a small change uploads only its span via `bufferSubData`.
+    prev_bg_uploaded: Vec<f32>,
+    prev_text_uploaded: Vec<f32>,
 }
 
 impl WebGL2Renderer {
@@ -923,6 +1040,10 @@ impl WebGL2Renderer {
             origin_x: 0,
             origin_y: 0,
             dpr,
+            bg_instances: Vec::new(),
+            text_instances: Vec::new(),
+            prev_bg_uploaded: Vec::new(),
+            prev_text_uploaded: Vec::new(),
         })
     }
 
@@ -964,20 +1085,7 @@ impl WebGL2Renderer {
         // Bake any codepoint on screen that isn't in the static ranges into the
         // on-demand atlas region, so the GL path renders the full Unicode range
         // exactly like the Canvas 2D fallback.
-        let mut needed: Vec<char> = Vec::new();
-        for r in 0..rows {
-            for c in 0..cols {
-                if r < prows as u32 && c < pcols as u32 {
-                    if let Some(cell) = screen.cell(r as u16, c as u16) {
-                        if let Some(ch) = cell.contents().chars().next() {
-                            if !is_static_cp(ch as u32) && !needed.contains(&ch) {
-                                needed.push(ch);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let needed = collect_needed(screen, rows, cols, prows, pcols);
         self.atlas.ensure_glyphs(gl, &needed)?;
 
         // Use the full drawing buffer as the viewport so the destination rect
@@ -1000,7 +1108,11 @@ impl WebGL2Renderer {
         ffi::gl_bind_texture(gl, TEXTURE_2D, self.atlas.texture);
         ffi::gl_uniform1i(gl, self.brush.atlas_loc, 0);
 
-        let (bg_instances, text_instances) = Self::build_instances(
+        // Fill the persistent scratch buffers in place: no per-frame Vec
+        // allocation, and their capacity survives across frames.
+        Self::build_instances_into(
+            &mut self.bg_instances,
+            &mut self.text_instances,
             rows,
             cols,
             self.cell_w,
@@ -1018,18 +1130,21 @@ impl WebGL2Renderer {
             default_bg,
             self.dpr,
         );
-        let bg_count = bg_instances.len() / INSTANCE_FLOATS;
-        let text_count = text_instances.len() / INSTANCE_FLOATS;
+        let bg_count = self.bg_instances.len() / INSTANCE_FLOATS;
+        let text_count = self.text_instances.len() / INSTANCE_FLOATS;
 
-        let pos_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_position") as u32;
-        let tex_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_texcoord") as u32;
-        let off_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_offset") as u32;
-        let size_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_size") as u32;
-        let uv_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_uv") as u32;
-        let fg_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_fg") as u32;
-        let bg_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_bg") as u32;
-        let sel_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_sel") as u32;
-        let cur_attr = ffi::gl_get_attrib_location(gl, self.brush.program, "a_cur") as u32;
+        // Attribute locations were resolved once when the program was built;
+        // they are fixed for the life of a linked program.
+        let attrs = self.brush.attrs;
+        let pos_attr = attrs.position;
+        let tex_attr = attrs.texcoord;
+        let off_attr = attrs.offset;
+        let size_attr = attrs.size;
+        let uv_attr = attrs.uv;
+        let fg_attr = attrs.fg;
+        let bg_attr = attrs.bg;
+        let sel_attr = attrs.sel;
+        let cur_attr = attrs.cur;
 
         // Per-vertex attributes (shared across all instances)
         ffi::gl_bind_buffer(gl, ARRAY_BUFFER, self.brush.pos_buffer);
@@ -1075,16 +1190,43 @@ impl WebGL2Renderer {
             ffi::gl_vertex_attrib_divisor(gl, cur_attr, 1);
         };
 
+        // Upload only the span that changed. The first frame (previous data
+        // empty) and any layout change (length differs) upload the whole
+        // buffer; a small change — the cursor, say — uploads just its span via
+        // `bufferSubData`, which requires the buffer to already be sized by an
+        // earlier full upload.
+        let upload = |gl: JsHandle, buffer: JsHandle, cur: &[f32], prev: &mut Vec<f32>| {
+            ffi::gl_bind_buffer(gl, ARRAY_BUFFER, buffer);
+            let Some(range) = changed_instance_range(prev, cur) else {
+                return;
+            };
+            if range.start == 0 && range.end == cur.len() {
+                ffi::gl_buffer_data_f32(gl, ARRAY_BUFFER, &cur[range.clone()], DYNAMIC_DRAW);
+            } else {
+                ffi::gl_buffer_sub_data_f32(gl, ARRAY_BUFFER, range.start, &cur[range.clone()]);
+            }
+            prev.clear();
+            prev.extend_from_slice(cur);
+        };
+
         // --- Pass 1: Background rects (mode = 0) ---
-        ffi::gl_bind_buffer(gl, ARRAY_BUFFER, self.brush.bg_instance_buffer);
-        ffi::gl_buffer_data_f32(gl, ARRAY_BUFFER, &bg_instances, DYNAMIC_DRAW);
+        upload(
+            gl,
+            self.brush.bg_instance_buffer,
+            &self.bg_instances,
+            &mut self.prev_bg_uploaded,
+        );
         ffi::gl_uniform1f(gl, self.brush.mode_loc, 0.0);
         bind_instances(gl, self.brush.bg_instance_buffer);
         ffi::gl_draw_arrays_instanced(gl, TRIANGLE_STRIP, 0, 4, bg_count as i32);
 
         // --- Pass 2: Text (mode = 1) ---
-        ffi::gl_bind_buffer(gl, ARRAY_BUFFER, self.brush.text_instance_buffer);
-        ffi::gl_buffer_data_f32(gl, ARRAY_BUFFER, &text_instances, DYNAMIC_DRAW);
+        upload(
+            gl,
+            self.brush.text_instance_buffer,
+            &self.text_instances,
+            &mut self.prev_text_uploaded,
+        );
         ffi::gl_uniform1f(gl, self.brush.mode_loc, 1.0);
         bind_instances(gl, self.brush.text_instance_buffer);
         ffi::gl_draw_arrays_instanced(gl, TRIANGLE_STRIP, 0, 4, text_count as i32);
@@ -1100,6 +1242,10 @@ impl WebGL2Renderer {
         Ok(())
     }
 
+    /// Thin wrapper over [`Self::build_instances_into`] that allocates fresh
+    /// buffers. Kept so the unit tests can call it without owning renderer
+    /// state; the renderer itself uses the scratch-buffer form.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn build_instances(
         rows: u32,
@@ -1119,10 +1265,55 @@ impl WebGL2Renderer {
         default_bg: u32,
         dpr: f64,
     ) -> (Vec<f32>, Vec<f32>) {
-        let sel_set: std::collections::HashSet<(u16, u16)> = selection.iter().copied().collect();
+        let mut bg = Vec::new();
+        let mut text = Vec::new();
+        Self::build_instances_into(
+            &mut bg, &mut text, rows, cols, cell_w, cell_h, origin_x, origin_y, atlas, screen,
+            prows, pcols, selection, cursor, cursor_style, default_fg, default_bg, dpr,
+        );
+        (bg, text)
+    }
+
+    /// Build the background/text instance data into the caller's buffers,
+    /// clearing them first so the renderer can reuse the same allocation across
+    /// frames instead of allocating two `Vec<f32>` per render.
+    #[allow(clippy::too_many_arguments)]
+    fn build_instances_into(
+        bg: &mut Vec<f32>,
+        text: &mut Vec<f32>,
+        rows: u32,
+        cols: u32,
+        cell_w: u32,
+        cell_h: u32,
+        origin_x: u32,
+        origin_y: u32,
+        atlas: &GlyphAtlas,
+        screen: &vt100::Screen,
+        prows: u16,
+        pcols: u16,
+        selection: &[(u16, u16)],
+        cursor: (u16, u16),
+        cursor_style: CursorStyle,
+        default_fg: u32,
+        default_bg: u32,
+        dpr: f64,
+    ) {
+        // Only build the membership set when there is a selection; the common
+        // case (no selection) then skips the per-cell lookup entirely.
+        let sel_set: Option<std::collections::HashSet<(u16, u16)>> = if selection.is_empty() {
+            None
+        } else {
+            Some(selection.iter().copied().collect())
+        };
         let capacity = (rows * cols) as usize * INSTANCE_FLOATS;
-        let mut bg = Vec::with_capacity(capacity);
-        let mut text = Vec::with_capacity(capacity * 2);
+        bg.clear();
+        text.clear();
+        if bg.capacity() < capacity {
+            bg.reserve(capacity);
+        }
+        if text.capacity() < capacity * 2 {
+            text.reserve(capacity * 2);
+        }
         let solid = atlas.solid_uv();
         let cell_wf = cell_w as f32;
         let cell_hf = cell_h as f32;
@@ -1133,7 +1324,9 @@ impl WebGL2Renderer {
                 // Both renderers share the top-down pixel convention: row 0 is
                 // the canvas top and each row steps one cell height downward.
                 let py = origin_y + r * cell_h;
-                let is_selected = sel_set.contains(&(r as u16, c as u16));
+                let is_selected = sel_set
+                    .as_ref()
+                    .is_some_and(|set| set.contains(&(r as u16, c as u16)));
                 let is_cursor = (r as u16, c as u16) == cursor;
 
                 let cell = if r < prows as u32 && c < pcols as u32 {
@@ -1163,15 +1356,25 @@ impl WebGL2Renderer {
                 let sel = if is_selected && !is_cursor { 1.0 } else { 0.0 };
                 let cur = if is_cursor { 1.0 } else { 0.0 };
 
-                // Background pass: one full-cell quad per cell
-                bg.extend_from_slice(&[
-                    px as f32, py as f32, // offset
-                    cell_wf, cell_hf, // size
-                    0.0, 0.0, 0.0, 0.0, // UV (ignored in mode 0)
-                    fg_r, fg_g, fg_b, // foreground
-                    bg_r, bg_g, bg_b, // background
-                    sel, cur,
-                ]);
+                // Background pass: one full-cell quad per cell, but only when
+                // the cell actually needs one. A cell on the cleared default
+                // background is already covered by `gl_clear` in `render`, and
+                // a cell with a glyph repaints its own background in the text
+                // pass; selection and the block/reverse cursor override the
+                // color and therefore always need the quad.
+                let needs_bg_quad = bg_rgb != default_bg
+                    || is_selected
+                    || (is_cursor && cursor_style.is_block());
+                if needs_bg_quad {
+                    bg.extend_from_slice(&[
+                        px as f32, py as f32, // offset
+                        cell_wf, cell_hf, // size
+                        0.0, 0.0, 0.0, 0.0, // UV (ignored in mode 0)
+                        fg_r, fg_g, fg_b, // foreground
+                        bg_r, bg_g, bg_b, // background
+                        sel, cur,
+                    ]);
+                }
 
                 // Underline/bar cursor: a second background quad for the
                 // strip, painted in the cell's own foreground color.
@@ -1193,44 +1396,52 @@ impl WebGL2Renderer {
                     }
                 }
 
-                // Text pass: glyph quad, or flat geometry for graphic cells
-                if let Some(rects) = graphic_cell_rects(
-                    ch,
-                    px as f64,
-                    py as f64,
-                    cell_wf as f64,
-                    cell_hf as f64,
-                    dpr,
-                ) {
-                    for (x, y, w, h, a) in rects {
-                        let a = a as f32;
-                        // Shaded blocks are pre-blended over the cell background;
-                        // full-alpha glyphs use the foreground as-is.
-                        let (tr, tg, tb) = if a < 1.0 {
-                            (
-                                fg_r * a + bg_r * (1.0 - a),
-                                fg_g * a + bg_g * (1.0 - a),
-                                fg_b * a + bg_b * (1.0 - a),
-                            )
-                        } else {
-                            (fg_r, fg_g, fg_b)
-                        };
+                // Text pass: glyph quad, or flat geometry for graphic cells.
+                // A blank cell (no contents) paints nothing here — its
+                // background already comes from the bg pass or the clear — so
+                // it costs no text instance and upload. Cursor and selection
+                // cells are kept, since they repaint the cell background in
+                // this pass too.
+                let blank = cell.is_none_or(|cell| cell.contents().is_empty());
+                if !blank || is_cursor || is_selected {
+                    if let Some(rects) = graphic_cell_rects(
+                        ch,
+                        px as f64,
+                        py as f64,
+                        cell_wf as f64,
+                        cell_hf as f64,
+                        dpr,
+                    ) {
+                        for (x, y, w, h, a) in rects.iter().copied() {
+                            let a = a as f32;
+                            // Shaded blocks are pre-blended over the cell background;
+                            // full-alpha glyphs use the foreground as-is.
+                            let (tr, tg, tb) = if a < 1.0 {
+                                (
+                                    fg_r * a + bg_r * (1.0 - a),
+                                    fg_g * a + bg_g * (1.0 - a),
+                                    fg_b * a + bg_b * (1.0 - a),
+                                )
+                            } else {
+                                (fg_r, fg_g, fg_b)
+                            };
+                            text.extend_from_slice(&[
+                                x as f32, y as f32, w as f32, h as f32, // geometry rect
+                                solid.0, solid.1, solid.2, solid.3, // flat sample
+                                tr, tg, tb, // paint color
+                                bg_r, bg_g, bg_b, sel, cur,
+                            ]);
+                        }
+                    } else if let Some((u0, v0, u1, v1)) = atlas.uv_for(ch) {
                         text.extend_from_slice(&[
-                            x as f32, y as f32, w as f32, h as f32, // geometry rect
-                            solid.0, solid.1, solid.2, solid.3, // flat sample
-                            tr, tg, tb, // paint color
-                            bg_r, bg_g, bg_b, sel, cur,
+                            px as f32, py as f32, // offset
+                            cell_wf, cell_hf, // size
+                            u0, v0, u1, v1, // UV
+                            fg_r, fg_g, fg_b, // foreground
+                            bg_r, bg_g, bg_b, // background
+                            sel, cur,
                         ]);
                     }
-                } else if let Some((u0, v0, u1, v1)) = atlas.uv_for(ch) {
-                    text.extend_from_slice(&[
-                        px as f32, py as f32, // offset
-                        cell_wf, cell_hf, // size
-                        u0, v0, u1, v1, // UV
-                        fg_r, fg_g, fg_b, // foreground
-                        bg_r, bg_g, bg_b, // background
-                        sel, cur,
-                    ]);
                 }
                 // No atlas entry for this codepoint: draw no glyph quad at all.
                 // Falling back to a default UV would sample whatever happens to
@@ -1239,7 +1450,6 @@ impl WebGL2Renderer {
                 // (see `ensure_glyphs`).
             }
         }
-        (bg, text)
     }
 }
 
@@ -1256,6 +1466,7 @@ mod tests {
             glyph_width: 8,
             glyph_height: 18,
             uv_map: (0..1584).map(|_| (0.25, 0.25, 0.75, 0.75)).collect(),
+            ascii_uv: [Some((0.25, 0.25, 0.75, 0.75)); 128],
             dpr: 1.0,
             dynamic_base: 1584,
             dynamic_slots: vec![None; cap],
@@ -1326,6 +1537,23 @@ mod tests {
                 uv
             );
         }
+    }
+
+    /// The ASCII LUT must return exactly what the range scan would, and
+    /// non-ASCII must still reach the range scan / dynamic table.
+    #[test]
+    fn uv_for_ascii_fast_path_matches_uv_map() {
+        let atlas = scratch_atlas();
+        for cp in 0u32..128 {
+            let ch = char::from_u32(cp).unwrap();
+            let expected = ATLAS_RANGES
+                .iter()
+                .find(|r| cp >= r.start && cp < r.start + r.len)
+                .and_then(|r| atlas.uv_map.get((r.offset + (cp - r.start)) as usize).copied());
+            assert_eq!(atlas.uv_for(ch), expected, "ascii cp {:#x}", cp);
+        }
+        assert!(atlas.uv_for('\u{2190}').is_some(), "non-ascii range missed");
+        assert_eq!(atlas.uv_for('\u{1F600}'), None, "unbaked char resolved");
     }
 
     /// Static codepoints never consume on-demand slots.
@@ -1508,7 +1736,9 @@ mod tests {
     }
     /// Underline/bar cursors keep the cursor cell's own colors and add a
     /// strip quad (bottom bar / left edge) in the cell's foreground color;
-    /// block cursors keep the single swapped cell and add nothing.
+    /// block cursors keep the single swapped cell and add nothing. Cells on
+    /// the default background emit no background quad at all, so only the
+    /// cursor cells/quirks below produce any.
     #[test]
     fn build_instances_cursor_styles() {
         let atlas = scratch_atlas();
@@ -1536,25 +1766,22 @@ mod tests {
             )
         };
 
-        // Block: one bg quad per cell, cursor cell swapped, no extra quad.
+        // Block: only the cursor cell needs a background quad (both cells sit
+        // on the default background otherwise). The cursor cell is swapped.
         let (bg, _) = build(CursorStyle::default());
-        assert_eq!(bg.len() / INSTANCE_FLOATS, 2);
-        let cursor_cell = &bg[INSTANCE_FLOATS..2 * INSTANCE_FLOATS];
+        assert_eq!(bg.len() / INSTANCE_FLOATS, 1, "only the cursor cell");
+        let cursor_cell = &bg[0..INSTANCE_FLOATS];
         assert_eq!(cursor_cell[15], 1.0, "cursor cell must carry a_cur=1");
         // Cursor swap: cell background (floats 11..14) becomes the default fg.
         let (fr, fg, fb) = rgb_to_floats(0xFF_FF_FF);
         assert_eq!(&cursor_cell[11..14], &[fr, fg, fb]);
 
-        // Underline (DECSCUSR 4): same two cell quads — unswapped — plus a
-        // strip quad at the bottom of the cursor cell: x=8, w=8,
-        // h=18/8=2.25, y=18-2.25=15.75, painted in the cell's fg color.
+        // Underline (DECSCUSR 4): no swapped cell quad — both cells are on the
+        // default background — just a strip at the bottom of the cursor cell:
+        // x=8, w=8, h=18/8=2.25, y=18-2.25=15.75, in the cell's fg color.
         let (bg, _) = build(CursorStyle::from_decscusr(4));
-        assert_eq!(bg.len() / INSTANCE_FLOATS, 3, "cells + strip");
-        let cursor_cell = &bg[INSTANCE_FLOATS..2 * INSTANCE_FLOATS];
-        assert_eq!(cursor_cell[15], 1.0);
-        let br = rgb_to_floats(0x00_00_00);
-        assert_eq!(&cursor_cell[11..14], &[br.0, br.1, br.2], "no swap");
-        let strip = &bg[2 * INSTANCE_FLOATS..3 * INSTANCE_FLOATS];
+        assert_eq!(bg.len() / INSTANCE_FLOATS, 1, "strip only");
+        let strip = &bg[0..INSTANCE_FLOATS];
         assert_eq!(
             &strip[0..4],
             &[8.0, 15.75, 8.0, 2.25],
@@ -1565,12 +1792,12 @@ mod tests {
 
         // Bar (DECSCUSR 5): strip hugs the left edge of the cursor cell.
         let (bg, _) = build(CursorStyle::from_decscusr(5));
-        assert_eq!(bg.len() / INSTANCE_FLOATS, 3);
-        let strip = &bg[2 * INSTANCE_FLOATS..3 * INSTANCE_FLOATS];
+        assert_eq!(bg.len() / INSTANCE_FLOATS, 1);
+        let strip = &bg[0..INSTANCE_FLOATS];
         assert_eq!(&strip[0..4], &[8.0, 0.0, 1.0, 18.0]);
 
         // Hidden cursor (the (u16::MAX, u16::MAX) sentinel): no a_cur=1
-        // anywhere, so no cell is swapped or given a strip.
+        // anywhere, and no cell quad since everything is default background.
         let (bg, _) = WebGL2Renderer::build_instances(
             1,
             2,
@@ -1589,7 +1816,280 @@ mod tests {
             0x00_00_00,
             1.0,
         );
-        assert_eq!(bg.len() / INSTANCE_FLOATS, 2);
-        assert!(bg.chunks(INSTANCE_FLOATS).all(|i| i[15] == 0.0));
+        assert_eq!(bg.len() / INSTANCE_FLOATS, 0);
+    }
+
+    /// A cell whose resolved background is the cleared default emits no
+    /// background quad; a cell with its own background still does.
+    #[test]
+    fn background_quads_skip_default_background_cells() {
+        let atlas = scratch_atlas();
+        let mut p = vt100::Parser::new(2, 4, 0);
+        // Row 1, col 0: red background.
+        p.process(b"\x1b[2;1H\x1b[41mX");
+        let (prows, pcols) = p.screen().size();
+        let (bg, _) = WebGL2Renderer::build_instances(
+            2,
+            4,
+            8,
+            18,
+            0,
+            0,
+            &atlas,
+            p.screen(),
+            prows,
+            pcols,
+            &[],
+            (u16::MAX, u16::MAX),
+            CursorStyle::default(),
+            0xFF_FF_FF,
+            0x00_00_00,
+            1.0,
+        );
+        assert_eq!(bg.len() / INSTANCE_FLOATS, 1, "only the red cell");
+        // Offset (x, y) = (0, cell_h) puts it on row 1, col 0.
+        assert_eq!(&bg[0..2], &[0.0, 18.0]);
+    }
+
+    /// Selection overrides the background color, so a selected cell must keep
+    /// its background quad even when it sits on the default background.
+    #[test]
+    fn background_quads_are_kept_for_selected_default_cells() {
+        let atlas = scratch_atlas();
+        let p = vt100::Parser::new(2, 4, 0);
+        let (prows, pcols) = p.screen().size();
+        let (bg, _) = WebGL2Renderer::build_instances(
+            2,
+            4,
+            8,
+            18,
+            0,
+            0,
+            &atlas,
+            p.screen(),
+            prows,
+            pcols,
+            &[(0, 1)],
+            (u16::MAX, u16::MAX),
+            CursorStyle::default(),
+            0xFF_FF_FF,
+            0x00_00_00,
+            1.0,
+        );
+        assert_eq!(bg.len() / INSTANCE_FLOATS, 1, "only the selected cell");
+        assert_eq!(&bg[0..2], &[8.0, 0.0], "selected cell at row 0, col 1");
+        // Selection paints the original foreground as its background.
+        let (fr, fg, fb) = rgb_to_floats(0xFF_FF_FF);
+        assert_eq!(&bg[11..14], &[fr, fg, fb]);
+        assert_eq!(bg[14], 1.0, "selection flag set");
+    }
+
+    /// A blank cell (empty contents) must not produce a text instance; only
+    /// the single real glyph on the row should. (A written space has contents
+    /// `" "`, so it is *not* blank and keeps its quad.)
+    #[test]
+    fn blank_cells_contribute_no_text_instance() {
+        let atlas = scratch_atlas();
+        let mut p = vt100::Parser::new(1, 3, 0);
+        p.process(b"A");
+        let (prows, pcols) = p.screen().size();
+        let (_, text) = WebGL2Renderer::build_instances(
+            1,
+            3,
+            8,
+            18,
+            0,
+            0,
+            &atlas,
+            p.screen(),
+            prows,
+            pcols,
+            &[],
+            (u16::MAX, u16::MAX),
+            CursorStyle::default(),
+            0xFF_FF_FF,
+            0x00_00_00,
+            1.0,
+        );
+        assert_eq!(text.len() / INSTANCE_FLOATS, 1, "only A");
+        assert_eq!(&text[0..2], &[0.0, 0.0], "A at col 0");
+    }
+
+    /// A selected blank cell is still painted: it keeps a background quad and
+    /// the text pass still emits its cell so the highlight is repainted.
+    #[test]
+    fn selected_blank_cell_still_paints() {
+        let atlas = scratch_atlas();
+        let mut p = vt100::Parser::new(1, 3, 0);
+        p.process(b"A");
+        let (prows, pcols) = p.screen().size();
+        let (bg, text) = WebGL2Renderer::build_instances(
+            1,
+            3,
+            8,
+            18,
+            0,
+            0,
+            &atlas,
+            p.screen(),
+            prows,
+            pcols,
+            &[(0, 1)],
+            (u16::MAX, u16::MAX),
+            CursorStyle::default(),
+            0xFF_FF_FF,
+            0x00_00_00,
+            1.0,
+        );
+        assert_eq!(bg.len() / INSTANCE_FLOATS, 1, "selection background");
+        assert_eq!(&bg[0..2], &[8.0, 0.0], "selected blank at col 1");
+        assert_eq!(text.len() / INSTANCE_FLOATS, 2, "A and the selected blank");
+    }
+
+    /// `collect_needed` dedups the codepoints that need baking, keeps
+    /// first-seen order, and ignores static (ASCII) codepoints entirely.
+    #[test]
+    fn collect_needed_dedups_and_skips_static_codepoints() {
+        let mut p = vt100::Parser::new(2, 4, 0);
+        // Two repeated dynamic single-width codepoints plus static ASCII.
+        p.process("A\u{3b1}\u{3b2}\u{3b1}B".as_bytes());
+        let (prows, pcols) = p.screen().size();
+        let needed = collect_needed(p.screen(), 2, 4, prows, pcols);
+        assert_eq!(needed, vec!['\u{3b1}', '\u{3b2}']);
+        // A second pass is stable (same order, still deduplicated).
+        assert_eq!(
+            collect_needed(p.screen(), 2, 4, prows, pcols),
+            needed
+        );
+    }
+
+    /// `plan_missing` bakes each missing codepoint once, ignores static ranges,
+    /// and stamps the frame on codepoints already resident in the atlas.
+    #[test]
+    fn plan_missing_dedups_and_skips_present_and_static() {
+        let mut atlas = scratch_atlas();
+        // Put a dynamic codepoint ('β') in slot 0.
+        atlas.dynamic_index.insert('\u{3b2}', 0);
+        atlas.dynamic_slots[0] = Some('\u{3b2}');
+        let before = atlas.frame;
+        let to_bake = atlas.plan_missing(&['A', '\u{3b2}', '\u{3b1}', '\u{3b1}']);
+        assert_eq!(to_bake, vec!['\u{3b1}'], "only the new codepoint, once");
+        assert_eq!(
+            atlas.dynamic_stamp[0],
+            before.wrapping_add(1),
+            "resident codepoint stamped with the advanced frame"
+        );
+    }
+
+    /// `build_instances_into` must clear (not append to) the scratch buffers,
+    /// so a reused buffer never carries a previous frame's tail into the GPU.
+    #[test]
+    fn build_instances_into_clears_scratch_buffers() {
+        let atlas = scratch_atlas();
+        let mut parser = vt100::Parser::new(1, 3, 0);
+        parser.process(b"A");
+
+        let mut bg = vec![9.0f32; 100];
+        let mut text = vec![9.0f32; 100];
+        WebGL2Renderer::build_instances_into(
+            &mut bg,
+            &mut text,
+            1,
+            3,
+            8,
+            18,
+            0,
+            0,
+            &atlas,
+            parser.screen(),
+            1,
+            3,
+            &[],
+            (0, 0),
+            CursorStyle::default(),
+            0xffffff,
+            0x000000,
+            1.0,
+        );
+        let bg_len = bg.len();
+        let text_len = text.len();
+        assert!(bg_len < 100, "stale junk must be cleared, got {}", bg_len);
+        assert_eq!(bg_len % INSTANCE_FLOATS, 0);
+        assert_eq!(text_len % INSTANCE_FLOATS, 0);
+
+        // A second pass over the same screen must not accumulate.
+        WebGL2Renderer::build_instances_into(
+            &mut bg,
+            &mut text,
+            1,
+            3,
+            8,
+            18,
+            0,
+            0,
+            &atlas,
+            parser.screen(),
+            1,
+            3,
+            &[],
+            (0, 0),
+            CursorStyle::default(),
+            0xffffff,
+            0x000000,
+            1.0,
+        );
+        assert_eq!(bg.len(), bg_len, "scratch buffer must be reused, not grown");
+        assert_eq!(text.len(), text_len);
+    }
+
+    /// `changed_instance_range` must isolate the smallest changed span, and
+    /// fall back to the whole buffer when the layout length changes.
+    #[test]
+    fn changed_instance_range_finds_minimal_span() {
+        assert_eq!(changed_instance_range(&[], &[]), None);
+        assert_eq!(changed_instance_range(&[], &[1.0, 2.0]), Some(0..2));
+        assert_eq!(changed_instance_range(&[1.0, 2.0], &[]), None);
+        assert_eq!(changed_instance_range(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]), None);
+        // Single middle change: span covers just that element.
+        assert_eq!(
+            changed_instance_range(&[1.0, 2.0, 3.0], &[1.0, 9.0, 3.0]),
+            Some(1..2)
+        );
+        // Two separated changes: span covers the bounding range (safe).
+        assert_eq!(
+            changed_instance_range(&[1.0, 2.0, 3.0, 4.0], &[9.0, 2.0, 3.0, 9.0]),
+            Some(0..4)
+        );
+        // Length change forces a full upload.
+        assert_eq!(changed_instance_range(&[1.0], &[1.0, 2.0]), Some(0..2));
+    }
+
+    /// With no selection the renderer must not mark any cell as selected.
+    #[test]
+    fn empty_selection_sets_no_selection_flag() {
+        let atlas = scratch_atlas();
+        let mut parser = vt100::Parser::new(1, 3, 0);
+        parser.process(b"abc");
+        let (bg, _text) = WebGL2Renderer::build_instances(
+            1,
+            3,
+            8,
+            18,
+            0,
+            0,
+            &atlas,
+            parser.screen(),
+            1,
+            3,
+            &[],
+            (0, 2),
+            CursorStyle::default(),
+            0xffffff,
+            0x000000,
+            1.0,
+        );
+        for inst in bg.chunks(INSTANCE_FLOATS) {
+            assert_eq!(inst[14], 0.0, "no selection flag for an empty selection");
+        }
     }
 }

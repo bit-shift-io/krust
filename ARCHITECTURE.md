@@ -150,6 +150,25 @@ obtained. On init it logs `KRUST: WebGL2 renderer initialized` or
   are painted as vector geometry (`draw_graphic_cell`, `block_geometry`,
   `box_geometry`) with a `GRAPHIC_EPS = 0.7` overflow so grids/borders tile
   seamlessly; anything else falls back to the font path.
+* **Dirty tracking:** the Canvas 2D path diffs the previous screen against the
+  current one **at render time** (`diff_screens` via `DirtyTracker`), not on
+  every `process_bytes` call. The WebGL2 path ignores the dirty set entirely
+  (it rebuilds instances from the current screen each frame). A `FullReset` or
+  resize marks the whole grid dirty.
+* **Terminal standards beyond `vt100`:** state the parser does not model is
+  captured through `TerminalCallbacks` and small scanners:
+  * bracketed paste (`DECSET 2004`) — `paste_bytes` wraps pasted text in
+    `ESC[200~`/`ESC[201~`;
+  * focus reporting (`DECSET 1004`) — `FocusReporting` scans the stream and the
+    page sends `ESC[I`/`ESC[O`;
+  * bell (`BEL`, `ESC g`) — `take_bell` flags a flash;
+  * `OSC 8` hyperlinks (`LinkSpan`, `hyperlink_at`), `OSC 52` clipboard
+    (opt-in via `?clipboard=1`), and `OSC 7`/`OSC 133` shell integration
+    (`take_cwd`, `take_prompt_mark`);
+  * dynamic colors (`OSC 4`/`10`/`11`) override a thread-local palette in
+    `color.rs` (`resolved_indexed`, `default_fg`/`default_bg`), reset on
+    `reset_terminal`, and the `OSC 11` query reply follows the override;
+  * `DECRQM` (`CSI ? Ps $p`) and `DA3` (`CSI = c`) replies in `query.rs`.
 * **Selection & input:** shift-drag selection extracted natively
   (`set_selection`/`selected_text`/`clear_selection`); `key_to_bytes` maps
   keyboard events to PTY byte sequences (arrows, modifiers, home/end, etc.).
@@ -190,6 +209,17 @@ obtained. On init it logs `KRUST: WebGL2 renderer initialized` or
   * Pass 1 (mode 1) — text glyphs sampling atlas alpha.
   Both passes draw all cells in a single `draw_arrays_instanced` call driven by
   per-instance attributes: offset, size, UV, fg, bg, selection flag, cursor flag.
+  Instance data is built into two persistent `Vec<f32>` scratch buffers on
+  `WebGL2Renderer` (`build_instances_into`) instead of fresh allocations per
+  frame; attribute locations are resolved once at program build
+  (`AttrLocations`) rather than re-queried every frame. Background quads are
+  emitted only for cells whose resolved bg differs from the current default
+  (or that are selected / hold the block cursor), and text quads only for
+  non-blank cells (or the cursor/selection) — mostly-blank screens therefore
+  upload a small fraction of the grid. Between frames only the changed span is
+  re-uploaded via `bufferSubData` (`changed_instance_range`); a full upload is
+  used on the first frame or after a full redraw. `rebuild_webgl()` builds a
+  fresh renderer, so its empty upload mirrors correctly force a full upload.
 * **Selection & cursor:** text color goes black on selected cells (bg swaps to
   the cell's fg, matching the Canvas 2D behavior); the cursor is a block that
   swaps fg/bg and takes priority over selection.
@@ -346,6 +376,23 @@ server (before first PTY read) or in the shell (before first write). A
 boot-time pre-warm of the default session was tried as a workaround and
 reverted by request; it is the current fallback option if this is ever
 prioritized.
+
+### Keyboard protocol limitations (deliberate)
+
+**`CSI ? u` (kitty keyboard protocol query)** is answered with flags `0`:
+"legacy keys only". That is truthful — `key_to_bytes` emits the classic
+xterm sequences and does not implement progressive enhancement / key event
+types — but it means modern TUIs that would otherwise opt into the kitty
+protocol (Neovim, some shells/fzf builds) fall back to legacy keys or their
+own `modifyOtherKeys` path.
+
+**`CSI > 4 ; m` (modifyOtherKeys)** is *not* implemented. The XTGETTCAP `km`
+capability is still advertised as `ESC[>4;m`, matching xterm, but the
+terminal does not act on the sequences. Apps that depend on
+`modifyOtherKeys` for disambiguating modified keys (e.g. Ctrl+Shift+letter)
+will see the plain key. Implementing it requires tracking the *current* mode
+in `TerminalState` and consulting it in `key_to_bytes`; both are additions,
+not bugs in the current mapping.
 | `AGENTS.md` | Shared agent context and conventions |
 | `TASKS.md` | Implementation roadmap |
 | `NOTES.md` | Design rationale and decisions |

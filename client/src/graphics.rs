@@ -149,6 +149,40 @@ pub(crate) fn box_geometry(c: char) -> Option<(BarSide, StemSide, LineWeight)> {
     Some(g)
 }
 
+/// Maximum rects a single graphic glyph expands to: ▣ is a frame of four bars
+/// plus a centered fill, and a double-line box paints a stem and a bar per line.
+pub(crate) const MAX_GRAPHIC_RECTS: usize = 5;
+
+/// The `(x, y, w, h, alpha)` rects that paint one graphic glyph, backed by a
+/// fixed array so building the geometry allocates nothing. Derefs to the valid
+/// `[..len]` slice.
+pub(crate) struct GraphicCellRects {
+    rects: [(f64, f64, f64, f64, f64); MAX_GRAPHIC_RECTS],
+    len: usize,
+}
+
+impl std::ops::Deref for GraphicCellRects {
+    type Target = [(f64, f64, f64, f64, f64)];
+    fn deref(&self) -> &Self::Target {
+        &self.rects[..self.len]
+    }
+}
+
+impl GraphicCellRects {
+    fn new() -> Self {
+        Self {
+            rects: [(0.0, 0.0, 0.0, 0.0, 0.0); MAX_GRAPHIC_RECTS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, rect: (f64, f64, f64, f64, f64)) {
+        debug_assert!(self.len < MAX_GRAPHIC_RECTS, "graphic rect overflow");
+        self.rects[self.len] = rect;
+        self.len += 1;
+    }
+}
+
 /// Compute the pixel rects that paint a graphic glyph (block element or
 /// box-drawing) inside a cell whose top-left origin is `(ox, oy)`. `cw`/`ch`
 /// are the cell size in the caller's pixel unit and `scale` multiplies the
@@ -163,14 +197,16 @@ pub(crate) fn graphic_cell_rects(
     cw: f64,
     ch: f64,
     scale: f64,
-) -> Option<Vec<(f64, f64, f64, f64, f64)>> {
+) -> Option<GraphicCellRects> {
     let eps = GRAPHIC_EPS * scale;
     if let Some((fx0, fy0, fx1, fy1, alpha)) = block_geometry(c) {
         let x = ox + fx0 * cw - eps;
         let y = oy + fy0 * ch - eps;
         let w = (fx1 - fx0) * cw + eps * 2.0;
         let h = (fy1 - fy0) * ch + eps * 2.0;
-        return Some(vec![(x, y, w, h, alpha)]);
+        let mut out = GraphicCellRects::new();
+        out.push((x, y, w, h, alpha));
+        return Some(out);
     }
     // ▣ U+25A3 (white square containing black small square) is synthesized as a
     // hollow square frame plus a centered filled square. Some monospace fonts
@@ -186,13 +222,13 @@ pub(crate) fn graphic_cell_rects(
         let cx = ox + cw * 0.5;
         let cy = oy + ch * 0.5;
         let inner = side * 0.34;
-        return Some(vec![
-            (x0 - eps, y0 - eps, side + eps * 2.0, t + eps, 1.0),
-            (x0 - eps, y1 - t - eps, side + eps * 2.0, t + eps, 1.0),
-            (x0 - eps, y0 - eps, t + eps, side + eps * 2.0, 1.0),
-            (x1 - t - eps, y0 - eps, t + eps, side + eps * 2.0, 1.0),
-            (cx - inner * 0.5, cy - inner * 0.5, inner, inner, 1.0),
-        ]);
+        let mut out = GraphicCellRects::new();
+        out.push((x0 - eps, y0 - eps, side + eps * 2.0, t + eps, 1.0));
+        out.push((x0 - eps, y1 - t - eps, side + eps * 2.0, t + eps, 1.0));
+        out.push((x0 - eps, y0 - eps, t + eps, side + eps * 2.0, 1.0));
+        out.push((x1 - t - eps, y0 - eps, t + eps, side + eps * 2.0, 1.0));
+        out.push((cx - inner * 0.5, cy - inner * 0.5, inner, inner, 1.0));
+        return Some(out);
     }
     let (bar, stem, weight) = box_geometry(c)?;
     let (t_css, gap_css) = box_line_width(weight);
@@ -201,7 +237,7 @@ pub(crate) fn graphic_cell_rects(
     let cx = ox + cw * 0.5;
     let cy = oy + ch * 0.5;
     let offsets: &[f64] = if gap > 0.0 { &[-gap, gap] } else { &[0.0] };
-    let mut rects = Vec::with_capacity(4);
+    let mut out = GraphicCellRects::new();
     for &off in offsets {
         if stem != StemSide::None {
             let x = cx + off - t * 0.5;
@@ -214,7 +250,7 @@ pub(crate) fn graphic_cell_rects(
                 }
                 _ => unreachable!(),
             };
-            rects.push((x, y, t, h, 1.0));
+            out.push((x, y, t, h, 1.0));
         }
         if bar != BarSide::None {
             let y = cy + off - t * 0.5;
@@ -227,10 +263,10 @@ pub(crate) fn graphic_cell_rects(
                 }
                 _ => unreachable!(),
             };
-            rects.push((x, y, w, t, 1.0));
+            out.push((x, y, w, t, 1.0));
         }
     }
-    Some(rects)
+    Some(out)
 }
 
 /// Paint a graphic glyph (block element or box-drawing) as geometry covering
@@ -254,7 +290,7 @@ pub(crate) fn draw_graphic_cell(
         return false;
     };
     ffi::ctx_set_fill_style(ctx, &css_color(color));
-    for (x, y, w, h, alpha) in rects {
+    for (x, y, w, h, alpha) in rects.iter().copied() {
         if alpha < 1.0 {
             ffi::ctx_set_global_alpha(ctx, alpha);
         }
@@ -347,10 +383,22 @@ mod tests {
         assert!((inner.1 + inner.3 * 0.5 - cy).abs() < 0.5);
         assert!(inner.2 < cw * 0.6 && inner.3 < ch * 0.6);
         // The frame's outer extents stay within the cell (plus the seam eps).
-        for r in &rects {
+        for r in rects.iter() {
             assert!(r.0 >= ox - 1.0 && r.1 >= oy - 1.0);
             assert!(r.0 + r.2 <= ox + cw + 1.0);
             assert!(r.1 + r.3 <= oy + ch + 1.0);
         }
+    }
+
+    /// Every glyph's rect count must fit the fixed buffer, and the widest
+    /// cases (double-line cross, ▣) must actually use it.
+    #[test]
+    fn graphic_rect_counts_fit_the_fixed_buffer() {
+        let cross = graphic_cell_rects('\u{256C}', 0.0, 0.0, 8.0, 18.0, 1.0).unwrap();
+        assert_eq!(cross.len(), 4, "double cross = two line offsets x (stem+bar)");
+        let square = graphic_cell_rects('\u{25A3}', 0.0, 0.0, 8.0, 18.0, 1.0).unwrap();
+        assert_eq!(square.len(), 5, "▣ = four frame bars + fill");
+        let block = graphic_cell_rects('\u{2588}', 0.0, 0.0, 8.0, 18.0, 1.0).unwrap();
+        assert_eq!(block.len(), 1);
     }
 }

@@ -33,6 +33,9 @@ pub(crate) type MirrorArc = std::sync::Arc<std::sync::Mutex<Mirror>>;
 pub(crate) const MAX_HISTORY_BYTES: usize = 1024 * 512;
 /// Max bytes per WS binary frame.
 pub(crate) const BINARY_FRAME_MAX: usize = 16 * 1024;
+/// PTY read chunk size. Aligned with [`BINARY_FRAME_MAX`] so a burst is drained
+/// in a few reads instead of hundreds of 1 KB ones.
+pub(crate) const PTY_READ_BUF: usize = BINARY_FRAME_MAX;
 
 /// Write raw bytes to a PTY master writer and flush.
 ///
@@ -41,6 +44,21 @@ pub(crate) const BINARY_FRAME_MAX: usize = 16 * 1024;
 pub(crate) fn pty_write(w: &mut dyn Write, bytes: &[u8]) -> std::io::Result<()> {
     w.write_all(bytes)?;
     w.flush()
+}
+
+/// Write bytes to a session's PTY writer, *waiting* for the lock if it is
+/// briefly held rather than dropping the input. Input frames are already
+/// processed one at a time by the socket task, so waiting cannot deadlock; a
+/// `try_lock` here would silently discard typed input or paste bytes whenever
+/// the two paths briefly contended.
+///
+/// Call only from a blocking context (e.g. `spawn_blocking`).
+pub(crate) fn pty_write_locked(
+    writer: &Mutex<Box<dyn Write + Send>>,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let mut w = writer.blocking_lock();
+    pty_write(&mut *w, bytes)
 }
 
 /// Build a [`PtySize`] from client-reported pixel dimensions.
@@ -258,7 +276,11 @@ pub(crate) async fn get_or_create_session(
     let mut stream_offset: StreamOffset = 0;
 
     tokio::task::spawn_blocking(move || {
-        let mut buffer = [0u8; 1024];
+        // Match the PTY read to the frame size the client ships in: a 1 KB
+        // read turned a 1 MB burst into ~1000 wakeups, each taking the history
+        // and mirror locks. 16 KB keeps `stream_offset`/`m.upto` arithmetic
+        // (both advanced by the byte count) unchanged.
+        let mut buffer = [0u8; PTY_READ_BUF];
         while let Ok(n) = reader.read(&mut buffer) {
             if n == 0 {
                 break;
@@ -309,4 +331,56 @@ pub(crate) async fn get_or_create_session(
     });
     sessions.insert(session_id.to_string(), session.clone());
     session
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `Write` sink that records everything written, so a test can prove a
+    /// write was not silently dropped.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<StdMutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn input_writes_wait_for_the_lock_instead_of_dropping() {
+        let cap = Capture::default();
+        let writer = Arc::new(Mutex::new(
+            Box::new(cap.clone()) as Box<dyn Write + Send>
+        ));
+
+        // Hold the writer lock from another thread and only release it after a
+        // delay, so the input write below must wait.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let holder = writer.clone();
+        let held = tokio::task::spawn_blocking(move || {
+            let _guard = holder.blocking_lock();
+            ready_tx.send(()).expect("signal");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        ready_rx.await.expect("holder acquired the lock");
+
+        // The lock is held: a `try_lock` implementation would drop these bytes,
+        // while the waiting implementation delivers them.
+        let w = writer.clone();
+        tokio::task::spawn_blocking(move || {
+            pty_write_locked(&w, b"hello").expect("write");
+        })
+        .await
+        .expect("join");
+
+        held.await.expect("holder join");
+        assert_eq!(&cap.0.lock().expect("capture lock")[..], b"hello");
+    }
 }

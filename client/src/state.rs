@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use vt100::Parser;
 
-use crate::color::{cell_visual, color_to_rgb, CellOverride, DEFAULT_BG, DEFAULT_FG};
+use crate::color::{cell_visual, color_to_rgb, default_bg, default_fg, CellOverride};
 use crate::cursor::{apply_decscusr, strip_rect, CursorStyle, SyncGate};
 use crate::ffi::{self, JsHandle};
 use crate::graphics::draw_graphic_cell;
@@ -16,6 +16,7 @@ use crate::measure::{
     css_color, device_pitch, fit_grid, measure_cell_dimensions_scratch, CELL_EPSILON, FONT_STACK,
     FONT_STACK_BOLD,
 };
+use crate::modes::FocusReporting;
 use crate::renderer;
 use crate::selection::{cell_is_selected, normalized_bounds, SelectionMode};
 
@@ -64,6 +65,167 @@ pub(crate) fn normalize_save_restore(bytes: &[u8], carry: &mut Vec<u8>) -> Vec<u
     }
     if carry_from < feed.len() {
         *carry = feed[carry_from..].to_vec();
+    }
+    out
+}
+
+/// A hyperlink created by an `OSC 8` sequence, tied to a screen region.
+///
+/// `vt100` has no per-cell hyperlink attribute, so a link is recorded as the
+/// cursor span between the opening and closing `OSC 8`. `end` is exclusive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkSpan {
+    pub(crate) uri: String,
+    pub(crate) start: (u16, u16),
+    pub(crate) end: (u16, u16),
+}
+
+/// Keep at most this many links; `ls --hyperlink` on a huge directory emits one
+/// per entry and only the visible ones can ever be hovered.
+const MAX_LINKS: usize = 256;
+
+/// Whether `(row, col)` falls inside `span`, accounting for wrapped rows.
+pub(crate) fn link_contains(span: &LinkSpan, row: u16, col: u16) -> bool {
+    let (sr, sc) = span.start;
+    let (er, ec) = span.end;
+    if (er, ec) <= (sr, sc) {
+        return false;
+    }
+    if row < sr || row > er {
+        return false;
+    }
+    if sr == er {
+        return row == sr && col >= sc && col < ec;
+    }
+    if row == sr {
+        col >= sc
+    } else if row == er {
+        col < ec
+    } else {
+        true
+    }
+}
+
+/// The URI of the last link covering `(row, col)`, if any.
+pub(crate) fn hyperlink_at(links: &[LinkSpan], row: u16, col: u16) -> Option<&str> {
+    links
+        .iter()
+        .rev()
+        .find(|span| link_contains(span, row, col))
+        .map(|span| span.uri.as_str())
+}
+
+/// vt100 parser callbacks for terminal events that do not affect the screen.
+///
+/// `vt100`'s `Screen` does not expose bells or hyperlinks, so they are
+/// surfaced through the parser's callback state instead.
+#[derive(Default)]
+pub(crate) struct TerminalCallbacks {
+    /// A bell (audible or visual) has rung since the page last took it.
+    pub(crate) bell_pending: bool,
+    /// Completed `OSC 8` hyperlinks, in the order they were closed.
+    pub(crate) links: Vec<LinkSpan>,
+    /// The currently open `OSC 8` link: its start cell and URI.
+    open_link: Option<((u16, u16), String)>,
+    /// Base64 payload from the last `OSC 52` copy request not yet taken.
+    pub(crate) clipboard: Option<String>,
+    /// Working directory from the last `OSC 7` sequence, not yet taken.
+    pub(crate) cwd: Option<String>,
+    /// Last `OSC 133` prompt mark (`A`/`B`/`C`/`D`), not yet taken.
+    pub(crate) prompt_mark: Option<u8>,
+}
+
+impl TerminalCallbacks {
+    /// Close the currently open link at `pos`, recording it if it covered any
+    /// cells.
+    fn close_link(&mut self, pos: (u16, u16)) {
+        if let Some((start, uri)) = self.open_link.take() {
+            if start != pos {
+                self.links.push(LinkSpan {
+                    uri,
+                    start,
+                    end: pos,
+                });
+                if self.links.len() > MAX_LINKS {
+                    let drop = self.links.len() - MAX_LINKS;
+                    self.links.drain(..drop);
+                }
+            }
+        }
+    }
+}
+
+impl vt100::Callbacks for TerminalCallbacks {
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        self.bell_pending = true;
+    }
+
+    fn visual_bell(&mut self, _: &mut vt100::Screen) {
+        self.bell_pending = true;
+    }
+
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
+        // `vt100` hands us a base64 payload; keep it encoded so the page can
+        // decode it with `atob` (which knows the browser's text conventions).
+        self.clipboard = Some(String::from_utf8_lossy(data).into_owned());
+    }
+
+    fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
+        // OSC 4 / 10 / 11 recolor the palette; they are not screen state.
+        if crate::color::apply_dynamic_color(params) {
+            return;
+        }
+        if params.first() == Some(&b"7".as_slice()) {
+            // OSC 7 ; file://host/path ST reports the shell's working directory.
+            let mut uri = Vec::new();
+            for (i, part) in params.iter().skip(1).enumerate() {
+                if i > 0 {
+                    uri.push(b';');
+                }
+                uri.extend_from_slice(part);
+            }
+            self.cwd = Some(String::from_utf8_lossy(&uri).into_owned());
+            return;
+        }
+        if params.first() == Some(&b"133".as_slice()) {
+            // OSC 133 ; A|B|C|D marks prompt/command boundaries.
+            if let Some(mark) = params.get(1).and_then(|p| p.first()) {
+                self.prompt_mark = Some(*mark);
+            }
+            return;
+        }
+        if params.first() != Some(&b"8".as_slice()) {
+            return;
+        }
+        let pos = screen.cursor_position();
+        self.close_link(pos);
+        let mut uri = Vec::new();
+        for (i, part) in params.iter().skip(2).enumerate() {
+            if i > 0 {
+                uri.push(b';');
+            }
+            uri.extend_from_slice(part);
+        }
+        if !uri.is_empty() {
+            self.open_link = Some((pos, String::from_utf8_lossy(&uri).into_owned()));
+        }
+    }
+}
+
+/// The bytes to send to the PTY for a paste of `text`.
+///
+/// When the application enabled bracketed paste (DECSET 2004), the text is
+/// wrapped in `ESC[200~` / `ESC[201~` so the shell inserts it literally rather
+/// than interpreting embedded newlines or control characters. Otherwise the
+/// bytes go through verbatim.
+pub(crate) fn bracketed_paste_bytes(text: &str, enabled: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + if enabled { 12 } else { 0 });
+    if enabled {
+        out.extend_from_slice(b"\x1b[200~");
+    }
+    out.extend_from_slice(text.as_bytes());
+    if enabled {
+        out.extend_from_slice(b"\x1b[201~");
     }
     out
 }
@@ -158,6 +320,65 @@ impl SelectionState {
     }
 }
 
+/// Tracks which cells changed since the last render.
+///
+/// `prev_screen` is a snapshot of the screen taken when it was last diffed;
+/// `dirty` is the set of cells that differ from it. The diff is computed at
+/// render time, not on every inbound byte: `process_bytes` mutates the parser
+/// but touches none of this, and `refresh` runs once per painted frame. That
+/// coalescing is what keeps a large paste from cloning the screen (and its
+/// scrollback) once per 1 KB WebSocket frame.
+struct DirtyTracker {
+    /// Screen snapshot the next diff compares against.
+    prev_screen: Option<vt100::Screen>,
+    /// Cells changed since the last render, consumed by the Canvas 2D path.
+    dirty: Vec<(u16, u16)>,
+    /// When set, the next render repaints the whole grid and the diff is
+    /// skipped (first frame, resize, reset, scroll, selection change).
+    full_redraw: bool,
+}
+
+impl DirtyTracker {
+    fn new() -> Self {
+        Self {
+            prev_screen: None,
+            dirty: Vec::new(),
+            full_redraw: true,
+        }
+    }
+
+    /// Force a full-grid repaint on the next render.
+    fn mark_all_dirty(&mut self) {
+        self.full_redraw = true;
+        self.dirty.clear();
+    }
+
+    /// Drop the baseline too, so the next diff treats every cell as changed.
+    fn reset_baseline(&mut self) {
+        self.prev_screen = None;
+        self.mark_all_dirty();
+    }
+
+    /// Recompute the dirty set against `screen`, then snapshot it as the next
+    /// baseline. A pending full redraw skips the scan but still refreshes the
+    /// baseline, so the render after it is incremental.
+    fn refresh(&mut self, screen: &vt100::Screen, rows: u16, cols: u16) {
+        if self.full_redraw {
+            self.dirty.clear();
+        } else if let Some(prev) = self.prev_screen.take() {
+            let (prows, pcols) = screen.size();
+            let rows = if rows > 0 { rows } else { prows };
+            let cols = if cols > 0 { cols } else { pcols };
+            self.dirty = diff_screens(&prev, screen, rows, cols);
+        } else {
+            // No baseline: treat this as a full redraw rather than painting
+            // nothing.
+            self.full_redraw = true;
+        }
+        self.prev_screen = Some(screen.clone());
+    }
+}
+
 /// Terminal state fields.
 ///
 /// Holds the vt100 parser, the active renderer (WebGL2 primary, Canvas 2D
@@ -165,7 +386,7 @@ impl SelectionState {
 /// WASM exports mutate it through.
 pub(crate) struct TerminalState {
     /// vt100 parser
-    parser: Parser,
+    parser: Parser<TerminalCallbacks>,
     /// 2D rendering context (Canvas 2D fallback path)
     ctx: Option<JsHandle>,
     /// WebGL2 renderer (primary path)
@@ -191,15 +412,9 @@ pub(crate) struct TerminalState {
     scroll: ScrollState,
     /// Selection-related state
     selection: SelectionState,
-    /// Previous screen state, used to diff against the current screen after
-    /// each `process_bytes` batch to find cells that changed.
-    prev_screen: Option<vt100::Screen>,
-    /// Cells that changed since the last render. Consumed by the renderer to
-    /// redraw only the affected cells instead of the whole grid.
-    dirty_cells: Vec<(u16, u16)>,
-    /// True when a full redraw is required (resize, scroll, selection change,
-    /// first frame). Cleared after the next render.
-    full_redraw: bool,
+    /// Cells changed since the last render, plus the screen snapshot the diff
+    /// compares against. Recomputed at render time, not per inbound frame.
+    dirty: DirtyTracker,
     /// Last rendered cursor cell, so the old highlight can be cleared when
     /// the cursor moves or becomes hidden.
     prev_cursor: Option<(u16, u16)>,
@@ -220,6 +435,9 @@ pub(crate) struct TerminalState {
     /// Withholds the body of a `?2026`-synchronized frame until it is
     /// complete, so a repaint never lands mid-frame.
     sync: SyncGate,
+    /// Focus-reporting mode (DECSET 1004), tracked out of band because `vt100`
+    /// does not model it.
+    focus: FocusReporting,
 }
 
 /// Renderer selection override, set from JS before `init()` via
@@ -233,7 +451,12 @@ impl TerminalState {
     /// # Parameters
     /// * `canvas_id` - HTML canvas element ID
     pub(crate) fn new(canvas_id: &str, cached: Option<(f64, f64)>) -> Result<Self, String> {
-        let parser = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
+        let parser = Parser::new_with_callbacks(
+            DEFAULT_ROWS,
+            DEFAULT_COLS,
+            SCROLLBACK_LEN,
+            TerminalCallbacks::default(),
+        );
 
         let win = ffi::window();
         let doc = if win != 0 {
@@ -329,9 +552,7 @@ impl TerminalState {
             origin_y: 0,
             scroll: ScrollState::new(),
             selection: SelectionState::new(),
-            prev_screen: None,
-            dirty_cells: Vec::new(),
-            full_redraw: true,
+            dirty: DirtyTracker::new(),
             prev_cursor: None,
             needs_render: false,
             csi_su_carry: Vec::new(),
@@ -339,6 +560,7 @@ impl TerminalState {
             cursor_style: CursorStyle::default(),
             blink_on: true,
             sync: SyncGate::new(),
+            focus: FocusReporting::new(),
         };
         if canvas_w > 0.0 && canvas_h > 0.0 {
             state.refit(
@@ -355,11 +577,6 @@ impl TerminalState {
         // Clamp the current scroll offset to the (possibly shrunken) history
         // before new bytes arrive, so we always stay within valid range.
         self.clamp_scroll();
-        // First batch: record the pre-processing screen so the first diff
-        // produces a sensible dirty set (full grid) instead of nothing.
-        if self.prev_screen.is_none() {
-            self.prev_screen = Some(self.parser.screen().clone());
-        }
         let normalized = normalize_save_restore(bytes, &mut self.csi_su_carry);
         let gated = self.sync.push(&normalized);
         self.feed_parser(gated);
@@ -373,6 +590,7 @@ impl TerminalState {
         let screen_before = self.parser.screen().alternate_screen();
 
         let feed = apply_decscusr(&gated, &mut self.dscsr_carry, &mut self.cursor_style);
+        let feed = self.focus.scan(&feed);
         if !feed.is_empty() {
             self.parser.process(&feed);
         }
@@ -390,8 +608,9 @@ impl TerminalState {
                 self.parser.screen_mut().set_scrollback(saved);
             }
         }
-
-        self.compute_dirty_cells();
+        // Dirty cells are intentionally *not* computed here: the diff runs at
+        // render time (see `render_canvas2d`), so a burst of WebSocket frames
+        // between two animation frames costs one diff, not one per frame.
     }
 
     /// Whether the sync gate is withholding bytes (an open `?2026` frame or
@@ -427,72 +646,7 @@ impl TerminalState {
 
     /// Mark every cell dirty so the next render is a full redraw.
     pub(crate) fn mark_all_dirty(&mut self) {
-        self.full_redraw = true;
-        self.dirty_cells.clear();
-    }
-
-    /// Compare the current screen against the previous one and record the
-    /// cells whose content or attributes changed. Also flags the wide
-    /// character partner, so a wide glyph is always redrawn as a unit.
-    fn compute_dirty_cells(&mut self) {
-        if self.full_redraw {
-            return;
-        }
-        let Some(prev) = self.prev_screen.clone() else {
-            self.full_redraw = true;
-            return;
-        };
-        let screen = self.parser.screen().clone();
-        let (prows, pcols) = screen.size();
-        let rows = if self.rows > 0 { self.rows } else { prows };
-        let cols = if self.cols > 0 { self.cols } else { pcols };
-        let mut dirty = Vec::new();
-        for row in 0..rows {
-            for col in 0..cols {
-                if Self::cell_changed(&prev, &screen, row, col) {
-                    dirty.push((row, col));
-                    // Wide character partner: redraw the other half too.
-                    if let Some(c) = screen.cell(row, col) {
-                        if c.is_wide() && col + 1 < cols {
-                            dirty.push((row, col + 1));
-                        } else if c.is_wide_continuation() && col > 0 {
-                            dirty.push((row, col - 1));
-                        }
-                    }
-                    // The previous screen's wide partner may also need a
-                    // redraw if the glyph changed or disappeared.
-                    if let Some(pc) = prev.cell(row, col) {
-                        if pc.is_wide() && col + 1 < cols {
-                            dirty.push((row, col + 1));
-                        } else if pc.is_wide_continuation() && col > 0 {
-                            dirty.push((row, col - 1));
-                        }
-                    }
-                }
-            }
-        }
-        dirty.sort_unstable();
-        dirty.dedup();
-        self.dirty_cells = dirty;
-        self.prev_screen = Some(screen);
-    }
-
-    /// Whether the cell at (`row`, `col`) differs between two screens.
-    fn cell_changed(a: &vt100::Screen, b: &vt100::Screen, row: u16, col: u16) -> bool {
-        match (a.cell(row, col), b.cell(row, col)) {
-            (Some(ca), Some(cb)) => {
-                ca.contents() != cb.contents()
-                    || ca.fgcolor() != cb.fgcolor()
-                    || ca.bgcolor() != cb.bgcolor()
-                    || ca.bold() != cb.bold()
-                    || ca.dim() != cb.dim()
-                    || ca.italic() != cb.italic()
-                    || ca.underline() != cb.underline()
-                    || ca.inverse() != cb.inverse()
-            }
-            (Some(_), None) | (None, Some(_)) => true,
-            (None, None) => false,
-        }
+        self.dirty.mark_all_dirty();
     }
 
     /// Returns the scroll offset for the currently active screen.
@@ -625,7 +779,14 @@ impl TerminalState {
                 _ => (u16::MAX, u16::MAX),
             };
             if let Some(w) = self.webgl.as_mut() {
-                return w.render(screen, DEFAULT_FG, DEFAULT_BG, &selection, cursor, style);
+                // The GL renderer rebuilds its instance buffer from the screen
+                // every frame, so the Canvas 2D dirty set is neither needed nor
+                // computed on this path. Nothing should have built one.
+                debug_assert!(
+                    self.dirty.dirty.is_empty(),
+                    "GL render path must not carry a Canvas 2D dirty set"
+                );
+                return w.render(screen, default_fg(), default_bg(), &selection, cursor, style);
             }
         }
         self.render_canvas2d()
@@ -656,14 +817,20 @@ impl TerminalState {
 
         let dpr = ffi::window_dpr(ffi::window());
 
+        // Compute the dirty set here, at render time: many WebSocket frames
+        // may have arrived since the last painted frame, and they coalesce
+        // into a single diff instead of one diff each. A pending full redraw
+        // (resize, scroll, selection, reset, first frame) skips the scan.
+        self.dirty.refresh(self.parser.screen(), rows, cols);
+
         // Full redraw when forced, or when enough of the grid changed that a
         // selective pass would cost more than just repainting everything.
         let total = (rows as usize).saturating_mul(cols as usize);
-        let dirty_count = self.dirty_cells.len();
-        let full = self.full_redraw || dirty_count >= total / 2;
-        self.full_redraw = false;
+        let dirty_count = self.dirty.dirty.len();
+        let full = self.dirty.full_redraw || dirty_count >= total / 2;
+        self.dirty.full_redraw = false;
 
-        let dirty = std::mem::take(&mut self.dirty_cells);
+        let dirty = std::mem::take(&mut self.dirty.dirty);
 
         ffi::ctx_set_transform(ctx, dpr.max(1.0), 0.0, 0.0, dpr.max(1.0), 0.0, 0.0);
 
@@ -695,7 +862,7 @@ impl TerminalState {
         let css_h = ffi::canvas_height(self.canvas) as f64 / dpr;
 
         // Clear to default background
-        ffi::ctx_set_fill_style(ctx, &css_color(DEFAULT_BG));
+        ffi::ctx_set_fill_style(ctx, &css_color(default_bg()));
         ffi::ctx_fill_rect(ctx, 0.0, 0.0, css_w.max(1.0), css_h.max(1.0));
         ffi::ctx_set_text_baseline(ctx, "middle");
 
@@ -738,7 +905,7 @@ impl TerminalState {
         let css_h = ffi::canvas_height(self.canvas) as f64 / dpr;
 
         // Clear entire canvas to default background
-        ffi::ctx_set_fill_style(ctx, &css_color(DEFAULT_BG));
+        ffi::ctx_set_fill_style(ctx, &css_color(default_bg()));
         ffi::ctx_fill_rect(ctx, 0.0, 0.0, css_w.max(1.0), css_h.max(1.0));
 
         // Cells to repaint: everything marked dirty, plus current and previous cursor cells
@@ -817,13 +984,13 @@ impl TerminalState {
             // Underline/bar: the cell itself was already painted normally
             // (it is always in the dirty set), so only the strip goes on
             // top, in the cell's own foreground color.
-            let (fg, _bg) = cell_visual(cell, DEFAULT_FG, DEFAULT_BG, CellOverride::Normal);
+            let (fg, _bg) = cell_visual(cell, default_fg(), default_bg(), CellOverride::Normal);
             ffi::ctx_set_fill_style(ctx, &css_color(fg));
             ffi::ctx_fill_rect(ctx, sx, sy, sw, sh);
             return Ok(Some((cr, cc)));
         }
         // Block: swap original fg/bg + glyph.
-        let (fg, bg) = cell_visual(cell, DEFAULT_FG, DEFAULT_BG, CellOverride::Cursor);
+        let (fg, bg) = cell_visual(cell, default_fg(), default_bg(), CellOverride::Cursor);
         ffi::ctx_set_fill_style(ctx, &css_color(bg));
         ffi::ctx_fill_rect(ctx, x, y, cw, ch);
         ffi::ctx_set_fill_style(ctx, &css_color(fg));
@@ -865,7 +1032,7 @@ impl TerminalState {
         let (x, y) = (ox + col as f64 * cw, oy + row as f64 * ch);
 
         // 1. Clear cell to default background
-        ffi::ctx_set_fill_style(ctx, &css_color(DEFAULT_BG));
+        ffi::ctx_set_fill_style(ctx, &css_color(default_bg()));
         ffi::ctx_fill_rect(ctx, x, y, cw, ch);
 
         let cell = if row < prows && col < pcols {
@@ -882,17 +1049,17 @@ impl TerminalState {
 
         // 2. Non-default background rect
         let base_bg = match cell {
-            Some(c) => color_to_rgb(c.bgcolor(), DEFAULT_BG),
-            _ => DEFAULT_BG,
+            Some(c) => color_to_rgb(c.bgcolor(), default_bg()),
+            _ => default_bg(),
         };
-        if base_bg != DEFAULT_BG && !selected {
+        if base_bg != default_bg() && !selected {
             ffi::ctx_set_fill_style(ctx, &css_color(base_bg));
             ffi::ctx_fill_rect(ctx, x, y, cw, ch);
         }
 
         // 3. Selection background rect (before text)
         if selected {
-            let (_fg, sel_bg) = cell_visual(cell, DEFAULT_FG, DEFAULT_BG, CellOverride::Selected);
+            let (_fg, sel_bg) = cell_visual(cell, default_fg(), default_bg(), CellOverride::Selected);
             ffi::ctx_set_fill_style(ctx, &css_color(sel_bg));
             ffi::ctx_fill_rect(
                 ctx,
@@ -907,8 +1074,8 @@ impl TerminalState {
         if let Some(c) = cell {
             let s = c.contents();
             if !s.is_empty() {
-                let (draw_fg, _bg) = cell_visual(Some(c), DEFAULT_FG, DEFAULT_BG, override_);
-                if draw_fg != DEFAULT_BG {
+                let (draw_fg, _bg) = cell_visual(Some(c), default_fg(), default_bg(), override_);
+                if draw_fg != default_bg() {
                     if draw_graphic_cell(ctx, x, y, cw, ch, s, draw_fg) {
                         return;
                     }
@@ -973,6 +1140,58 @@ impl TerminalState {
     /// Access the parser's screen.
     pub(crate) fn parser_screen(&self) -> &vt100::Screen {
         self.parser.screen()
+    }
+
+    /// Whether the application enabled bracketed paste (DECSET 2004).
+    pub(crate) fn bracketed_paste(&self) -> bool {
+        self.parser.screen().bracketed_paste()
+    }
+
+    /// Whether the application enabled focus reporting (DECSET 1004).
+    pub(crate) fn focus_reporting(&self) -> bool {
+        self.focus.enabled()
+    }
+
+    /// Take the pending bell flag, clearing it. A bell rings for `BEL` (0x07)
+    /// and the visual-bell escape; the page flashes when this returns true.
+    pub(crate) fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.parser.callbacks_mut().bell_pending)
+    }
+
+    /// The `OSC 8` hyperlink URI covering `(row, col)`, if any.
+    pub(crate) fn hyperlink_at(&self, row: u16, col: u16) -> Option<&str> {
+        hyperlink_at(&self.parser.callbacks().links, row, col)
+    }
+
+    /// Take the pending `OSC 52` clipboard payload (base64), clearing it.
+    pub(crate) fn take_clipboard(&mut self) -> Option<String> {
+        self.parser.callbacks_mut().clipboard.take()
+    }
+
+    /// Take the last `OSC 7` working directory URI, clearing it.
+    pub(crate) fn take_cwd(&mut self) -> Option<String> {
+        self.parser.callbacks_mut().cwd.take()
+    }
+
+    /// Take the last `OSC 133` prompt mark, clearing it.
+    pub(crate) fn take_prompt_mark(&mut self) -> Option<u8> {
+        self.parser.callbacks_mut().prompt_mark.take()
+    }
+
+    /// Snapshot the modes krust can report through `DECRQM`.
+    pub(crate) fn mode_report(&self) -> crate::query::ModeReport {
+        let sc = self.parser.screen();
+        crate::query::ModeReport {
+            application_cursor: sc.application_cursor(),
+            hide_cursor: sc.hide_cursor(),
+            bracketed_paste: sc.bracketed_paste(),
+            alternate_screen: sc.alternate_screen(),
+            focus_reporting: self.focus.enabled(),
+            mouse_tracking: !matches!(
+                sc.mouse_protocol_mode(),
+                vt100::MouseProtocolMode::None
+            ),
+        }
     }
 
     /// Access the selection start.
@@ -1133,33 +1352,98 @@ impl TerminalState {
     /// canvas, cell pitch and GL objects are all still valid — and the next
     /// `render` is a full redraw because `mark_all_dirty` forces one.
     pub(crate) fn reset(&mut self) {
-        self.parser = Parser::new(self.rows, self.cols, SCROLLBACK_LEN);
+        self.parser = Parser::new_with_callbacks(
+            self.rows,
+            self.cols,
+            SCROLLBACK_LEN,
+            TerminalCallbacks::default(),
+        );
         self.scroll = ScrollState::new();
         self.selection = SelectionState::new();
-        self.prev_screen = None;
+        self.dirty.reset_baseline();
         self.prev_cursor = None;
         self.csi_su_carry.clear();
         self.dscsr_carry.clear();
         self.cursor_style = CursorStyle::default();
         self.blink_on = true;
         self.sync.reset();
+        crate::color::reset_palette();
         self.mark_all_dirty();
     }
 
-    /// Reset only the previous screen state to None, forcing a full redraw
-    /// on the next `compute_dirty_cells()` call. This is useful after the
-    /// terminal has been hidden for a period, to ensure the dirty cell
-    /// mechanism starts with a fresh state rather than comparing against
-    /// stale state from before the hide.
+    /// Reset the diff baseline and force a full redraw on the next render.
+    /// This is useful after the terminal has been hidden for a period, to
+    /// ensure the dirty cell mechanism starts with a fresh state rather than
+    /// comparing against stale state from before the hide.
     pub(crate) fn reset_prev_screen(&mut self) {
-        self.prev_screen = None;
-        self.mark_all_dirty();
+        self.dirty.reset_baseline();
     }
 
     /// Whether the WebGL context has been lost, which leaves every GL object
     /// krust holds invalid until the renderer is rebuilt.
     pub(crate) fn webgl_is_lost(&self) -> bool {
         self.webgl.as_ref().is_some_and(renderer::WebGL2Renderer::is_lost)
+    }
+}
+
+/// The cells that differ between two screens, bounded to `rows` x `cols`.
+///
+/// A changed cell also flags its wide-character partner as dirty (in both the
+/// current and previous screen), so a wide glyph is always redrawn as a unit
+/// and a half-drawn partner can never be left behind. The result is sorted and
+/// deduplicated. Pure so it can be driven by host `vt100::Parser` instances.
+pub(crate) fn diff_screens(
+    prev: &vt100::Screen,
+    cur: &vt100::Screen,
+    rows: u16,
+    cols: u16,
+) -> Vec<(u16, u16)> {
+    let mut dirty = Vec::new();
+    for row in 0..rows {
+        for col in 0..cols {
+            if !cell_changed(prev, cur, row, col) {
+                continue;
+            }
+            dirty.push((row, col));
+            // Wide character partner: redraw the other half too.
+            if let Some(c) = cur.cell(row, col) {
+                if c.is_wide() && col + 1 < cols {
+                    dirty.push((row, col + 1));
+                } else if c.is_wide_continuation() && col > 0 {
+                    dirty.push((row, col - 1));
+                }
+            }
+            // The previous screen's wide partner may also need a redraw if the
+            // glyph changed or disappeared.
+            if let Some(pc) = prev.cell(row, col) {
+                if pc.is_wide() && col + 1 < cols {
+                    dirty.push((row, col + 1));
+                } else if pc.is_wide_continuation() && col > 0 {
+                    dirty.push((row, col - 1));
+                }
+            }
+        }
+    }
+    dirty.sort_unstable();
+    dirty.dedup();
+    dirty
+}
+
+/// Whether the cell at (`row`, `col`) differs between two screens.
+fn cell_changed(a: &vt100::Screen, b: &vt100::Screen, row: u16, col: u16) -> bool {
+    match (a.cell(row, col), b.cell(row, col)) {
+        (Some(ca), Some(cb)) => {
+            ca.contents() != cb.contents()
+                || ca.fgcolor() != cb.fgcolor()
+                || ca.bgcolor() != cb.bgcolor()
+                || ca.bold() != cb.bold()
+                || ca.dim() != cb.dim()
+                || ca.italic() != cb.italic()
+                || ca.underline() != cb.underline()
+                || ca.inverse() != cb.inverse()
+        }
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
     }
 }
 
@@ -1342,5 +1626,386 @@ mod resync_tests {
         replayed.process(stream);
         assert_eq!(screen_text(&replayed), "   X   X\n\n\n\n\n\n");
         assert_ne!(screen_text(&replayed), expected);
+    }
+}
+
+#[cfg(test)]
+mod diff_screens_tests {
+    use super::diff_screens;
+    use vt100::Parser;
+
+    #[test]
+    fn unchanged_screen_yields_no_dirty_cells() {
+        let mut a = Parser::new(4, 8, 0);
+        let mut b = Parser::new(4, 8, 0);
+        a.process(b"hello");
+        b.process(b"hello");
+        assert!(diff_screens(a.screen(), b.screen(), 4, 8).is_empty());
+    }
+
+    #[test]
+    fn changed_attributes_flag_the_cell() {
+        let mut a = Parser::new(4, 8, 0);
+        let mut b = Parser::new(4, 8, 0);
+        a.process(b"\x1b[1;1HA");
+        b.process(b"\x1b[31m\x1b[1;1HA");
+        let dirty = diff_screens(a.screen(), b.screen(), 4, 8);
+        assert_eq!(dirty, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn changed_glyph_and_position_are_listed() {
+        let mut a = Parser::new(4, 8, 0);
+        let mut b = Parser::new(4, 8, 0);
+        a.process(b"\x1b[1;1HAB");
+        b.process(b"\x1b[1;1HAX");
+        let dirty = diff_screens(a.screen(), b.screen(), 4, 8);
+        assert_eq!(dirty, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn wide_char_change_flags_both_halves() {
+        // A wide glyph newly written from a blank screen must list both the
+        // wide cell and its continuation cell, so neither half is left blank.
+        let a = Parser::new(4, 8, 0);
+        let mut b = Parser::new(4, 8, 0);
+        b.process("\u{4e2d}".as_bytes());
+        let dirty = diff_screens(a.screen(), b.screen(), 4, 8);
+        assert!(dirty.contains(&(0, 0)), "wide cell missing: {dirty:?}");
+        assert!(
+            dirty.contains(&(0, 1)),
+            "wide continuation missing: {dirty:?}"
+        );
+    }
+
+    #[test]
+    fn scanning_is_bounded_to_the_requested_grid() {
+        // The screen is 8 cols but we only ask about 2: a change in column 5
+        // must not appear, so a render never paints outside the fitted grid.
+        let a = Parser::new(4, 8, 0);
+        let mut b = Parser::new(4, 8, 0);
+        b.process(b"\x1b[1;6HX");
+        let dirty = diff_screens(a.screen(), b.screen(), 4, 2);
+        assert!(dirty.is_empty(), "out-of-grid change leaked: {dirty:?}");
+    }
+
+    #[test]
+    fn identical_parsers_produce_empty_diff_for_all_dirty() {
+        // Sanity: a full-screen change is just "every cell", which the caller
+        // can bypass entirely via `full_redraw`.
+        let mut a = Parser::new(2, 2, 0);
+        let mut b = Parser::new(2, 2, 0);
+        a.process(b"ab");
+        b.process(b"cd");
+        let dirty = diff_screens(a.screen(), b.screen(), 2, 2);
+        assert_eq!(dirty, vec![(0, 0), (0, 1)]);
+    }
+
+    /// Mirrors `DirtyTracker::refresh`'s take/clone bookkeeping: the stored
+    /// previous screen is diffed against the live one, and the retained
+    /// snapshot is the live screen, so the next diff is empty.
+    #[test]
+    fn prev_screen_take_bookkeeping_diffs_against_the_live_screen() {
+        let mut parser = Parser::new(4, 8, 0);
+        parser.process(b"seed");
+        let mut prev: Option<vt100::Screen> = Some(parser.screen().clone());
+
+        parser.process(b"\x1b[2;1Hnext");
+        let stored = prev.take().expect("previous screen present");
+        let dirty = diff_screens(&stored, parser.screen(), 4, 8);
+        prev = Some(parser.screen().clone());
+        assert_eq!(dirty, vec![(1, 0), (1, 1), (1, 2), (1, 3)]);
+
+        // No new output: diffing the retained snapshot against the live screen
+        // is empty, i.e. the diff is idempotent between renders.
+        let stored = prev.take().expect("previous screen present");
+        assert!(diff_screens(&stored, parser.screen(), 4, 8).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dirty_tracker_tests {
+    use super::DirtyTracker;
+    use vt100::Parser;
+
+    /// Model one render: refresh the diff, then clear the pending-full flag
+    /// exactly as `render_canvas2d` does.
+    fn settle(tracker: &mut DirtyTracker, screen: &vt100::Screen, rows: u16, cols: u16) {
+        tracker.refresh(screen, rows, cols);
+        tracker.full_redraw = false;
+    }
+
+    #[test]
+    fn first_frame_forces_full_redraw() {
+        let mut tracker = DirtyTracker::new();
+        let parser = Parser::new(4, 8, 0);
+        tracker.refresh(parser.screen(), 4, 8);
+        assert!(tracker.full_redraw);
+    }
+
+    /// The WebGL branch of `TerminalState::render` returns before
+    /// `render_canvas2d`, so it never calls `DirtyTracker::refresh`. Model that
+    /// path: a parser advancing with no refresh leaves the dirty set empty, so
+    /// GL rendering never pays for the Canvas 2D diff or its screen clone.
+    #[test]
+    fn gl_render_path_never_builds_a_canvas_dirty_set() {
+        let mut tracker = DirtyTracker::new();
+        let mut parser = Parser::new(4, 8, 0);
+        settle(&mut tracker, parser.screen(), 4, 8);
+
+        parser.process(b"gl output");
+        assert!(
+            tracker.dirty.is_empty(),
+            "GL path built a Canvas dirty set: {:?}",
+            tracker.dirty
+        );
+    }
+
+    #[test]
+    fn feeding_without_rendering_defers_the_diff() {
+        let mut tracker = DirtyTracker::new();
+        let mut parser = Parser::new(4, 8, 0);
+        settle(&mut tracker, parser.screen(), 4, 8);
+
+        // Several WebSocket frames arrive between two painted frames: the
+        // parser advances but the tracker is untouched.
+        parser.process(b"one ");
+        parser.process(b"two ");
+        assert!(
+            tracker.dirty.is_empty(),
+            "diff ran before render: {:?}",
+            tracker.dirty
+        );
+
+        // One render computes one diff covering every change so far.
+        tracker.refresh(parser.screen(), 4, 8);
+        assert_eq!(
+            tracker.dirty,
+            (0..8).map(|c| (0, c)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn refresh_is_idempotent_between_renders() {
+        let mut tracker = DirtyTracker::new();
+        let mut parser = Parser::new(4, 8, 0);
+        settle(&mut tracker, parser.screen(), 4, 8);
+
+        parser.process(b"x");
+        tracker.refresh(parser.screen(), 4, 8);
+        tracker.full_redraw = false;
+        assert!(!tracker.dirty.is_empty());
+
+        // No new output: the next render diffs to nothing.
+        tracker.refresh(parser.screen(), 4, 8);
+        assert!(tracker.dirty.is_empty());
+    }
+
+    #[test]
+    fn mark_all_dirty_forces_a_full_redraw_and_drops_the_diff() {
+        let mut tracker = DirtyTracker::new();
+        let mut parser = Parser::new(4, 8, 0);
+        settle(&mut tracker, parser.screen(), 4, 8);
+
+        parser.process(b"x");
+        tracker.refresh(parser.screen(), 4, 8);
+        tracker.full_redraw = false;
+
+        tracker.mark_all_dirty();
+        assert!(tracker.full_redraw);
+        assert!(tracker.dirty.is_empty());
+    }
+
+    #[test]
+    fn reset_baseline_forces_full_redraw_and_drops_the_baseline() {
+        let mut tracker = DirtyTracker::new();
+        let mut parser = Parser::new(4, 8, 0);
+        settle(&mut tracker, parser.screen(), 4, 8);
+
+        parser.process(b"x");
+        tracker.refresh(parser.screen(), 4, 8);
+        tracker.reset_baseline();
+        assert!(tracker.full_redraw);
+        assert!(tracker.prev_screen.is_none());
+    }
+}
+
+#[cfg(test)]
+mod bracketed_paste_tests {
+    use super::bracketed_paste_bytes;
+
+    #[test]
+    fn wraps_paste_when_bracketed_paste_is_enabled() {
+        let bytes = bracketed_paste_bytes("a\nb", true);
+        assert_eq!(bytes, b"\x1b[200~a\nb\x1b[201~");
+    }
+
+    #[test]
+    fn passes_paste_through_when_disabled() {
+        assert_eq!(bracketed_paste_bytes("a\nb", false), b"a\nb");
+    }
+
+    #[test]
+    fn empty_paste_is_wrapped_when_enabled() {
+        assert_eq!(bracketed_paste_bytes("", true), b"\x1b[200~\x1b[201~");
+        assert!(bracketed_paste_bytes("", false).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bell_tests {
+    use super::{Parser, TerminalCallbacks};
+
+    fn bell_parser() -> Parser<TerminalCallbacks> {
+        Parser::new_with_callbacks(4, 8, 0, TerminalCallbacks::default())
+    }
+
+    #[test]
+    fn bel_rings_and_taking_clears_it() {
+        let mut p = bell_parser();
+        assert!(!p.callbacks().bell_pending);
+        p.process(b"\x07");
+        assert!(p.callbacks().bell_pending);
+        assert!(std::mem::take(&mut p.callbacks_mut().bell_pending));
+        assert!(!p.callbacks().bell_pending);
+    }
+
+    #[test]
+    fn visual_bell_escape_rings_too() {
+        let mut p = bell_parser();
+        p.process(b"hello\x1bg");
+        assert!(p.callbacks().bell_pending);
+    }
+
+    #[test]
+    fn bel_inside_osc_terminated_string_does_not_ring() {
+        // OSC 2 ... BEL sets the title; the BEL terminates the string rather
+        // than ringing, and vt100 does not invoke the bell callback for it.
+        let mut p = bell_parser();
+        p.process(b"\x1b]2;title\x07");
+        assert!(!p.callbacks().bell_pending);
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::{hyperlink_at, link_contains, LinkSpan, Parser, TerminalCallbacks};
+
+    fn link_parser() -> Parser<TerminalCallbacks> {
+        Parser::new_with_callbacks(6, 20, 0, TerminalCallbacks::default())
+    }
+
+    #[test]
+    fn osc8_open_records_link_over_following_cells() {
+        let mut p = link_parser();
+        p.process(b"\x1b]8;;http://example.com\x1b\\AB\x1b]8;;\x1b\\");
+        let links = &p.callbacks().links;
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].uri, "http://example.com");
+        assert_eq!(links[0].start, (0, 0));
+        assert_eq!(links[0].end, (0, 2));
+        assert_eq!(hyperlink_at(links, 0, 0), Some("http://example.com"));
+        assert_eq!(hyperlink_at(links, 0, 1), Some("http://example.com"));
+        assert_eq!(hyperlink_at(links, 0, 2), None);
+    }
+
+    #[test]
+    fn osc8_close_without_open_records_nothing() {
+        let mut p = link_parser();
+        p.process(b"\x1b]8;;\x1b\\");
+        assert!(p.callbacks().links.is_empty());
+    }
+
+    #[test]
+    fn osc8_double_open_closes_previous() {
+        let mut p = link_parser();
+        p.process(b"\x1b]8;;http://a\x1b\\X\x1b]8;;http://b\x1b\\Y\x1b]8;;\x1b\\");
+        let links = &p.callbacks().links;
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].uri, "http://a");
+        assert_eq!(links[1].uri, "http://b");
+    }
+
+    #[test]
+    fn link_contains_handles_wrapped_rows() {
+        let span = LinkSpan {
+            uri: "u".into(),
+            start: (1, 5),
+            end: (3, 2),
+        };
+        assert!(!link_contains(&span, 0, 5));
+        assert!(link_contains(&span, 1, 5));
+        assert!(!link_contains(&span, 1, 4));
+        assert!(link_contains(&span, 2, 0));
+        assert!(link_contains(&span, 2, 19));
+        assert!(link_contains(&span, 3, 1));
+        assert!(!link_contains(&span, 3, 2));
+        assert!(!link_contains(&span, 4, 0));
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::{Parser, TerminalCallbacks};
+
+    fn clip_parser() -> Parser<TerminalCallbacks> {
+        Parser::new_with_callbacks(4, 20, 0, TerminalCallbacks::default())
+    }
+
+    #[test]
+    fn osc52_copy_is_captured_as_base64() {
+        let mut p = clip_parser();
+        p.process(b"\x1b]52;c;aGVsbG8=\x1b\\");
+        assert_eq!(p.callbacks().clipboard.as_deref(), Some("aGVsbG8="));
+    }
+
+    #[test]
+    fn osc52_paste_request_sets_no_clipboard() {
+        let mut p = clip_parser();
+        p.process(b"\x1b]52;c;?\x1b\\");
+        assert_eq!(p.callbacks().clipboard, None);
+    }
+}
+
+#[cfg(test)]
+mod dynamic_color_tests {
+    use super::{Parser, TerminalCallbacks};
+
+    #[test]
+    fn osc4_through_the_parser_updates_the_palette() {
+        crate::color::reset_palette();
+        let mut p = Parser::new_with_callbacks(2, 8, 0, TerminalCallbacks::default());
+        p.process(b"\x1b]4;2;#abcdef\x1b\\");
+        assert_eq!(crate::color::resolved_indexed(2), 0xabcdef);
+        crate::color::reset_palette();
+        assert_eq!(crate::color::resolved_indexed(2), 0x00CD00);
+    }
+}
+
+#[cfg(test)]
+mod shell_integration_tests {
+    use super::{Parser, TerminalCallbacks};
+
+    fn parser() -> Parser<TerminalCallbacks> {
+        Parser::new_with_callbacks(4, 20, 0, TerminalCallbacks::default())
+    }
+
+    #[test]
+    fn osc7_records_the_working_directory_uri() {
+        let mut p = parser();
+        p.process(b"\x1b]7;file://host/home/user\x1b\\");
+        assert_eq!(
+            p.callbacks().cwd.as_deref(),
+            Some("file://host/home/user")
+        );
+    }
+
+    #[test]
+    fn osc133_records_prompt_marks() {
+        let mut p = parser();
+        p.process(b"\x1b]133;A\x1b\\");
+        assert_eq!(p.callbacks().prompt_mark, Some(b'A'));
+        p.process(b"\x1b]133;D;0\x1b\\");
+        assert_eq!(p.callbacks().prompt_mark, Some(b'D'));
     }
 }

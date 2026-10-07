@@ -56,3 +56,58 @@ fault.
 - Browser: Canvas 2D and WebGL2 both paint the prompt against the real server.
 - `cargo test -p krust` (32) and `-p terminal-client` (80) green; krust clippy
   clean; only untouched files remain rustfmt-check-failing (pre-existing).
+
+## Keyboard protocol limitations (deliberate)
+
+Unlike the rendering/parsing issues above, these are scoped-out features, not
+bugs.
+
+- **Kitty keyboard protocol (`CSI ? u`):** the query is answered with flags
+  `0` ("legacy keys only"). `key_to_bytes` maps the classic xterm sequences and
+  does not implement progressive enhancement or key event types, so advertising
+  anything else would be a lie. TUIs that probe for kitty keys fall back to
+  legacy input (or to their `modifyOtherKeys` path).
+- **`modifyOtherKeys` (`CSI > 4 ; m`):** unsupported. XTGETTCAP `km` is still
+  advertised (matching xterm) so capability probes do not stall, but the mode
+  is not tracked and does not alter `key_to_bytes`. Modified keys that rely on
+  it (Ctrl+Shift+letter and friends) arrive as their base sequence.
+
+Making either real means tracking the mode in `TerminalState` (the same pattern
+used for bracketed paste / focus reporting) and consulting it when encoding a
+key press; there is no framework in the way.
+
+## Audit remediation (2026-10): performance, GL, standards
+
+Derived from `AUDIT.md` (see `TASKS.md` phases 0-4). Three themes:
+
+### 1. Paste / live-output stall (critical)
+
+`compute_dirty_cells` ran on every WebSocket frame and cloned the whole
+`vt100::Screen` twice (scrollback included) to build a dirty set the WebGL
+renderer never reads. At 1 KB PTY reads a 1 MB paste was ~1000 frames ×
+~400k cell copies. Fixes: the diff (`diff_screens`) is computed **at render
+time** by `DirtyTracker`, the WebGL path skips it entirely, the remaining clone
+is avoided with `prev_screen.take()`, the server PTY read buffer is 16 KiB, and
+the client paste throttle is gone (one frame per paste). The server also now
+blocks on the PTY write lock (`pty_write_locked`) instead of `try_lock`-and-drop.
+
+### 2. WebGL2 renderer waste (high)
+
+Per-frame full-grid rebuild/re-upload, a background quad per cell, per-frame
+glyph hashing, and per-frame attribute lookups. Fixes: default-background cells
+emit no bg quad and blank cells no text quad; needed codepoints are collected
+into a set and `plan_missing` dedups with a set; the 256-entry ASCII UV LUT
+skips the range scan; `graphic_cell_rects` returns a fixed-size array instead of
+allocating; attribute locations are cached (`AttrLocations`); instance scratch
+buffers are reused; the selection `HashSet` is skipped when empty; and only the
+changed instance span is re-uploaded with `bufferSubData`.
+
+### 3. Terminal standards (medium)
+
+Added bracketed paste (`?2004`), focus reporting (`?1004`), bell, `OSC 8`
+hyperlinks (ctrl/cmd-click opens), `OSC 52` clipboard (opt-in via
+`?clipboard=1`), dynamic colors (`OSC 4`/`10`/`11`, with the `OSC 11` query
+reply kept consistent), `DECRQM` + `DA3`, and `OSC 7`/`OSC 133` shell
+integration. All of these live in `TerminalCallbacks` / small scanners and are
+host-unit-tested; the palette overrides are thread-local in `color.rs` and reset
+by `reset_terminal`.

@@ -12,6 +12,8 @@
         #scrollbar.hidden { visibility: hidden; pointer-events: none; }
         #scrollbar:hover, body.scrolling #scrollbar { opacity: 1; }
         #scrollbar-thumb { position: absolute; left: 1px; right: 1px; border-radius: 4px; background: rgba(255,255,255,0.4); }
+        canvas.bell { animation: bell-flash 0.15s ease-out; }
+        @keyframes bell-flash { from { filter: brightness(2.2); } to { filter: brightness(1); } }
     </style>
 </head>
 <body>
@@ -35,6 +37,8 @@
                 scroll, scroll_to, scroll_to_bottom, scroll_to_top,
                 scroll_offset, scrollback_len, is_alt_screen, grid_metrics, version,
                 mouse_event, mouse_tracking, application_cursor,
+                paste_bytes, focus_reporting, take_bell, hyperlink_at, take_clipboard,
+                take_cwd, take_prompt_mark,
                 free_memory, free_string, free_result, alloc, dealloc } = wasm.instance.exports;
 
         // WASM memory. Views are constructed fresh from mem.buffer on every
@@ -122,6 +126,10 @@
         const params = new URLSearchParams(location.search);
         const sid = params.get('s') || params.get('session') || (Math.random().toString(36).substring(2, 6));
         const startDir = params.get('dir');
+        // OSC 52 lets an application replace the system clipboard, which is a
+        // security-sensitive capability (a hostile program could clobber a
+        // password you just copied). It stays off unless explicitly enabled.
+        const clipboardOptIn = params.get('clipboard') === '1';
 
         const reflected = params.get('s') || params.get('session');
         if (reflected !== sid) {
@@ -190,6 +198,7 @@
         });
 
         let lastTitle = 'krust | terminal';
+        let lastCwd = '';
         let lastRenderTime = 0;
 
         // Full repaint of everything when the tab comes back. `repaint` is
@@ -205,8 +214,39 @@
             try { repaint(); } catch (_) {}
         }
 
+        // Focus in/out reports (DECSET 1004). Sent as ESC[I / ESC[O only when
+        // the running app asked for them; harmless otherwise.
+        function sendFocusReport(focused) {
+            try {
+                if (focus_reporting() !== 1) return;
+            } catch (_) {
+                return;
+            }
+            if (ws && ws.readyState === 1) {
+                ws.send(new TextEncoder().encode(focused ? '\x1b[I' : '\x1b[O'));
+            }
+        }
+        window.addEventListener('blur', () => sendFocusReport(false));
+
+        // Visual bell: a brief brightness flash when the app rings BEL (0x07)
+        // or sends the visual-bell escape. No audio by default — browsers
+        // block autoplay and an uninvited beep is worse than silence.
+        let bellTimer = null;
+        function flashBell() {
+            if (!canvas) return;
+            canvas.classList.remove('bell');
+            void canvas.offsetWidth; // restart the animation on rapid bells
+            canvas.classList.add('bell');
+            if (bellTimer) clearTimeout(bellTimer);
+            bellTimer = setTimeout(() => {
+                canvas.classList.remove('bell');
+                bellTimer = null;
+            }, 200);
+        }
+
         window.addEventListener('focus', () => {
             document.title = lastTitle;
+            sendFocusReport(true);
             fit();
             const now = performance.now();
             if (now - lastRenderTime > 32) {
@@ -499,26 +539,41 @@
         const proto = location.protocol === 'https:' ? 'wss' : 'ws';
         const st = params.get('selftest');
         if (st) {
-            const rows = parseInt(st, 10);
-            const line = new TextEncoder().encode('X'.repeat(80) + '\n');
-            const chunk = new Uint8Array(line.length * rows);
-            for (let i = 0; i < rows; i++) chunk.set(line, i * line.length);
-            const t0 = performance.now();
-            let mx = 0, sum = 0, N = 0;
-            for (let off = 0; off < chunk.length; off += 1024) {
-                const t = performance.now();
-                const sub = chunk.subarray(off, Math.min(off + 1024, chunk.length));
-                const subPtr = alloc(sub.length);
-                new Uint8Array(mem.buffer, subPtr, sub.length).set(sub);
-                const summaryPtr = process_bytes(subPtr, sub.length);
-                dealloc(subPtr, sub.length);
-                if (summaryPtr !== 0) free_result(summaryPtr);
-                scheduleRender();
-                const dt = performance.now() - t;
-                if (dt > mx) mx = dt;
-                sum += dt; N++;
-            }
-            console.log('SELFTEST', JSON.stringify({ rows, gridRows, gridCols, innerW: window.innerWidth, innerH: window.innerHeight, dpr: window.devicePixelRatio, N, maxMs: mx, avgMs: sum / N, wallMs: performance.now() - t0, bytesIn: bytesIn, scrollbackLen: scrollback_len(), offset: scroll_offset() }));
+            // Regression harness for the per-frame `process_bytes` cost: feed a
+            // synthetic trace in 1024-byte chunks (the server's old PTY read
+            // size) and report max/avg ms alongside the scrollback that built
+            // up. Run it at the requested size and at 10x that, because the
+            // cost used to scale with scrollback — the second run must not be
+            // dramatically slower than the first once the clone-per-frame bug
+            // is fixed. `firstMs`/`lastMs` show growth within a single trace.
+            const runSelftest = (rows) => {
+                const line = new TextEncoder().encode('X'.repeat(80) + '\n');
+                const chunk = new Uint8Array(line.length * rows);
+                for (let i = 0; i < rows; i++) chunk.set(line, i * line.length);
+                const t0 = performance.now();
+                let mx = 0, sum = 0, N = 0, firstMs = 0, lastMs = 0;
+                for (let off = 0; off < chunk.length; off += 1024) {
+                    const t = performance.now();
+                    const sub = chunk.subarray(off, Math.min(off + 1024, chunk.length));
+                    const subPtr = alloc(sub.length);
+                    new Uint8Array(mem.buffer, subPtr, sub.length).set(sub);
+                    const summaryPtr = process_bytes(subPtr, sub.length);
+                    dealloc(subPtr, sub.length);
+                    if (summaryPtr !== 0) free_result(summaryPtr);
+                    scheduleRender();
+                    const dt = performance.now() - t;
+                    if (N === 0) firstMs = dt;
+                    lastMs = dt;
+                    if (dt > mx) mx = dt;
+                    sum += dt; N++;
+                }
+                console.log('SELFTEST', JSON.stringify({ rows, gridRows, gridCols, innerW: window.innerWidth, innerH: window.innerHeight, dpr: window.devicePixelRatio, N, maxMs: mx, avgMs: sum / N, firstMs, lastMs, wallMs: performance.now() - t0, bytesIn: bytesIn, scrollbackLen: scrollback_len(), offset: scroll_offset() }));
+            };
+            const base = Math.max(1, parseInt(st, 10) || 200);
+            // Reset parser state between runs so the second trace starts from
+            // a clean screen but the scrollback comparison stays honest.
+            runSelftest(base);
+            runSelftest(base * 10);
         }
 
         // Route one inbound WebSocket payload. Control frames arrive as text;
@@ -600,6 +655,40 @@
                 } catch (_) {}
             }
             benchSample(performance.now() - t0);
+            try { if (take_bell() === 1) flashBell(); } catch (_) {}
+            // OSC 52: honour an application clipboard request only when the
+            // user opted in via ?clipboard=1. Always drain it so a disabled
+            // clipboard never accumulates payloads.
+            try {
+                const b64 = callStringExport(take_clipboard);
+                if (b64 && clipboardOptIn) {
+                    const bin = atob(b64);
+                    const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+                    navigator.clipboard
+                        .writeText(new TextDecoder().decode(bytes))
+                        .then(() => showStatus('clipboard set'), () => {});
+                }
+            } catch (_) {}
+            // OSC 7 shell integration: remember the cwd so the tab title can
+            // fall back to it when the app sets no OSC 2 title. OSC 133 prompt
+            // marks are drained here for future jump-to-prompt support.
+            try {
+                const cwd = callStringExport(take_cwd);
+                if (cwd) {
+                    lastCwd = cwd;
+                    const title = extractTitle(inData);
+                    if (!title) {
+                        let name = cwd;
+                        try {
+                            const path = new URL(cwd).pathname.replace(/\/+$/, '');
+                            name = path.slice(path.lastIndexOf('/') + 1) || '/';
+                        } catch (_) {}
+                        lastTitle = name + ' | terminal';
+                        document.title = lastTitle;
+                    }
+                }
+            } catch (_) {}
+            try { take_prompt_mark(); } catch (_) {}
             curScroll = scroll_offset();
             updateScrollbar();
             const title = extractTitle(inData);
@@ -621,7 +710,7 @@
                 const p = params.get('paste');
                 if (p) {
                     const unit = 'X'.repeat(1024) + '\n';
-                    sendPaste(unit.repeat(parseInt(p, 10)), params.get('via') === 'fast');
+                    sendPaste(unit.repeat(parseInt(p, 10)));
                 }
                 const b = params.get('bench');
                 if (b) {
@@ -730,20 +819,24 @@
             }
         });
 
-        const PASTE_CHUNK = 4096;
-        const PASTE_INTERVAL_MS = 16;
-        function sendPaste(text, force) {
+        // Paste goes out as a single frame. WebSocket/TCP already provide flow
+        // control, so interposing a timer only costs time: the old 4 KB-per-16 ms
+        // throttle stretched a 1 MB paste to roughly four seconds. The wrapper
+        // (ESC[200~/ESC[201~) is applied by the wasm module when the app enabled
+        // bracketed paste, so embedded newlines are inserted literally.
+        function sendPaste(text) {
             const data = new TextEncoder().encode(text);
             if (data.length === 0) return;
-            let i = 0;
-            const push = () => {
-                if (!ws || ws.readyState !== 1) return;
-                ws.send(data.slice(i, i + PASTE_CHUNK));
-                i += PASTE_CHUNK;
-                if (i < data.length && !force) setTimeout(push, PASTE_INTERVAL_MS);
-                else if (i < data.length) push();
-            };
-            push();
+            const textPtr = alloc(data.length);
+            new Uint8Array(mem.buffer, textPtr, data.length).set(data);
+            const bytesPtr = paste_bytes(textPtr, data.length);
+            dealloc(textPtr, data.length);
+            if (bytesPtr === 0) return;
+            const { dataPtr, dataLen, boxPtr } = exportBoxedPair(bytesPtr);
+            const bytes = readBytesCopy(dataPtr, dataLen);
+            free_memory(dataPtr, dataLen);
+            free_result(boxPtr);
+            if (bytes.length > 0 && ws && ws.readyState === 1) ws.send(bytes);
         }
 
         window.addEventListener('paste', (e) => {
@@ -813,6 +906,16 @@
             if (e.button > 2) return; // back/forward buttons: not reported, no selection
             if (scrollbarEl.contains(e.target)) return; // the scrollbar owns its own drag
             const cell = cellFromPoint(e.clientX, e.clientY);
+            if ((isMac ? e.metaKey : e.ctrlKey) && e.button === 0) {
+                // OSC 8: modifier-click opens the hyperlink under the cursor
+                // instead of reporting the click to the app.
+                const uri = callStringExport(hyperlink_at, cell.row, cell.col);
+                if (uri) {
+                    e.preventDefault();
+                    window.open(uri, '_blank', 'noopener,noreferrer');
+                    return;
+                }
+            }
             if (mouse_tracking() === 1 && !forceNativeSelection(e)) {
                 e.preventDefault();
                 mousePhase = 'capture';
@@ -829,6 +932,10 @@
 
         window.addEventListener('mousemove', (e) => {
             const cell = cellFromPoint(e.clientX, e.clientY);
+            // Show a pointer over OSC 8 links while the open modifier is held.
+            const modLink = isMac ? e.metaKey : e.ctrlKey;
+            canvas.style.cursor =
+                modLink && callStringExport(hyperlink_at, cell.row, cell.col) ? 'pointer' : '';
             if (mousePhase === 'capture') {
                 // Report motion only while a button is actually held; the
                 // protocol filter in wasm drops it if the app did not ask

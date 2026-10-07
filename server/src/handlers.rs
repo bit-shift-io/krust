@@ -17,7 +17,7 @@ use tokio::sync::broadcast;
 
 use crate::replay::replay_image;
 use crate::session::{
-    binary_chunks, get_or_create_session, pty_size, pty_write, AppState, History, MirrorArc,
+    binary_chunks, get_or_create_session, pty_size, pty_write_locked, AppState, History, MirrorArc,
     StreamOffset,
 };
 
@@ -479,9 +479,7 @@ async fn handle_socket(
                         ClientMessage::Input { data } => {
                             let writer = writer.clone();
                             let _ = tokio::task::spawn_blocking(move || {
-                                if let Ok(mut w) = writer.try_lock() {
-                                    let _ = pty_write(&mut *w, data.as_bytes());
-                                }
+                                let _ = pty_write_locked(&writer, data.as_bytes());
                             })
                             .await;
                         }
@@ -510,9 +508,7 @@ async fn handle_socket(
                 // Raw PTY input: no JSON framing, bytes go straight to the shell.
                 let writer = writer.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    if let Ok(mut w) = writer.try_lock() {
-                        let _ = pty_write(&mut *w, &bytes);
-                    }
+                    let _ = pty_write_locked(&writer, &bytes);
                 })
                 .await;
             }

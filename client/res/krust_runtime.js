@@ -157,6 +157,10 @@ window.KRUST_RUNTIME = (function () {
     krust_gl_buffer_data_f32: (gl, target, ptr, count, usage) => {
       getObject(gl).bufferData(target, f32view(ptr, count), usage);
     },
+    krust_gl_buffer_sub_data_f32: (gl, target, offset, ptr, count) => {
+      const glObj = getObject(gl);
+      glObj.bufferSubData(target, offset * 4, f32view(ptr, count));
+    },
     krust_gl_create_texture: (gl) => addObject(getObject(gl).createTexture()),
     krust_gl_bind_texture: (gl, target, tex) => {
       getObject(gl).bindTexture(target, getObject(tex));

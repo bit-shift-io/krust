@@ -10,9 +10,9 @@ use std::os::raw::c_char;
 use crate::ffi;
 use crate::input::map_key;
 use crate::measure::measure_cell_dimensions;
-use crate::query::collect_query_replies;
+use crate::query::collect_query_replies_with_modes;
 use crate::selection::extract_selection;
-use crate::state::{TerminalState, TERM_STATE};
+use crate::state::{bracketed_paste_bytes, TerminalState, TERM_STATE};
 
 // --- Minimal JSON support -------------------------------------------------
 //
@@ -289,7 +289,13 @@ pub extern "C" fn query_replies(bytes_ptr: *const u8, bytes_len: usize) -> *mut 
         match state {
             Ok(s) => {
                 let (row, col) = s.parser_screen().cursor_position();
-                Ok(collect_query_replies(bytes, row as usize, col as usize))
+                let modes = s.mode_report();
+                Ok(collect_query_replies_with_modes(
+                    bytes,
+                    row as usize,
+                    col as usize,
+                    &modes,
+                ))
             }
             Err(_) => Err(()),
         }
@@ -432,10 +438,10 @@ pub extern "C" fn handle_resize(width: i32, height: i32) {
     });
 }
 
-/// Reset the previous screen state to None, forcing a full redraw on the
-/// next `compute_dirty_cells()` call. This is useful after the terminal has
-/// been hidden for a period, to ensure the dirty cell mechanism starts with a
-/// fresh state rather than comparing against stale state from before the hide.
+/// Reset the diff baseline, forcing a full redraw on the next render. This is
+/// useful after the terminal has been hidden for a period, to ensure the dirty
+/// cell mechanism starts with a fresh state rather than comparing against
+/// stale state from before the hide.
 #[no_mangle]
 pub extern "C" fn reset_prev_screen() {
     TERM_STATE.with(|cell| {
@@ -718,6 +724,129 @@ pub extern "C" fn application_cursor() -> i32 {
             .map(|s| i32::from(s.parser_screen().application_cursor()))
             .unwrap_or(0)
     })
+}
+
+/// Whether the application enabled bracketed paste (DECSET 2004).
+///
+/// The page asks this when pasting so it can wrap the payload in `ESC[200~`
+/// / `ESC[201~`; the state lives on the parsed screen, so it is always current.
+#[no_mangle]
+pub extern "C" fn bracketed_paste() -> i32 {
+    TERM_STATE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|s| i32::from(s.bracketed_paste()))
+            .unwrap_or(0)
+    })
+}
+
+/// Whether the application enabled focus reporting (DECSET 1004).
+///
+/// The page sends `ESC[I` on focus and `ESC[O` on blur when this is 1.
+#[no_mangle]
+pub extern "C" fn focus_reporting() -> i32 {
+    TERM_STATE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|s| i32::from(s.focus_reporting()))
+            .unwrap_or(0)
+    })
+}
+
+/// Take the pending bell flag (1 if a bell rang since the last call).
+///
+/// The page calls this after feeding PTY bytes; a 1 triggers a short flash.
+#[no_mangle]
+pub extern "C" fn take_bell() -> i32 {
+    TERM_STATE.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .map(|s| i32::from(s.take_bell()))
+            .unwrap_or(0)
+    })
+}
+
+/// Take the pending `OSC 7` working directory URI ("" if none).
+///
+/// The page can use this to keep the tab title or a "new tab here" action in
+/// sync with the shell; krust itself never changes the PTY's directory.
+#[no_mangle]
+pub extern "C" fn take_cwd() -> *mut u8 {
+    let cwd = TERM_STATE.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .and_then(|s| s.take_cwd())
+            .unwrap_or_default()
+    });
+    let (ptr, len) = write_string_to_wasm(cwd);
+    return_pair(ptr as *mut u8, len)
+}
+
+/// Take the last `OSC 133` prompt mark as its ASCII byte (0 if none).
+///
+/// `A` prompt start, `B` prompt end, `C` command start, `D` command end.
+#[no_mangle]
+pub extern "C" fn take_prompt_mark() -> i32 {
+    TERM_STATE.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .and_then(|s| s.take_prompt_mark())
+            .map(i32::from)
+            .unwrap_or(0)
+    })
+}
+
+/// Take the pending `OSC 52` clipboard payload as base64 ("" if none).
+///
+/// The page decodes it with `atob` and writes it to the system clipboard only
+/// when the user opted in; krust never writes the clipboard on its own.
+#[no_mangle]
+pub extern "C" fn take_clipboard() -> *mut u8 {
+    let payload = TERM_STATE.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .and_then(|s| s.take_clipboard())
+            .unwrap_or_default()
+    });
+    let (ptr, len) = write_string_to_wasm(payload);
+    return_pair(ptr as *mut u8, len)
+}
+
+/// The `OSC 8` hyperlink URI covering a cell, or "" if none.
+///
+/// The page calls this on hover and on ctrl/cmd-click, using the same cell
+/// coordinates it gets from `handle_click`.
+#[no_mangle]
+pub extern "C" fn hyperlink_at(row: i32, col: i32) -> *mut u8 {
+    let uri = TERM_STATE.with(|cell| {
+        let state = cell.borrow();
+        state
+            .as_ref()
+            .and_then(|s| s.hyperlink_at(row.max(0) as u16, col.max(0) as u16))
+            .unwrap_or("")
+            .to_string()
+    });
+    let (ptr, len) = write_string_to_wasm(uri);
+    return_pair(ptr as *mut u8, len)
+}
+
+/// Wrap pasted text for the PTY according to the app's bracketed-paste mode.
+///
+/// Reads the current mode from the terminal state and returns the bytes to
+/// send as a (ptr, len) pair (caller must free).
+#[no_mangle]
+pub extern "C" fn paste_bytes(text_ptr: *const u8, text_len: usize) -> *mut u8 {
+    let text = unsafe {
+        std::str::from_utf8(std::slice::from_raw_parts(text_ptr, text_len)).unwrap_or("")
+    };
+    let enabled = TERM_STATE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|s| s.bracketed_paste())
+            .unwrap_or(false)
+    });
+    let (ptr, len) = write_bytes_to_wasm(bracketed_paste_bytes(text, enabled));
+    return_pair(ptr, len)
 }
 
 /// Map a browser keyboard event to raw PTY bytes.
