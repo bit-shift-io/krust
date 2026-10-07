@@ -376,23 +376,6 @@ server (before first PTY read) or in the shell (before first write). A
 boot-time pre-warm of the default session was tried as a workaround and
 reverted by request; it is the current fallback option if this is ever
 prioritized.
-
-### Keyboard protocol limitations (deliberate)
-
-**`CSI ? u` (kitty keyboard protocol query)** is answered with flags `0`:
-"legacy keys only". That is truthful — `key_to_bytes` emits the classic
-xterm sequences and does not implement progressive enhancement / key event
-types — but it means modern TUIs that would otherwise opt into the kitty
-protocol (Neovim, some shells/fzf builds) fall back to legacy keys or their
-own `modifyOtherKeys` path.
-
-**`CSI > 4 ; m` (modifyOtherKeys)** is *not* implemented. The XTGETTCAP `km`
-capability is still advertised as `ESC[>4;m`, matching xterm, but the
-terminal does not act on the sequences. Apps that depend on
-`modifyOtherKeys` for disambiguating modified keys (e.g. Ctrl+Shift+letter)
-will see the plain key. Implementing it requires tracking the *current* mode
-in `TerminalState` and consulting it in `key_to_bytes`; both are additions,
-not bugs in the current mapping.
 | `AGENTS.md` | Shared agent context and conventions |
 | `TASKS.md` | Implementation roadmap |
 | `NOTES.md` | Design rationale and decisions |

@@ -53,9 +53,9 @@ performance claims were re-verified with the in-repo harness after the fix.
   dynamic colors (`OSC 4`/`10`/`11`, query reply kept consistent), `DECRQM`,
   `DA3`, and `OSC 7`/`OSC 133` shell integration all implemented.
 - **Finding 4 (docs/complexity, LOW) — documented.** `renderer.rs`/`state.rs`/
-  `server.html` remain large but cohesive; split left optional. The kitty
-  keyboard / `modifyOtherKeys` limitation is now written up in `ARCHITECTURE.md`
-  (§9) and `NOTES.md`.
+  `server.html` remain large but cohesive; split left optional. (The interim
+  "kitty disabled" write-up in §9/`NOTES.md` was removed again: `map_key` does
+  emit kitty-style `CSI u` input, so the "legacy keys only" claim was wrong.)
 - **Tests:** `cargo test --workspace` = 164 client + 33 server, all green;
   render regression checks pass on both `?r=2d` and `?r=gl`.
 
@@ -147,7 +147,7 @@ and re-upload the entire grid every frame regardless of what changed:
 | **Bell** (`BEL 0x07`) | Missing | No audible/visual bell. |
 | **Dynamic colors** (`OSC 4`, `OSC 10/11/12` sets) | Partial | `OSC 11` is *queried* and answered with a constant (`query.rs`), but set requests never reach the renderer. |
 | **DECRQM / DA3** (`CSI ? Ps $p`, `CSI = c`) | Missing | Some apps probe mode support; unanswered = assume unsupported. |
-| **Kitty keyboard / modifyOtherKeys** | Deliberately unsupported | `query.rs` answers `CSI ? u` with flags 0; XTGETTCAP may still advertise `km`. Intentional, but document it. |
+| **Kitty keyboard / modifyOtherKeys** | Partial | `query.rs` answers `CSI ? u` with flags 0, but `key_to_bytes` still emits kitty-style `CSI N;m u` for modified Enter — the flags-0 reply and the emitted input disagree. `modifyOtherKeys` itself is unimplemented, yet XTGETTCAP `km` advertises `ESC[>4;m`. Reconcile flags, advertised capability, and emitted keys. |
 | **OSC 133 shell integration / OSC 7 cwd** | Missing | Prompt marking / cwd tracking absent. |
 
 ### 4. Comments, docs, and complexity observations (LOW)

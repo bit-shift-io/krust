@@ -253,10 +253,13 @@ pure helper first (Red), then wire it (Green).
 
 ## Phase 4 — Low: docs & cleanup
 
-- [x] **T4.1. Document the kitty-keyboard limitation.**
-  **Files:** `NOTES.md`, `ARCHITECTURE.md`.
-  **Steps:** Record that `CSI ? u` is answered with flags 0 deliberately and
-  that modifyOtherKeys is unsupported.
+- [x] **T4.1. Kitty-keyboard write-up (added then removed).**
+  **Files:** `NOTES.md`, `ARCHITECTURE.md`, `AUDIT.md`.
+  **Steps:** Initially recorded that `CSI ? u` is answered with flags 0 and
+  that modifyOtherKeys is unsupported. Reverted on review: `key_to_bytes` does
+  emit kitty-style `CSI u` input, so the "legacy keys only" claim was wrong;
+  `AUDIT.md` now treats it as an unresolved inconsistency instead of a
+  documented limitation.
   **Verify:** docs only.
 
 - [x] **T4.2. Update docs for Phase 1–3 behaviour.**

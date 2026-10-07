@@ -362,6 +362,8 @@
         }
         let reconnectAttempts = 0;
 
+        const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+
         // `window.devicePixelRatio` already folds in browser zoom (a 120% zoom
         // makes a 1x display report 1.2), and the wasm module reads the same
         // value. Do not clamp it here: the canvas backing store and the grid
@@ -470,16 +472,10 @@
         }
 
         // Read init result: init returns a pointer to [u32; 2] containing (json_ptr, json_len)
-        const dpr = devicePixelRatio();
-        const cacheKey = 'krust_cells_dpr';
-        let cachedDims = null;
-        try {
-            const raw = sessionStorage.getItem(cacheKey);
-            if (raw) {
-                const c = JSON.parse(raw);
-                if (c.dpr === dpr && c.w > 0 && c.h > 0) cachedDims = { w: c.w, h: c.h };
-            }
-        } catch (_) {}
+        // Cell dimensions are measured fresh on every visit. A cached value
+        // keyed only on DPR can be stale (fonts load lazily, render settings
+        // change) and a stale cell size puts both the grid layout and the
+        // mouse cell mapping off on every future visit at the same DPR.
 
         const rParam = params.get('r');
         set_renderer_mode(rParam === 'gl' ? 1 : rParam === '2d' ? 2 : 0);
@@ -488,17 +484,7 @@
         const canvasIdPtr = alloc(canvasIdBytes.length);
         const wasmBuf = new Uint8Array(mem.buffer, canvasIdPtr, canvasIdBytes.length);
         wasmBuf.set(canvasIdBytes);
-        let cachedPtr = 0, cachedLen = 0;
-        let cachedJson = '';
-        if (cachedDims) {
-            cachedJson = JSON.stringify(cachedDims);
-            const cjBytes = new TextEncoder().encode(cachedJson);
-            cachedPtr = alloc(cjBytes.length);
-            new Uint8Array(mem.buffer, cachedPtr, cjBytes.length).set(cjBytes);
-            cachedLen = cjBytes.length;
-        }
-        const boxPtr = init(canvasIdPtr, canvasIdBytes.length, cachedPtr, cachedLen);
-        if (cachedPtr) dealloc(cachedPtr, cachedLen);
+        const boxPtr = init(canvasIdPtr, canvasIdBytes.length, 0, 0);
         dealloc(canvasIdPtr, canvasIdBytes.length);
         let rendererName = null;
         if (boxPtr === 0) {
@@ -517,10 +503,6 @@
             cellW = Math.max(1, cfg.cell_width || 8);
             cellH = Math.max(1, cfg.cell_height || 18);
             rendererName = cfg.renderer || null;
-            // Cache cell dimensions for next visit (skip expensive scratch measurement)
-            try {
-                sessionStorage.setItem(cacheKey, JSON.stringify({ dpr, w: cellW, h: cellH }));
-            } catch (_) {}
         }
 
         fit();
@@ -732,7 +714,6 @@
         }
 
         window.addEventListener('keydown', (e) => {
-            const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
             const modifier = isMac ? e.metaKey : e.ctrlKey;
 
             if (e.key === 'PageUp' && !modifier && !e.altKey) {

@@ -57,25 +57,6 @@ fault.
 - `cargo test -p krust` (32) and `-p terminal-client` (80) green; krust clippy
   clean; only untouched files remain rustfmt-check-failing (pre-existing).
 
-## Keyboard protocol limitations (deliberate)
-
-Unlike the rendering/parsing issues above, these are scoped-out features, not
-bugs.
-
-- **Kitty keyboard protocol (`CSI ? u`):** the query is answered with flags
-  `0` ("legacy keys only"). `key_to_bytes` maps the classic xterm sequences and
-  does not implement progressive enhancement or key event types, so advertising
-  anything else would be a lie. TUIs that probe for kitty keys fall back to
-  legacy input (or to their `modifyOtherKeys` path).
-- **`modifyOtherKeys` (`CSI > 4 ; m`):** unsupported. XTGETTCAP `km` is still
-  advertised (matching xterm) so capability probes do not stall, but the mode
-  is not tracked and does not alter `key_to_bytes`. Modified keys that rely on
-  it (Ctrl+Shift+letter and friends) arrive as their base sequence.
-
-Making either real means tracking the mode in `TerminalState` (the same pattern
-used for bracketed paste / focus reporting) and consulting it when encoding a
-key press; there is no framework in the way.
-
 ## Audit remediation (2026-10): performance, GL, standards
 
 Derived from `AUDIT.md` (see `TASKS.md` phases 0-4). Three themes:
