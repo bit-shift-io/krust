@@ -14,15 +14,12 @@
         #scrollbar-thumb { position: absolute; left: 1px; right: 1px; border-radius: 4px; background: rgba(255,255,255,0.4); }
         canvas.bell { animation: bell-flash 0.15s ease-out; }
         @keyframes bell-flash { from { filter: brightness(2.2); } to { filter: brightness(1); } }
-        #render-error { position: fixed; top: 0; left: 0; right: 0; z-index: 20; font: 11px monospace; color: #ffe0e0; background: rgba(120,10,10,0.92); padding: 3px 8px; display: none; }
-        #render-error.visible { display: block; }
     </style>
 </head>
 <body>
     <canvas id="terminal-canvas"></canvas>
     <div id="scrollbar" class="hidden"><div id="scrollbar-thumb"></div></div>
     <div id="status">connecting...</div>
-    <div id="render-error"></div>
     <script src="/krust_runtime.js"></script>
     <script type="module">
         // Load raw WASM module directly via WebAssembly JS API. The import
@@ -311,31 +308,29 @@
 
         // A swallowed wasm exception inside a render call used to leave the
         // framebuffer presenting its last good frame while the grid moved on,
-        // with nothing on the console. Surface any such failure as a visible
-        // strip so a rare glitch is captured on screen instead of silently
-        // disappearing; the strip clears itself after a while.
-        let renderErrorCount = 0;
-        let renderErrorTimer = null;
+        // with nothing on the console. Log any such failure to console.
         function reportRenderError(e) {
-            renderErrorCount++;
             const msg = e && e.message ? e.message : String(e);
-            console.error('krust render error', msg);
-            const el = document.getElementById('render-error');
-            if (el) {
-                el.textContent = 'krust render error (' + renderErrorCount + '): ' + msg;
-                el.classList.add('visible');
+            // Skip extension-related errors
+            if (typeof msg === 'string' && (msg.includes('dispatchEvent') || msg.includes('moz-extension') || msg.includes('chrome-extension'))) {
+                return;
             }
-            if (renderErrorTimer) clearTimeout(renderErrorTimer);
-            renderErrorTimer = setTimeout(() => {
-                const strip = document.getElementById('render-error');
-                if (strip) strip.classList.remove('visible');
-            }, 10000);
+            console.error('krust render error', msg);
         }
         window.addEventListener('error', (e) => {
-            reportRenderError(e && e.message ? e.message : String(e));
+            const msg = e && e.message ? e.message : String(e);
+            // Ignore cross-origin errors from extensions
+            if (e && (e.filename && (e.filename.startsWith('moz-extension://') || e.filename.startsWith('chrome-extension://')))) {
+                return;
+            }
+            reportRenderError(msg);
         });
         window.addEventListener('unhandledrejection', (e) => {
-            reportRenderError('unhandled rejection: ' + (e && e.reason ? String(e.reason) : ''));
+            const reason = e && e.reason ? e.reason : '';
+            const msg = 'unhandled rejection: ' + String(reason);
+            if (typeof reason === 'object' && reason && reason.stack && reason.stack.includes('extension://')) return;
+            if (String(reason).includes('extension://') || String(reason).includes('moz-extension')) return;
+            reportRenderError(msg);
         });
 
         let statusTimeout = null;
