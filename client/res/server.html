@@ -35,7 +35,8 @@
         window.KRUST_RUNTIME.install(wasm.instance.exports.memory);
         const { init, set_renderer_mode, rebuild_webgl, process_bytes, query_replies, handle_resize, repaint,
                 blink_tick, sync_pending, flush_sync,
-                webgl_context_lost, reset_terminal,
+                webgl_context_lost, reset_terminal, reset_prev_screen,
+                handle_click,
                 key_to_bytes, set_selection, selected_text, clear_selection,
                 scroll, scroll_to, scroll_to_bottom, scroll_to_top,
                 scroll_offset, scrollback_len, is_alt_screen, grid_metrics, version,

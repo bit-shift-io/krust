@@ -1,0 +1,148 @@
+Feature Policy: Skipping unsupported feature name “clipboard-read”. localhost:5000
+Feature Policy: Skipping unsupported feature name “clipboard-write”. localhost:5000
+Feature Policy: Skipping unsupported feature name “clipboard-read”. localhost:5000
+Feature Policy: Skipping unsupported feature name “clipboard-write”. localhost:5000
+Feature Policy: Skipping unsupported feature name “clipboard-read”. localhost:5000
+Feature Policy: Skipping unsupported feature name “clipboard-write”. localhost:5000
+Feature Policy: Skipping unsupported feature name “clipboard-read”. localhost:5000
+Feature Policy: Skipping unsupported feature name “clipboard-write”. localhost:5000
+Feature Policy: Skipping unsupported feature name “clipboard-read”. app.js:795:9
+Feature Policy: Skipping unsupported feature name “clipboard-write”. app.js:795:9
+XHR GET
+http://localhost:4000/filetree?path=/
+[HTTP/1.1 500 Internal Server Error 2ms]
+Uncaught DOMException: Permission denied to access property "dispatchEvent" on cross-origin object
+    onUserInput moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:65
+    onUserInput moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:64
+    onKeyDownMouseDownToushStart moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:49
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:29
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:26
+    applyPrefs moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:144
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:165
+    inject moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:173
+    <anonymous> moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:174
+inject.js:65:9
+Feature Policy: Skipping unsupported feature name “clipboard-read”. app.js:1859:9
+Feature Policy: Skipping unsupported feature name “clipboard-write”. app.js:1859:9
+Feature Policy: Skipping unsupported feature name “clipboard-read”. app.js:795:9
+Feature Policy: Skipping unsupported feature name “clipboard-write”. app.js:795:9
+KRUST: WebGL2 renderer initialized krust_runtime.js:83:15
+KRUST: terminal reset after server-side resync krust_runtime.js:83:15
+no icon for "krust.spec" (ext: spec, mime: application/octet-stream) app.js:223:11
+XHR GET
+http://localhost:4000/filetree?path=/
+[HTTP/1.1 500 Internal Server Error 1ms]
+GET
+http://localhost:4000/icons/breeze-dark/mimetypes/64/text-x-generic.svg.svg
+[HTTP/1.1 404 Not Found 0ms]
+Uncaught DOMException: Permission denied to access property "dispatchEvent" on cross-origin object
+    onUserInput moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:65
+    onUserInput moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:64
+    onKeyUpMouseUpTouchEnd moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:58
+    setTimeout handler*onKeyUpMouseUpTouchEnd moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:56
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:30
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:26
+    applyPrefs moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:144
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:165
+    inject moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:173
+    <anonymous> moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:174
+inject.js:65:9
+krust render error SecurityError: Permission denied to access property "dispatchEvent" on cross-origin object localhost:3000:321:21
+Uncaught DOMException: Permission denied to access property "dispatchEvent" on cross-origin object
+    onKeyDownMouseDownToushStart moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:49
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:29
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:26
+    applyPrefs moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:144
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:165
+    inject moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:173
+    <anonymous> moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:174
+inject.js:49:7
+krust render error ReferenceError: handle_click is not defined localhost:3000:321:21
+Uncaught ReferenceError: handle_click is not defined
+    <anonymous> http://localhost:3000/?s=grit-krust-6bcomx-term-1&dir=/home/bronson/Projects/krust:1002
+    EventListener.handleEvent* http://localhost:3000/?s=grit-krust-6bcomx-term-1&dir=/home/bronson/Projects/krust:989
+ localhost:3000:1002:17
+krust render error SecurityError: Permission denied to access property "dispatchEvent" on cross-origin object localhost:3000:321:21
+Uncaught DOMException: Permission denied to access property "dispatchEvent" on cross-origin object
+    onKeyUpMouseUpTouchEnd moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:58
+    setTimeout handler*onKeyUpMouseUpTouchEnd moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:56
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:30
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:26
+    applyPrefs moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:144
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:165
+    inject moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:173
+    <anonymous> moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:174
+inject.js:58:9
+krust render error SecurityError: Permission denied to access property "dispatchEvent" on cross-origin object localhost:3000:321:21
+Uncaught DOMException: Permission denied to access property "dispatchEvent" on cross-origin object
+    onKeyDownMouseDownToushStart moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:49
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:29
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:26
+    applyPrefs moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:144
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:165
+    inject moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:173
+    <anonymous> moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:174
+inject.js:49:7
+krust render error ReferenceError: handle_click is not defined localhost:3000:321:21
+Uncaught ReferenceError: handle_click is not defined
+    <anonymous> http://localhost:3000/?s=grit-krust-6bcomx-term-1&dir=/home/bronson/Projects/krust:1002
+    EventListener.handleEvent* http://localhost:3000/?s=grit-krust-6bcomx-term-1&dir=/home/bronson/Projects/krust:989
+ localhost:3000:1002:17
+krust render error SecurityError: Permission denied to access property "dispatchEvent" on cross-origin object localhost:3000:321:21
+Uncaught DOMException: Permission denied to access property "dispatchEvent" on cross-origin object
+    onKeyDownMouseDownToushStart moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:49
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:29
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:26
+    applyPrefs moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:144
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:165
+    inject moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:173
+    <anonymous> moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:174
+inject.js:49:7
+krust render error ReferenceError: handle_click is not defined localhost:3000:321:21
+Uncaught ReferenceError: handle_click is not defined
+    <anonymous> http://localhost:3000/?s=grit-krust-6bcomx-term-1&dir=/home/bronson/Projects/krust:1002
+    EventListener.handleEvent* http://localhost:3000/?s=grit-krust-6bcomx-term-1&dir=/home/bronson/Projects/krust:989
+ localhost:3000:1002:17
+krust render error SecurityError: Permission denied to access property "dispatchEvent" on cross-origin object localhost:3000:321:21
+Uncaught DOMException: Permission denied to access property "dispatchEvent" on cross-origin object
+    onKeyDownMouseDownToushStart moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:49
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:29
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:26
+    applyPrefs moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:144
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:165
+    inject moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:173
+    <anonymous> moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:174
+inject.js:49:7
+krust render error SecurityError: Permission denied to access property "dispatchEvent" on cross-origin object localhost:3000:321:21
+Uncaught DOMException: Permission denied to access property "dispatchEvent" on cross-origin object
+    onKeyUpMouseUpTouchEnd moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:58
+    setTimeout handler*onKeyUpMouseUpTouchEnd moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:56
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:30
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:26
+    applyPrefs moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:144
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:165
+    inject moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:173
+    <anonymous> moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:174
+inject.js:58:9
+krust render error SecurityError: Permission denied to access property "dispatchEvent" on cross-origin object localhost:3000:321:21
+Uncaught DOMException: Permission denied to access property "dispatchEvent" on cross-origin object
+    onKeyUpMouseUpTouchEnd moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:58
+    setTimeout handler*onKeyUpMouseUpTouchEnd moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:56
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:30
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:26
+    applyPrefs moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:144
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:165
+    inject moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:173
+    <anonymous> moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:174
+inject.js:58:9
+krust render error SecurityError: Permission denied to access property "dispatchEvent" on cross-origin object localhost:3000:321:21
+Uncaught DOMException: Permission denied to access property "dispatchEvent" on cross-origin object
+    onKeyUpMouseUpTouchEnd moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:58
+    setTimeout handler*onKeyUpMouseUpTouchEnd moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:56
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:30
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:26
+    applyPrefs moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:144
+    init moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:165
+    inject moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:173
+    <anonymous> moz-extension://515a39d3-f1f4-41dc-b942-ee5c36b2cc1b/js/inject.js:174
+inject.js:58:9
