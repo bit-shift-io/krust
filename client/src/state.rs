@@ -904,10 +904,6 @@ impl TerminalState {
         let css_w = ffi::canvas_width(self.canvas) as f64 / dpr;
         let css_h = ffi::canvas_height(self.canvas) as f64 / dpr;
 
-        // Clear entire canvas to default background
-        ffi::ctx_set_fill_style(ctx, &css_color(default_bg()));
-        ffi::ctx_fill_rect(ctx, 0.0, 0.0, css_w.max(1.0), css_h.max(1.0));
-
         // Cells to repaint: everything marked dirty, plus current and previous cursor cells
         let cur = self.visible_cursor(screen, rows, cols);
         if let Some(c) = cur {

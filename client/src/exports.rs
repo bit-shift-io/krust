@@ -310,13 +310,21 @@ pub extern "C" fn query_replies(bytes_ptr: *const u8, bytes_len: usize) -> *mut 
 }
 
 /// Redraw the terminal immediately from the current parser state.
+///
+/// A failed render is logged rather than dropped: swallowing the error here
+/// used to leave the WebGL framebuffer presenting its last good frame while
+/// the grid had moved on — characters on screen that no longer match the
+/// parse state, with the console completely silent. Keep the failure visible
+/// so the next repaint (which may be a full redraw) can be diagnosed.
 #[no_mangle]
 pub extern "C" fn repaint() {
     TERM_STATE.with(|cell| {
         let mut guard = cell.borrow_mut();
         if let Some(state) = guard.as_mut() {
             state.mark_all_dirty();
-            let _ = state.render();
+            if let Err(msg) = state.render() {
+                ffi::console_log(&format!("krust repaint failed: {}", msg));
+            }
         }
     });
 }

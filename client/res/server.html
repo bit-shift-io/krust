@@ -14,12 +14,15 @@
         #scrollbar-thumb { position: absolute; left: 1px; right: 1px; border-radius: 4px; background: rgba(255,255,255,0.4); }
         canvas.bell { animation: bell-flash 0.15s ease-out; }
         @keyframes bell-flash { from { filter: brightness(2.2); } to { filter: brightness(1); } }
+        #render-error { position: fixed; top: 0; left: 0; right: 0; z-index: 20; font: 11px monospace; color: #ffe0e0; background: rgba(120,10,10,0.92); padding: 3px 8px; display: none; }
+        #render-error.visible { display: block; }
     </style>
 </head>
 <body>
     <canvas id="terminal-canvas"></canvas>
     <div id="scrollbar" class="hidden"><div id="scrollbar-thumb"></div></div>
     <div id="status">connecting...</div>
+    <div id="render-error"></div>
     <script src="/krust_runtime.js"></script>
     <script type="module">
         // Load raw WASM module directly via WebAssembly JS API. The import
@@ -103,6 +106,9 @@
 
         // Render loop for frame coalescing
         let renderScheduled = false;
+        // When `renderScheduled` last flipped; the blink interval uses this to
+        // catch a rAF that the browser throttled or dropped entirely (see below).
+        let lastScheduleAt = 0;
         // Stall timer for ?2026 synchronized output (see handleWsData).
         let syncFlushTimer = null;
         function scheduleRender() {
@@ -116,9 +122,10 @@
             if (document.hidden) return;
             if (!renderScheduled) {
                 renderScheduled = true;
+                lastScheduleAt = performance.now();
                 requestAnimationFrame(() => {
                     renderScheduled = false;
-                    try { repaint(); } catch (_) {}
+                    try { repaint(); } catch (e) { reportRenderError(e); }
                 });
             }
         }
@@ -210,8 +217,8 @@
         function repaintOnReturn() {
             try {
                 if (webgl_context_lost() === 1) rebuild_webgl();
-            } catch (_) {}
-            try { repaint(); } catch (_) {}
+            } catch (e) { reportRenderError(e); }
+            try { repaint(); } catch (e) { reportRenderError(e); }
         }
 
         // Focus in/out reports (DECSET 1004). Sent as ESC[I / ESC[O only when
@@ -282,9 +289,49 @@
             if (!document.hidden) {
                 // Flip the DECSCUSR blink phase (no-op unless the app chose
                 // a blinking cursor style), then repaint the frame.
-                try { blink_tick(); repaint(); } catch (_) {}
+                try { blink_tick(); repaint(); } catch (e) { reportRenderError(e); }
+                // If a frame was scheduled but its rAF has not fired within
+                // well over an interval, the browser dropped or throttled the
+                // callback (rAF can stall under frame-rate limiting while the
+                // tab stays visible). Run the coalesced repaint here instead —
+                // otherwise `renderScheduled` stays set and every future
+                // scheduleRender() early-returns, wedging the screen on its
+                // last painted frame.
+                if (renderScheduled && performance.now() - lastScheduleAt > 400) {
+                    renderScheduled = false;
+                    try { repaint(); } catch (e) { reportRenderError(e); }
+                }
             }
         }, 500);
+
+        // A swallowed wasm exception inside a render call used to leave the
+        // framebuffer presenting its last good frame while the grid moved on,
+        // with nothing on the console. Surface any such failure as a visible
+        // strip so a rare glitch is captured on screen instead of silently
+        // disappearing; the strip clears itself after a while.
+        let renderErrorCount = 0;
+        let renderErrorTimer = null;
+        function reportRenderError(e) {
+            renderErrorCount++;
+            const msg = e && e.message ? e.message : String(e);
+            console.error('krust render error', msg);
+            const el = document.getElementById('render-error');
+            if (el) {
+                el.textContent = 'krust render error (' + renderErrorCount + '): ' + msg;
+                el.classList.add('visible');
+            }
+            if (renderErrorTimer) clearTimeout(renderErrorTimer);
+            renderErrorTimer = setTimeout(() => {
+                const strip = document.getElementById('render-error');
+                if (strip) strip.classList.remove('visible');
+            }, 10000);
+        }
+        window.addEventListener('error', (e) => {
+            reportRenderError(e && e.message ? e.message : String(e));
+        });
+        window.addEventListener('unhandledrejection', (e) => {
+            reportRenderError('unhandled rejection: ' + (e && e.reason ? String(e.reason) : ''));
+        });
 
         let statusTimeout = null;
         function showStatus(message) {
@@ -626,7 +673,7 @@
                         if (syncFlushTimer === null) {
                             syncFlushTimer = setTimeout(() => {
                                 syncFlushTimer = null;
-                                try { flush_sync(); } catch (_) {}
+                                try { flush_sync(); console.log('krust sync stall flush'); } catch (_) {}
                                 scheduleRender();
                             }, 300);
                         }
