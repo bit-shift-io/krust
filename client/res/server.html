@@ -219,6 +219,13 @@
                 if (webgl_context_lost() === 1) rebuild_webgl();
             } catch (e) { reportRenderError(e); }
             try { repaint(); } catch (e) { reportRenderError(e); }
+            // Also force another repaint shortly after in case of timing issues
+            setTimeout(() => {
+                try { repaint(); } catch (e) { reportRenderError(e); }
+            }, 50);
+            setTimeout(() => {
+                try { repaint(); } catch (e) { reportRenderError(e); }
+            }, 150);
         }
 
         // Focus in/out reports (DECSET 1004). Sent as ESC[I / ESC[O only when
@@ -255,11 +262,8 @@
             document.title = lastTitle;
             sendFocusReport(true);
             fit();
-            const now = performance.now();
-            if (now - lastRenderTime > 32) {
-                lastRenderTime = now;
-                repaintOnReturn();
-            }
+            lastRenderTime = performance.now();
+            repaintOnReturn();
             // Reset prev_screen to None so the dirty cell mechanism starts
             // with a fresh state after the tab has been hidden, rather than
             // comparing against stale state from before the hide.

@@ -1,0 +1,6 @@
+bronson@btablet ~/P/tally (main) [SIGTERM]> ./run.sh
+   Compiling tally v0.1.0 (/home/bronson/Projects/tally)
+    Building [=======================> ] 309/310: tally(bin)                  Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.39s
+     Running `target/debug/tally`
+Server running on http://localhost:2000
+        ^[[?0u^[P>|krust(0.1.0)^[\^[]11;rgb:2b2b/2b2b/2b2b^[\^[P0+r696e646e=^[\^[P0+r71756572792d6f732d6e616d65=^[\^[[?1;2c^[]11;rgb:2b2b/2b2b/2b2b^[\^[[1;1R^[[?1;2c^[]11;rgb:2b2b/2b2b/2b2b^[\^[[1;1R^[[?1;2c^[]11;rgb:2b2b/2b2b/2b2b^[\^[[1;1R^[[?1;2c^[]11;rgb:2b2b/2b2b/2b2b^[\^[[1;1R^[[?1;2c^[]11;rgb:2b2b/2b2b/2b2b^[\^[[1;1R^[[?1;2c^[]11;rgb:2b2b/2b2b/2b2b^[\^[[1;1R^[[?1;2c^[]11;rgb:2b2b/2b2b/2b2b^[\^[[1;1R^[[?1;2c^[]11;rgb:2b2b/2b2b/2b2b^[\^[[1;1R^[[?1;2c^[]11;rgb:2b2b/2b2b/2b2b^[\^[[1;1R^[[?1;2c
