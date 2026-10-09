@@ -213,9 +213,7 @@
         // context was dropped while hidden: painting into a lost context is a
         // silent no-op, so without this the tab can come back blank.
         function repaintOnReturn() {
-            try {
-                if (webgl_context_lost() === 1) rebuild_webgl();
-            } catch (e) { reportRenderError(e); }
+            try { rebuild_webgl(); } catch (e) { reportRenderError(e); }
             try { repaint(); } catch (e) { reportRenderError(e); }
             // Also force another repaint shortly after in case of timing issues
             setTimeout(() => {
