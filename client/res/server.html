@@ -586,9 +586,8 @@
                     const sub = chunk.subarray(off, Math.min(off + 1024, chunk.length));
                     const subPtr = alloc(sub.length);
                     new Uint8Array(mem.buffer, subPtr, sub.length).set(sub);
-                    const summaryPtr = process_bytes(subPtr, sub.length);
+                    process_bytes(subPtr, sub.length);
                     dealloc(subPtr, sub.length);
-                    if (summaryPtr !== 0) free_result(summaryPtr);
                     scheduleRender();
                     const dt = performance.now() - t;
                     if (N === 0) firstMs = dt;
@@ -659,9 +658,8 @@
             if (params.get('benchskip') !== '1') {
                 const inPtr = alloc(inData.length);
                 new Uint8Array(mem.buffer, inPtr, inData.length).set(inData);
-                const summaryPtr = process_bytes(inPtr, inData.length);
-                dealloc(inPtr, inData.length);
-                if (summaryPtr !== 0) free_result(summaryPtr);
+             const summary = process_bytes(inPtr, inData.length);
+             dealloc(inPtr, inData.length);
                 scheduleRender();
                 // ?2026 synchronized output: wasm holds a frame's bytes
                 // until its end marker arrives so a render never lands
@@ -807,8 +805,7 @@
                 if (ws && ws.readyState === 1) {
                     navigator.clipboard.readText().then(text => {
                         if (text) {
-                            const data = new TextEncoder().encode(text);
-                            ws.send(data);
+                            sendPaste(text);
                         }
                     }).catch(err => {
                         console.warn("Clipboard read permission denied or unavailable", err);
@@ -940,7 +937,15 @@
                 const uri = callStringExport(hyperlink_at, cell.row, cell.col);
                 if (uri) {
                     e.preventDefault();
-                    window.open(uri, '_blank', 'noopener,noreferrer');
+                    // Validate the URI scheme before opening. Untrusted output
+                    // emitting \x1b]8;;javascript:... or data:... links can
+                    // trigger client-side script execution (XSS).
+                    try {
+                        const parsed = new URL(uri);
+                        if (parsed.protocol === 'http:' || parsed.protocol === 'https:' || parsed.protocol === 'mailto:') {
+                            window.open(parsed.href, '_blank', 'noopener,noreferrer');
+                        }
+                    } catch (_) {}
                     return;
                 }
             }

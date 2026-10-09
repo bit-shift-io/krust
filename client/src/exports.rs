@@ -204,7 +204,7 @@ pub extern "C" fn init(
 ) -> *mut u8 {
     install_panic_hook();
     if canvas_id_ptr.is_null() || canvas_id_len == 0 {
-        return write_string_to_wasm("".to_string()).0 as *mut u8;
+        return return_null_pair();
     }
     let canvas_id = unsafe {
         std::str::from_utf8(std::slice::from_raw_parts(canvas_id_ptr, canvas_id_len))
@@ -247,9 +247,10 @@ pub extern "C" fn init(
 /// * `bytes_ptr` - Pointer to bytes received from the WebSocket
 /// * `bytes_len` - Length of bytes
 ///
-/// Returns a JSON summary pointer/len pair (caller must free).
+/// Returns 1 on success, 0 on failure. No JSON allocation is made to avoid
+/// frame-level WASM memory leakage.
 #[no_mangle]
-pub extern "C" fn process_bytes(bytes_ptr: *const u8, bytes_len: usize) -> *mut u8 {
+pub extern "C" fn process_bytes(bytes_ptr: *const u8, bytes_len: usize) -> i32 {
     let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr, bytes_len) };
     let result = TERM_STATE.with(|cell| {
         let mut guard = cell.borrow_mut();
@@ -258,23 +259,12 @@ pub extern "C" fn process_bytes(bytes_ptr: *const u8, bytes_len: usize) -> *mut 
             Ok(s) => {
                 s.process_bytes(bytes);
                 s.schedule_render();
-                Ok(format!(
-                    "{{\"processed\":true,\"byte_count\":{},\"rows\":{},\"cols\":{}}}",
-                    bytes.len(),
-                    s.rows,
-                    s.cols
-                ))
+                1_i32
             }
-            Err(e) => Err(e),
+            Err(_) => 0,
         }
     });
-    match result {
-        Ok(json) => {
-            let (ptr, len) = write_string_to_wasm(json);
-            return_pair(ptr as *mut u8, len)
-        }
-        Err(_) => return_null_pair(),
-    }
+    result
 }
 
 /// Detect device-query sequences in terminal output and return replies.
@@ -946,10 +936,8 @@ pub extern "C" fn free_result(ptr: *mut u8) {
 /// Allocate memory in WASM linear memory.
 #[no_mangle]
 pub extern "C" fn alloc(size: usize) -> *mut u8 {
-    let mut buf = Vec::with_capacity(size);
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
-    ptr
+    let layout = std::alloc::Layout::from_size_align(size.max(1), 1).unwrap();
+    unsafe { std::alloc::alloc(layout) }
 }
 
 /// Deallocate memory in WASM linear memory.
@@ -958,8 +946,9 @@ pub extern "C" fn dealloc(ptr: *mut u8, size: usize) {
     if ptr.is_null() {
         return;
     }
+    let layout = std::alloc::Layout::from_size_align(size.max(1), 1).unwrap();
     unsafe {
-        let _ = Vec::from_raw_parts(ptr, size, size);
+        std::alloc::dealloc(ptr, layout);
     }
 }
 

@@ -25,11 +25,6 @@ pub(crate) fn xterm_modifier_param(ctrl: bool, alt: bool, shift: bool) -> Option
     any.then_some(param)
 }
 
-/// Whether a character is directly typeable into a PTY (graphic or space).
-fn is_printable_ascii(c: char) -> bool {
-    c.is_ascii_graphic() || c == ' '
-}
-
 /// Map a browser keyboard event to the raw bytes to write to the PTY.
 ///
 /// Follows the mapping table in `NOTES.md`: Ctrl+letter → control code,
@@ -119,7 +114,7 @@ pub(crate) fn map_key(key: &str, ctrl: bool, alt: bool, shift: bool, _meta: bool
     // Alt + printable → ESC prefix.
     if alt {
         if let Some(c) = single_char {
-            if is_printable_ascii(c) {
+            if !c.is_control() {
                 let mut buf = [0u8; 4];
                 let mut out = Vec::with_capacity(5);
                 out.push(0x1b);
@@ -130,13 +125,65 @@ pub(crate) fn map_key(key: &str, ctrl: bool, alt: bool, shift: bool, _meta: bool
         return Vec::new();
     }
 
-    // Plain single printable character passes through.
+    // Plain single non-control character passes through.
     if let Some(c) = single_char {
-        if is_printable_ascii(c) {
+        if !c.is_control() {
             let mut buf = [0u8; 4];
             return c.encode_utf8(&mut buf).as_bytes().to_vec();
         }
     }
 
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accented_characters_encode_as_utf8() {
+        assert_eq!(map_key("é", false, false, false, false), vec![0xc3, 0xa9]);
+        assert_eq!(map_key("ü", false, false, false, false), vec![0xc3, 0xbc]);
+        assert_eq!(map_key("ñ", false, false, false, false), vec![0xc3, 0xb1]);
+        assert_eq!(map_key("à", false, false, false, false), vec![0xc3, 0xa0]);
+    }
+
+    #[test]
+    fn cyrillic_characters_encode_as_utf8() {
+        assert_eq!(map_key("а", false, false, false, false), vec![0xd0, 0xb0]);
+        assert_eq!(map_key("б", false, false, false, false), vec![0xd0, 0xb1]);
+        assert_eq!(map_key("ж", false, false, false, false), vec![0xd0, 0xb6]);
+    }
+
+    #[test]
+    fn cjk_ideographs_encode_as_utf8() {
+        assert_eq!(map_key("中", false, false, false, false), vec![0xe4, 0xb8, 0xad]);
+        assert_eq!(map_key("字", false, false, false, false), vec![0xe5, 0xad, 0x97]);
+        assert_eq!(map_key("元", false, false, false, false), vec![0xe5, 0x85, 0x83]);
+    }
+
+    #[test]
+    fn emoji_encode_as_utf8() {
+        // Emoji are single-character codepoints; encode to UTF-8.
+        assert_eq!(map_key("😀", false, false, false, false), vec![0xf0, 0x9f, 0x98, 0x80]);
+    }
+
+    #[test]
+    fn alt_accented_character_prefixed_with_esc() {
+        let mut buf = [0u8; 4];
+        let mut expected = Vec::with_capacity(5);
+        expected.push(0x1b);
+        expected.extend_from_slice('\u{e9}'.encode_utf8(&mut buf).as_bytes());
+        assert_eq!(map_key("é", false, true, false, false), expected);
+    }
+
+    #[test]
+    fn control_characters_are_dropped() {
+        assert_eq!(map_key("\x00", false, false, false, false), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn tab_still_returns_control_sequence() {
+        assert_eq!(map_key("Tab", false, false, false, false), vec![0x09]);
+    }
 }

@@ -34,7 +34,7 @@ fn xtgettcaps_value(name: &str) -> &'static str {
 /// Decode a hex XTGETTCAP name into its ASCII form. Returns `None` for
 /// anything that is not an even-length run of hex digits.
 fn hex_name_to_str(hex: &str) -> Option<String> {
-    if hex.is_empty() || hex.len() % 2 != 0 {
+    if hex.is_empty() || !hex.len().is_multiple_of(2) {
         return None;
     }
     let bytes = hex.as_bytes();

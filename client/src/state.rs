@@ -153,6 +153,15 @@ impl TerminalCallbacks {
             }
         }
     }
+
+    /// Clear all recorded link spans and any open link.
+    ///
+    /// Called when the terminal screen is fully cleared (ED 2 / `\x1b[2J`)
+    /// or reset, so old hyperlinks do not attach to newly drawn text.
+    pub(crate) fn clear_links(&mut self) {
+        self.links.clear();
+        self.open_link = None;
+    }
 }
 
 impl vt100::Callbacks for TerminalCallbacks {
@@ -598,11 +607,15 @@ impl TerminalState {
         let screen_after = self.parser.screen().alternate_screen();
 
         if !screen_before && screen_after {
+            // Entering alternate screen: clear links from normal screen
+            self.parser.callbacks_mut().clear_links();
             self.scroll.saved_normal_offset_for_alt = Some(self.scroll.normal_offset);
             self.parser
                 .screen_mut()
                 .set_scrollback(self.scroll.normal_offset);
         } else if screen_before && !screen_after {
+            // Exiting alternate screen: clear links from alt screen
+            self.parser.callbacks_mut().clear_links();
             if let Some(saved) = self.scroll.saved_normal_offset_for_alt.take() {
                 self.scroll.normal_offset = saved;
                 self.parser.screen_mut().set_scrollback(saved);
@@ -901,8 +914,8 @@ impl TerminalState {
     ) -> Result<(), String> {
         let screen = self.parser.screen();
         let (prows, pcols) = screen.size();
-        let css_w = ffi::canvas_width(self.canvas) as f64 / dpr;
-        let css_h = ffi::canvas_height(self.canvas) as f64 / dpr;
+        let _css_w = ffi::canvas_width(self.canvas) as f64 / dpr;
+        let _css_h = ffi::canvas_height(self.canvas) as f64 / dpr;
 
         // Cells to repaint: everything marked dirty, plus current and previous cursor cells
         let cur = self.visible_cursor(screen, rows, cols);

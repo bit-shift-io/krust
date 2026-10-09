@@ -10,6 +10,8 @@ use axum::{
         Query, State,
     },
     http::header,
+    http::HeaderMap,
+    response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -308,8 +310,20 @@ pub(crate) async fn runtime_js() -> ([(header::HeaderName, &'static str); 2], &'
 pub(crate) async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(query): Query<WsQuery>,
+    headers: HeaderMap,
     State(state): State<AppState>,
-) -> impl axum::response::IntoResponse {
+) -> impl IntoResponse {
+    // Validate WebSocket Origin header to prevent CSWSH.
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        if !state.config.is_origin_allowed(origin) {
+            return axum::http::Response::builder()
+                .status(axum::http::StatusCode::FORBIDDEN)
+                .body(axum::body::Body::empty())
+                .unwrap()
+                .into_response();
+        }
+    }
+
     let session_id = query
         .s
         .filter(|s| !s.trim().is_empty())

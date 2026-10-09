@@ -2,7 +2,7 @@
 
 **Audit Target:** `krust` — Rust/WASM terminal emulator client + Axum/`portable-pty` server  
 **Audit Date:** 2026-10-09  
-**Status:** Findings Active (Remediation Pending)
+**Status:** All findings resolved (2026-10-09 audit remediation complete)
 
 ---
 

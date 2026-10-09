@@ -64,6 +64,7 @@ impl MouseKind {
 /// Returns `None` when the protocol does not want this event (the page then
 /// falls back to its own selection/scrolling behaviour) or when the encoding
 /// cannot represent the coordinates.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn mouse_report(
     mode: MouseProtocolMode,
     encoding: MouseProtocolEncoding,

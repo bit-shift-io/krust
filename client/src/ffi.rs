@@ -345,6 +345,7 @@ pub(crate) fn gl_tex_parameteri(gl: JsHandle, target: u32, pname: u32, param: i3
 }
 
 /// `gl.texImage2D(..., UNSIGNED_BYTE, src)` with an `ALPHA`-format texture.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn gl_tex_image_2d_alpha(
     gl: JsHandle,
     target: u32,

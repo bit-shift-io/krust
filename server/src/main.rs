@@ -8,6 +8,7 @@
 // - `replay.rs` — synthesizes a screen-repainting ANSI stream from the mirror
 // - `handlers.rs` — HTTP/WS handler layer (router endpoints live in `main()`)
 
+mod config;
 mod handlers;
 mod replay;
 mod session;
@@ -20,8 +21,11 @@ async fn main() {
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::RwLock;
 
+    let config = config::KrustConfig::load();
+
     let state = session::AppState {
         sessions: Arc::new(RwLock::new(HashMap::new())),
+        config: Arc::new(config.clone()),
     };
 
     let app = Router::new()
@@ -32,10 +36,8 @@ async fn main() {
         .layer(CorsLayer::permissive());
     let app = app.with_state(state);
 
-    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
-    let addr = format!("0.0.0.0:{}", port);
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    println!("Web terminal listening on http://localhost:{}", port);
+    let listener = tokio::net::TcpListener::bind(&config.bind_addr()).await.unwrap();
+    println!("Web terminal listening on http://{}/", config.bind_addr());
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -176,6 +178,7 @@ mod tests {
             .route("/", get(index))
             .with_state(AppState {
                 sessions: Arc::new(RwLock::new(HashMap::new())),
+                config: Arc::new(config::KrustConfig::default()),
             })
             .layer(CorsLayer::permissive());
 

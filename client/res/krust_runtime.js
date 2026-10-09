@@ -14,9 +14,9 @@
 window.KRUST_RUNTIME = (function () {
   "use strict";
 
-  let memory = null;
-  let heap = [null];
-  let freeSlots = [];
+let memory = null;
+let heap = [null, window, document];
+let freeSlots = [];
 
   function getObject(h) {
     return heap[h] || null;
@@ -61,9 +61,9 @@ window.KRUST_RUNTIME = (function () {
 
   const krust = {
     // --- globals: window / document / elements ---------------------------
-    krust_window: () => addObject(window),
+    krust_window: () => 1,
     krust_window_dpr: (w) => (getObject(w) ? getObject(w).devicePixelRatio || 1 : 1),
-    krust_window_document: (w) => (getObject(w) ? addObject(getObject(w).document) : 0),
+    krust_window_document: (w) => 2,
     krust_document_get_element_by_id: (doc, p, l) =>
       addObject(getObject(doc).getElementById(readString(p, l))),
     krust_document_create_canvas: (doc) => addObject(getObject(doc).createElement("canvas")),

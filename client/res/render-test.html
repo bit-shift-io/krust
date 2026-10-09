@@ -77,9 +77,8 @@
             for (const p of parts) { joined.set(p, off); off += p.length; }
             const ptr = alloc(joined.length);
             new Uint8Array(mem.buffer, ptr, joined.length).set(joined);
-            const summary = process_bytes(ptr, joined.length);
+            process_bytes(ptr, joined.length);
             dealloc(ptr, joined.length);
-            if (summary !== 0) free_result(summary);
         }
 
         // Seam analysis: every line in a region should be uniformly bright.
@@ -331,9 +330,8 @@
                 const b = new TextEncoder().encode('\x1b[23;1H' + str);
                 const p = alloc(b.length);
                 new Uint8Array(mem.buffer, p, b.length).set(b);
-                const s = process_bytes(p, b.length);
+                process_bytes(p, b.length);
                 dealloc(p, b.length);
-                if (s !== 0) free_result(s);
             }
             function cellSig(rowIdx, colIdx) {
                 const x0 = xoff + R(colIdx * cw), x1 = xoff + R((colIdx + 1) * cw);
@@ -368,9 +366,8 @@
                 const b = new TextEncoder().encode(s);
                 const p = alloc(b.length);
                 new Uint8Array(mem.buffer, p, b.length).set(b);
-                const sum = process_bytes(p, b.length);
+                process_bytes(p, b.length);
                 dealloc(p, b.length);
-                if (sum !== 0) free_result(sum);
             }
             function callBytes(fn, ...args) {
                 const boxPtr = fn(...args);

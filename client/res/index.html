@@ -81,9 +81,8 @@
             const testBytes = new TextEncoder().encode('Hello World\x1b[31m red\x1b[0m');
             const testPtr = alloc(testBytes.length);
             new Uint8Array(mem.buffer, testPtr, testBytes.length).set(testBytes);
-            const summaryPtr = process_bytes(testPtr, testBytes.length);
+            process_bytes(testPtr, testBytes.length);
             dealloc(testPtr, testBytes.length);
-            if (summaryPtr !== 0) free_result(summaryPtr);
             ping('proc');
             document.body.className = 'done';
             showStatus(ver + ' PASS');
