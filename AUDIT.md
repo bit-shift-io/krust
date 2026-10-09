@@ -1,179 +1,83 @@
 # Codebase Audit Summary
 
-**Audit Target:** `krust` — Rust/WASM terminal emulator client + Axum/`portable-pty` server
-**Date:** 2026-10-07
+**Audit Target:** `krust` — Rust/WASM terminal emulator client + Axum/`portable-pty` server  
+**Audit Date:** 2026-10-09  
+**Status:** Findings Active (Remediation Pending)
 
 ---
 
 ## Executive Summary
 
-The architecture is sound and unusually well-documented, but the hot path has a
-severe performance defect: **every WebSocket frame clones the entire `vt100`
-screen twice, scrollback included, to compute a dirty-cell set that the WebGL
-renderer never reads.** This is the dominant cost behind the reported
-minutes-long paste and heavy live output. Two secondary themes emerge: the GL
-renderer rebuilds and re-uploads the whole grid unconditionally every frame, and
-several common terminal standards (bracketed paste, focus reporting, OSC 52,
-OSC 8, bell) are not implemented. None of the fixes below are structural
-rewrites; the highest-value ones are localized.
+Krust is a single-binary web terminal emulator featuring an Axum WebSocket server backed by `portable-pty` and a raw WebAssembly client rendering via WebGL2 (with Canvas 2D fallback).
+
+Following the October 7 performance remediation, the hot-path terminal diffing and frame throughput are significantly improved. However, this audit identified **two high-severity security vulnerabilities** (Cross-Site WebSocket Hijacking allowing arbitrary remote shell command execution, and unauthenticated/unbounded session spawning DoS), a **continuous WASM heap memory leak** occurring on every inbound WebSocket frame, a **functional bug dropping all non-ASCII unicode keystrokes**, and a **session lockup defect** that leaves sessions permanently dead after a shell terminates.
 
 ## Key Metrics
 
-- **Unused/Orphan Files:** 0 found (all modules reachable from `lib.rs`; assets embedded via `include_str!`/`include_bytes!`).
-- **Dead Functions/Exports:** 0 found.
-- **Commented-Out Code / Debug Logs:** 0 (`console.log` only in the `SELFTEST` diagnostic path).
-- **Open TODOs/FIXMEs:** 0 in source (tracked narratively in `NOTES.md` / `TASKS.md`).
-
----
-
-## Resolution Status (2026-10-07)
-
-All findings below are addressed. Tracked in `TASKS.md` (phases 0–4); the
-performance claims were re-verified with the in-repo harness after the fix.
-
-- **Finding 1 (paste/live-output, CRITICAL) — resolved.** Dirty diffing moved to
-  render time (`DirtyTracker`) and skipped entirely on the GL path; the
-  remaining clone removed via `prev_screen.take()`; server PTY read buffer
-  widened to 16 KiB; client paste throttle removed; PTY writes wait on the lock
-  (`pty_write_locked`) instead of dropping.
-  - **Harness (`server.html?selftest=N`, headless Chromium, 1024-byte chunks):**
-    after = **0.10 ms/frame** at 1029 frames (≈1 MB, 103.9 ms total) and
-    **0.086 ms/frame** at 10284 frames (≈10 MB, 892.9 ms total); per-frame cost
-    is flat with scrollback (no growth from run 1 to run 2).
-  - **Before:** a benchmark of the old path (two `Screen::clone()`s per 1 KB
-    frame at 50×200/1024 scrollback) measured **6.81 ms/frame → ≈7.0 s per
-    1 MB paste**, i.e. ~68× the current per-frame cost, before any parse work.
-- **Finding 2 (WebGL2 waste, HIGH) — resolved.** Default-bg cells emit no bg
-  quad, blank cells no text quad; `HashSet`-based needed/dedup; cached attribute
-  locations (`AttrLocations`); reused instance scratch buffers; selection set
-  skipped when empty; `GraphicCellRects` fixed array; ASCII UV LUT; changed-span
-  `bufferSubData` uploads.
-- **Finding 3 (missing standards, MEDIUM) — resolved.** Bracketed paste
-  (`?2004`), focus reporting (`?1004`), `OSC 52` (opt-in), `OSC 8`, bell,
-  dynamic colors (`OSC 4`/`10`/`11`, query reply kept consistent), `DECRQM`,
-  `DA3`, and `OSC 7`/`OSC 133` shell integration all implemented.
-- **Finding 4 (docs/complexity, LOW) — documented.** `renderer.rs`/`state.rs`/
-  `server.html` remain large but cohesive; split left optional. (The interim
-  "kitty disabled" write-up in §9/`NOTES.md` was removed again: `map_key` does
-  emit kitty-style `CSI u` input, so the "legacy keys only" claim was wrong.)
-- **Tests:** `cargo test --workspace` = 164 client + 33 server, all green;
-  render regression checks pass on both `?r=2d` and `?r=gl`.
+- **Workspace Test Suite:** 197 passing tests (164 client, 33 server).
+- **Headless Browser Harness:** Headless Chromium (`render-check.sh` GL & 2D) and headless Firefox (`smoke-test.sh`) pass.
+- **Compiler / Linter Warnings:** 5 Clippy warnings in `terminal-client` (unused variables, argument counts, manual multiple checks).
+- **Security Exposures:** 3 identified (Remote Code Execution via CSWSH / LAN bind, Session Exhaustion DoS, Unchecked OSC 8 URI scheme).
+- **Memory Leaks:** 2 identified (frame-level CString leak in `process_bytes`, unreleased FFI object handles in `krust_runtime.js`).
+- **Input / Protocol Deficiencies:** 3 identified (non-ASCII character input drop, keyboard paste bypassing bracketed paste, permanent session lockup on shell exit).
+- **Untracked / Stray Files:** 3 accidental debug logs/dumps committed to git (`console-export-*.log`, `dump.txt`).
 
 ---
 
 ## Findings & Recommendations
 
-### 1. Paste slowness and live-output cost (CRITICAL)
+### 1. Security & Networking (HIGH / CRITICAL)
 
-**Root cause (confirmed by code path).** `client/src/state.rs:437`
-`compute_dirty_cells()` runs on **every** `process_bytes` call
-(`state.rs:354` → `feed_parser` → `state.rs:394`), i.e. once per inbound
-WebSocket frame, and:
-
-- `state.rs:441` clones the stored previous screen — `self.prev_screen.clone()` —
-  purely to satisfy the borrow checker.
-- `state.rs:445` clones the current screen — `self.parser.screen().clone()`.
-- `state.rs:450-473` then diffs the full `rows × cols` grid.
-
-`vt100::Screen` derives `Clone` and owns **two** `Grid`s (`screen.rs:54-65`),
-each with its own `scrollback: VecDeque<Row>` (`grid.rs:3-15`). At 200×50 with a
-full 1024-row scrollback, one clone copies ~200k `Cell`s (each with a heap
-`String`), so **two clones ≈ 400k allocations per frame**. The PTY reader feeds
-the server 1024-byte reads (`server/src/session.rs:261`), so a 1 MB paste echo
-arrives as ~1000 frames → ~400M cell copies. That is the minutes-scale stall.
-
-**Aggravators.**
-- The WebGL renderer **ignores `dirty_cells` entirely** (`state.rs:613-629`;
-  `renderer.rs:947`); the Canvas 2D renderer is the only consumer
-  (`state.rs:674`). The entire clone+diff is therefore pure waste on the default
-  GL path.
-- Client `sendPaste` throttles to 4096 B / 16 ms ≈ **256 KB/s**
-  (`client/res/server.html:733-747`), an artificial floor unrelated to real
-  backpressure.
-- The server input task `try_lock()`s the PTY writer (`handlers.rs:482`,
-  `handlers.rs:513`) and silently drops bytes on contention (currently rare,
-  since only that task locks it, but latent data loss).
-
-**Recommendations.**
-1. **Move the diff to render time.** Compute dirty cells inside `render()` (once
-   per rAF) instead of `process_bytes()` — coalescing is already in place
-   (`scheduleRender`), so this removes the per-frame amplification by itself.
-2. **Skip it on the GL path entirely.** GL does not consume the set; only
-   Canvas 2D needs it.
-3. **Stop cloning `Screen` to diff.** Compare via `prev_screen.take()` /
-   `std::mem::replace` so the borrow is not needed, and retain only the visible
-   region (rebuild a `Parser::new(rows, cols, 0)` snapshot) rather than dragging
-   scrollback. Better still, drive Canvas 2D from `vt100::Screen::state_diff`,
-   which already emits a minimal repaint stream.
-4. Remove the 16 ms paste delay (WebSocket + TCP already flow-control), and bump
-   the server read buffer from 1024 B to 16 KB (`session.rs:261`) to cut frame
-   count ~16×.
-5. Replace `try_lock` drop-on-contention with `lock().await` (the write task is
-   already sequential, so waiting is correct).
-
-*Verification tool already in the repo:* `server.html:500-521` `SELFTEST` times
-each `process_bytes` over 1024-byte chunks while `rows` lines are parsed.
-Running it (`?selftest=N`) at increasing N shows per-call latency rising with
-scrollback — the exact regression.
-
-### 2. WebGL2 renderer optimizations (HIGH)
-
-`renderer.rs:947` `render()` and `renderer.rs:1104` `build_instances()` recompute
-and re-upload the entire grid every frame regardless of what changed:
-
-| Issue | Location | Impact | Fix |
-|:---|:---|:---|:---|
-| A full-cell background quad is emitted for **every** cell | `renderer.rs:1166-1174` | ~rows×cols instances even though `gl_clear` already paints `default_bg` | Emit bg quads only when resolved bg ≠ default, or on selection/cursor cells |
-| Text quad emitted for blank cells | `renderer.rs:1144-1146`, `1225-1233` | one instance per space | Skip when `contents()` is empty and not cursor/selection |
-| `needed` scan is O(cells × unique) via `Vec::contains` | `renderer.rs:967-980`, `:973` | quadratic on CJK/emoji screens | Use a `HashSet`, or fold into the `build_instances` pass |
-| `plan_missing` uses `to_bake.contains` then `push` | `renderer.rs:551-565` | O(n²) glyph-baking plan | `HashSet` for `to_bake` |
-| 9 `gl_get_attrib_location` calls **per frame** | `renderer.rs:1024-1032` | redundant JS round-trips | Cache locations at program creation |
-| Two fresh `Vec<f32>` allocated per frame | `renderer.rs:1124-1125` | wasm GC/alloc pressure | Reuse persistent scratch buffers (`clear()` + `extend`) |
-| `sel_set` HashSet built even when selection empty | `renderer.rs:1122` | needless alloc | Early-out / reuse buffer |
-| `graphic_cell_rects` returns an owned `Vec` per call | `graphics.rs`, used `renderer.rs:1197` | alloc per graphic cell | Return `SmallVec`/array or write into an out-param |
-| `uv_for` scans ranges + hashes for ASCII | `renderer.rs:528` | per-cell overhead | Direct 128-entry LUT fast path |
-| No dirty-range updates; full `bufferData` each frame | `renderer.rs:1080`, `:1087` | full re-upload | After dirty tracking is restored, `bufferSubData` changed spans (or at minimum hoist the two rows above to shrink the upload) |
-
-### 3. Missing terminal standards (MEDIUM)
-
-`vt100` covers the core; these are unimplemented in the client:
-
-| Standard | State | Notes / Recommendation |
-|:---|:---|:---|
-| **Bracketed paste** (`DECSET 2004`) | Missing | `vt100` exposes `screen().bracketed_paste()` (used in `server/src/replay.rs:138`), but `sendPaste` (`server.html:735`) always sends raw text. Multi-line paste executes line-by-line in shells and misbehaves in vim/nano. Wrap in `ESC[200~`/`ESC[201~` when the mode is set. |
-| **Focus reporting** (`DECSET 1004`, `CSI I`/`CSI O`) | Missing | `server.html:208` handles `focus` only to repaint; TUIs (vim, tmux, opencode) that request 1004 never receive events. Forward on `focus`/`blur` when the mode is enabled. |
-| **OSC 52 clipboard** | Missing | Apps cannot set the system clipboard. Security-sensitive; needs opt-in. |
-| **OSC 8 hyperlinks** | Missing | Links render as plain text; no ctrl/cmd-click open. |
-| **Bell** (`BEL 0x07`) | Missing | No audible/visual bell. |
-| **Dynamic colors** (`OSC 4`, `OSC 10/11/12` sets) | Partial | `OSC 11` is *queried* and answered with a constant (`query.rs`), but set requests never reach the renderer. |
-| **DECRQM / DA3** (`CSI ? Ps $p`, `CSI = c`) | Missing | Some apps probe mode support; unanswered = assume unsupported. |
-| **Kitty keyboard / modifyOtherKeys** | Partial | `query.rs` answers `CSI ? u` with flags 0, but `key_to_bytes` still emits kitty-style `CSI N;m u` for modified Enter — the flags-0 reply and the emitted input disagree. `modifyOtherKeys` itself is unimplemented, yet XTGETTCAP `km` advertises `ESC[>4;m`. Reconcile flags, advertised capability, and emitted keys. |
-| **OSC 133 shell integration / OSC 7 cwd** | Missing | Prompt marking / cwd tracking absent. |
-
-### 4. Comments, docs, and complexity observations (LOW)
-
-- Documentation quality is high and mostly current; `NOTES.md` correctly records
-  the focus-loss root cause. No stale comments found.
-- File/function sizes exceed the skill's thresholds (`renderer.rs` 1595 lines;
-  `state.rs` 1346; `handlers.rs` 540; `server.html` 1010), but the code is
-  cohesive and heavily sectioned; splitting is optional, not debt.
-- `handlers.rs:474` `ws_recv_task` serializes every input frame through
-  `spawn_blocking(...).await`, one at a time. Correct, but a batching writer
-  would reduce per-frame overhead during paste.
+| Finding | Location | Severity | Description & Remediation |
+|:---|:---|:---:|:---|
+| **Cross-Site WebSocket Hijacking (CSWSH) & LAN Shell Access** | `server/src/main.rs:35-40`<br>`server/src/handlers.rs:308-320` | **Critical** | The server defaults to binding `0.0.0.0:3000`, exposing shell access to the entire local network without authentication. Furthermore, `ws_handler` does not validate the HTTP `Origin` header. WebSockets are not restricted by CORS preflights; any website visited in a user's browser can initiate `new WebSocket("ws://localhost:3000/ws")` and send arbitrary shell commands to run under the local user's account.<br>**Fix:** Support configuring `host` via `.config/bitshift/krust/config.json` (defaulting to `127.0.0.1` to restrict access by default, with an option to set `0.0.0.0` for trusted LAN environments). In `ws_handler`, validate the `Origin` header against an allowlist (same host and explicitly allowed origins like `localhost:5000`). |
+| **Unbounded Session Spawning (Denial of Service)** | `server/src/handlers.rs:313-328`<br>`server/src/session.rs:204-245` | **High** | Connecting with `?s=<id>` triggers `get_or_create_session`, which spawns a system shell subprocess (`portable-pty`), background reader thread, 512 KB history buffer, and mirror parser. Sessions are never evicted from `state.sessions`. Rapid connections with randomized session IDs can exhaust system PTYs, file descriptors, and process limits.<br>**Fix:** Enforce a maximum concurrent session cap (e.g. 16) and implement idle cleanup for abandoned sessions. |
+| **Unsanitized URI Scheme in OSC 8 Hyperlinks** | `client/res/server.html:940-945` | **Medium** | When opening an OSC 8 link on Ctrl/Cmd-click, the page invokes `window.open(uri, '_blank', 'noopener,noreferrer')` without scheme validation. Untrusted output emitting `\x1b]8;;javascript:...` or `data:...` links can trigger client-side script execution (XSS).<br>**Fix:** Validate that the URI protocol is strictly `http:`, `https:`, or `mailto:` before calling `window.open`. |
 
 ---
 
-## Top Priority Action Plan
+### 2. Memory & Resource Management (HIGH / MEDIUM)
 
-1. **[Critical]** Stop cloning `vt100::Screen` per WebSocket frame: compute dirty
-   cells only at render time, and skip it on the GL path (`state.rs:394`,
-   `state.rs:437-477`). This is the paste fix.
-2. **[High]** Cut GL instance count: skip default-bg and blank-cell quads; cache
-   attribute locations; reuse scratch buffers
-   (`renderer.rs:947-1243`).
-3. **[High]** Remove the client paste throttle and widen the server PTY read
-   buffer (`server.html:733-747`, `server/src/session.rs:261`); make PTY writes
-   wait, not drop (`handlers.rs:482`, `handlers.rs:513`).
-4. **[Medium]** Implement bracketed paste and focus reporting — the two standards
-   users hit immediately.
-5. **[Low]** Document the deliberate kitty-keyboard limitation.
+| Finding | Location | Severity | Description & Remediation |
+|:---|:---|:---:|:---|
+| **Per-Frame CString Leak in `process_bytes`** | `client/src/exports.rs:252-278`<br>`client/res/server.html:662-665` | **High** | `process_bytes` allocates a JSON string in WASM linear memory (`write_string_to_wasm(json)`) and returns a boxed `[u32; 2]` pair. In `handleWsData` (and `SELFTEST`, `render-test.html`, `index.html`), callers only execute `free_result(summaryPtr)`, which frees the 8-byte boxed pair but **never calls `free_string(dataPtr)`**. Over thousands of frames, ~70 bytes per frame are leaked continuously into WASM memory. The JSON summary is never even consumed by JS.<br>**Fix:** Change `process_bytes` to return `void` (or an integer code), avoiding both the heap allocation and the leak. |
+| **JS Object Handle Leaks in `krust_runtime.js`** | `client/res/krust_runtime.js:64-66`<br>`client/src/measure.rs:43-50`<br>`client/src/exports.rs:473` | **Medium** | `krust_window()` and `krust_window_document()` append `window` and `document` to the JS `heap` array on every resize, measurement, and `grid_metrics()` call without corresponding `krust_release()` calls. Similarly, `rebuild_webgl` creates new GL resources while old texture/shader handles remain in `heap`.<br>**Fix:** Assign static reserved handle IDs in `krust_runtime.js` for permanent objects like `window` (1) and `document` (2). |
+| **Potential Allocator Mismatch in `alloc` / `dealloc`** | `client/src/exports.rs:948-964` | **Low** | `alloc(size)` creates a `Vec::with_capacity(size)` and forgets it. Allocators may round up capacity (`capacity >= size`). `dealloc(ptr, size)` reconstructs `Vec::from_raw_parts(ptr, size, size)`. If the allocated capacity exceeded `size`, this violates the safety precondition that capacity must equal the original allocation capacity.<br>**Fix:** Use `std::alloc::alloc` and `std::alloc::dealloc` with explicit `Layout`. |
+
+---
+
+### 3. Terminal Protocol & Usability (MEDIUM)
+
+| Finding | Location | Severity | Description & Remediation |
+|:---|:---|:---:|:---|
+| **Non-ASCII Unicode Keystrokes Dropped** | `client/src/input.rs:29-31, 133-140`<br>`client/res/server.html:843-847` | **Medium** | `input.rs` uses `is_printable_ascii(c)` to gate single-character keyboard input. Any accented character (`é`, `ü`, `ñ`), non-Latin character (Cyrillic, Greek, Arabic, CJK), or emoji returns `false`. `map_key` returns an empty byte slice and `server.html` drops the event. Users cannot type non-ASCII characters directly into the terminal.<br>**Fix:** Replace `is_printable_ascii(c)` on the single-character pass-through with `!c.is_control()`, allowing all non-control unicode scalar values to be encoded as UTF-8. |
+| **Keyboard Paste Bypasses Bracketed Paste** | `client/res/server.html:805-818` | **Medium** | When pasting via Ctrl+Shift+V, Cmd+V, or Shift+Insert, the event handler reads clipboard text and calls `ws.send(data)` directly with raw text instead of calling `sendPaste(text)`. Bracketed paste (`DECSET 2004`) wrapping (`ESC[200~` ... `ESC[201~`) is bypassed for keyboard paste, breaking multiline paste and auto-indent in Vim, Nano, and shells.<br>**Fix:** Call `sendPaste(text)` in the clipboard read promise handler. |
+| **Permanent Session Lockup After Shell Exit** | `server/src/session.rs:278-321`<br>`server/src/handlers.rs:523-536` | **Medium** | When a shell process exits (e.g. typing `exit`), the PTY reader thread encounters EOF and exits. The WebSocket connection closes. However, because sessions persist indefinitely in `state.sessions`, refreshing the page or reconnecting returns the dead session. The reconnected terminal is permanently unresponsive.<br>**Fix:** Track session vitality (e.g. `is_alive: Arc<AtomicBool>`); when `get_or_create_session` encounters a dead session, purge it and spawn a new shell. |
+| **Stale Hyperlink (`OSC 8`) Coordinates on Scroll / Clear** | `client/src/state.rs:141-155` | **Low** | `LinkSpan` stores absolute `(row, col)` screen coordinates. When the terminal scrolls or screen clears, link spans are not shifted or cleared. Newly drawn text at those cell positions can falsely match old hyperlink coordinates.<br>**Fix:** Clear or adjust link spans when the grid scrolls or screen is erased. |
+
+---
+
+### 4. Code Hygiene & Maintenance (LOW)
+
+| Finding | Location | Severity | Description & Remediation |
+|:---|:---|:---:|:---|
+| **Compiler & Clippy Warnings** | `client/src/state.rs:904-905`<br>`client/src/query.rs:37`<br>`client/src/ffi.rs:348`<br>`client/src/mouse.rs:67` | **Low** | Unused variables `css_w` and `css_h` in `render_dirty_cells` (left over from canvas-clear removal); `manual_is_multiple_of` in `query.rs`; `too_many_arguments` in FFI/mouse reporting.<br>**Fix:** Prefix unused variables with underscores (or remove), and apply suggested Clippy idioms. |
+| **Accidental Debug Logs & Dumps Committed to Git** | Repository Root | **Low** | `console-export-2026-10-8_17-40-56.log`, `console-export-2026-10-8_21-4-17.log`, and `dump.txt` are tracked in git and contain local filesystem paths and escape dumps. In addition, `client/pkg/` and `client/target/` are missing from `.gitignore`.<br>**Fix:** Remove the files from git tracking and add `*.log`, `dump.txt`, `client/pkg`, and `client/target` to `.gitignore`. |
+
+---
+
+## Remediation Plan
+
+1. **[Immediate / Security]** Implement `.config/bitshift/krust/config.json` for host/port binding (defaulting `host` to `127.0.0.1`, configurable to `0.0.0.0`), and restrict WebSocket origins in `handlers.rs`.
+2. **[Immediate / Performance]** Remove JSON string allocation from `process_bytes` in `exports.rs` to stop WASM frame memory leakage.
+3. **[Immediate / Usability]** Permit non-ASCII unicode characters in `input.rs` (`!c.is_control()`).
+4. **[High / Usability]** Route keyboard paste shortcuts in `server.html` through `sendPaste()` to respect bracketed paste mode.
+5. **[High / Stability]** Detect terminated shell sessions in `session.rs` and replace dead sessions on reconnect.
+6. **[Medium / Security]** Sanitize OSC 8 hyperlink schemes in `server.html` before executing `window.open`.
+7. **[Low / Cleanliness]** Clean up Clippy warnings, remove git-tracked logs/dump, and update `.gitignore`.
+
+---
+
+## Previous Audit Status (2026-10-07)
+
+All findings from the previous audit (double screen cloning on live output, GL full-grid reupload, missing bracketed paste/focus/OSC standards) were resolved in phases 0–4 and verified with the regression test suite. The new findings above reflect issues discovered in subsequent review and commits.
