@@ -123,9 +123,23 @@
                 lastScheduleAt = performance.now();
                 requestAnimationFrame(() => {
                     renderScheduled = false;
-                    try { repaint(); } catch (e) { reportRenderError(e); }
+                    try { repaintChecked(); } catch (e) { reportRenderError(e); }
                 });
             }
+        }
+
+        // Repaint, but only after making sure there is a context to paint into.
+        // A WebGL context can go away with no involvement from the page at all —
+        // an iframe whose host put it in a `display: none` container, or a GPU
+        // process that got recycled — and repainting into a lost context is a
+        // silent no-op. Without this check the screen keeps its last painted
+        // frame forever while the grid moves on, which looks like a frozen
+        // terminal, and `webglcontextrestored` may never arrive to rescue it.
+        function repaintChecked() {
+            try {
+                if (webgl_context_lost() === 1) rebuild_webgl();
+            } catch (e) { reportRenderError(e); }
+            try { repaint(); } catch (e) { reportRenderError(e); }
         }
 
         const params = new URLSearchParams(location.search);
@@ -289,7 +303,7 @@
             if (!document.hidden) {
                 // Flip the DECSCUSR blink phase (no-op unless the app chose
                 // a blinking cursor style), then repaint the frame.
-                try { blink_tick(); repaint(); } catch (e) { reportRenderError(e); }
+                try { blink_tick(); repaintChecked(); } catch (e) { reportRenderError(e); }
                 // If a frame was scheduled but its rAF has not fired within
                 // well over an interval, the browser dropped or throttled the
                 // callback (rAF can stall under frame-rate limiting while the
@@ -299,7 +313,11 @@
                 // last painted frame.
                 if (renderScheduled && performance.now() - lastScheduleAt > 400) {
                     renderScheduled = false;
-                    try { repaint(); } catch (e) { reportRenderError(e); }
+                    // Clearing the flag above only helps if this repaint can
+                    // actually draw: a context lost while the frame was not
+                    // being drawn must be rebuilt first, or the flag is cleared
+                    // with nothing painted and the screen stays as it was.
+                    try { repaintChecked(); } catch (e) { reportRenderError(e); }
                 }
             }
         }, 500);
