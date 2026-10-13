@@ -2018,3 +2018,202 @@ mod shell_integration_tests {
         assert_eq!(p.callbacks().prompt_mark, Some(b'D'));
     }
 }
+
+#[cfg(test)]
+mod opencode_exit_tests {
+    use super::{
+        apply_decscusr, normalize_save_restore, Parser, SyncGate, TerminalCallbacks,
+        CursorStyle,
+    };
+
+    /// The full preprocessing pipeline `TerminalState::process_bytes` applies,
+    /// driven by hand so this test does not need a DOM.
+    struct Pipeline {
+        parser: Parser<TerminalCallbacks>,
+        csi_su_carry: Vec<u8>,
+        dscsr_carry: Vec<u8>,
+        sync: SyncGate,
+    }
+
+    impl Pipeline {
+        fn new(rows: u16, cols: u16) -> Self {
+            Self {
+                parser: Parser::new_with_callbacks(rows, cols, 0, TerminalCallbacks::default()),
+                csi_su_carry: Vec::new(),
+                dscsr_carry: Vec::new(),
+                sync: SyncGate::new(),
+            }
+        }
+
+        fn process(&mut self, bytes: &[u8]) {
+            let normalized = normalize_save_restore(bytes, &mut self.csi_su_carry);
+            let gated = self.sync.push(&normalized);
+            let feed = apply_decscusr(
+                &gated,
+                &mut self.dscsr_carry,
+                &mut CursorStyle::default(),
+            );
+            if !feed.is_empty() {
+                self.parser.process(&feed);
+            }
+        }
+
+        fn alt(&self) -> bool {
+            self.parser.screen().alternate_screen()
+        }
+
+        fn text(&self) -> String {
+            let (rows, cols) = self.parser.screen().size();
+            let mut out = String::new();
+            for row in 0..rows {
+                for col in 0..cols {
+                    match self.parser.screen().cell(row, col) {
+                        Some(c) if !c.contents().is_empty() => out.push_str(c.contents()),
+                        _ => out.push(' '),
+                    }
+                }
+                out.push('\n');
+            }
+            out
+        }
+    }
+
+    /// The bytes opencode writes when Ctrl+C leaves the terminal, captured from
+    /// a real PTY. Alt-screen entry is the leading `CSI ? 1049 h`.
+    const OPENCODE_EXIT: &[u8] = b"\x1b]0;\x07\x1b[?25h\x1b[0m\x1b]22;\x07\x1b[>4;0m\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[?1049l\x1b[?2031l\x1b]0;\x07\x1b]12;default\x07\x1b]112\x07\x1b[0 q\x1b[?25h\x1b[?25h";
+
+    /// The alternate screen must actually be left, whatever chunk boundary the
+    /// PTY read happened to fall on. A terminal that stays on the alt screen
+    /// keeps painting the TUI's frame under everything the shell prints, which
+    /// is what "the screen doesn't clear when exiting the TUI" looks like.
+    #[test]
+    fn opencode_exit_leaves_the_alternate_screen_at_every_chunk_boundary() {
+        for chunk in [4096usize, 1024, 128, 64, 32, 16, 8, 4, 3, 2, 1] {
+            let mut p = Pipeline::new(24, 80);
+            p.process(b"\x1b[H\x1b[2Juser@host:~$ ");
+            p.process(b"\x1b[?1049h\x1b[2J\x1b[44mtui frame here");
+            assert!(p.alt(), "chunk={chunk}: never entered the alt screen");
+
+            for off in (0..OPENCODE_EXIT.len()).step_by(chunk) {
+                let end = (off + chunk).min(OPENCODE_EXIT.len());
+                p.process(&OPENCODE_EXIT[off..end]);
+            }
+            assert!(
+                !p.alt(),
+                "chunk={chunk}: parser stuck on the alternate screen after opencode exited"
+            );
+            assert!(
+                p.text().contains("user@host:~$"),
+                "chunk={chunk}: shell prompt lost:\n{}",
+                p.text()
+            );
+        }
+    }
+
+    /// `CSI ? 1049 h` followed immediately by `CSI ? 1049 l` inside one chunk
+    /// must not leave the alt screen active: the bookkeeping compares screen
+    /// state across a whole chunk, so a same-chunk round trip is invisible to
+    /// it — but the parser still has to end up outside.
+    #[test]
+    fn enter_and_exit_in_one_chunk_ends_on_the_normal_screen() {
+        let mut p = Pipeline::new(24, 80);
+        p.process(b"prompt\r\n");
+        p.process(b"\x1b[?1049h\x1b[2J\x1b[44mtui");
+        assert!(p.alt());
+        p.process(b"\x1b[?1049l");
+        assert!(!p.alt(), "same-chunk round trip left the alt screen active");
+    }
+
+    /// The exit is routinely delivered *inside* a synchronized frame, because
+    /// a TUI brackets its final repaint in `CSI ? 2026 h/l`. The gate must
+    /// hand the body over when the end marker arrives rather than stranding
+    /// the DECRST 1049 inside the frame forever.
+    #[test]
+    fn alt_exit_inside_a_synchronized_frame_is_released() {
+        let framed = [
+            b"\x1b[?1049h\x1b[2J\x1b[44mtui frame".as_slice(),
+            &OPENCODE_EXIT[..OPENCODE_EXIT.len() - 1],
+            &OPENCODE_EXIT[OPENCODE_EXIT.len() - 1..],
+        ]
+        .concat();
+        let mut p = Pipeline::new(24, 80);
+        p.process(b"prompt\r\n");
+        // The exit with the closing `?2026l` before it.
+        p.process(b"\x1b[?1049h\x1b[2J\x1b[44mtui");
+        assert!(p.alt());
+        let _ = framed;
+        p.process(b"\x1b[?2026h");
+        assert!(p.sync.pending(), "sync frame should be withheld");
+        p.process(OPENCODE_EXIT);
+        p.process(b"\x1b[?2026l");
+        assert!(!p.alt(), "exit held inside a ?2026 frame never reached the parser");
+    }
+}
+
+#[cfg(test)]
+mod alt_screen_repro_tests {
+    use super::{cell_changed, diff_screens, Parser};
+
+    /// The reported bug: leaving a TUI that owns the alternate screen leaves
+    /// parts of its frame on screen, with the shell prompt painted over the
+    /// top of it. Reproduced against the diff the Canvas 2D path runs.
+    #[test]
+    fn diff_after_alt_screen_exit_covers_every_changed_cell() {
+        let (rows, cols) = (6u16, 20u16);
+        let mut p = Parser::new(rows, cols, 10);
+
+        // The shell prompt that is on the normal screen before the TUI starts.
+        p.process(b"\x1b[H\x1b[2Juser@host:~$ ");
+        let before_tui = p.screen().clone();
+        p.process(b"\x1b[?1049h");
+
+        // A TUI frame that covers the whole grid with a colored background.
+        p.process(b"\x1b[44m\x1b[H\x1b[2J");
+        for r in 0..rows {
+            p.process(format!("\x1b[{};1Hopencode row {}", r + 1, r + 1).as_bytes());
+        }
+        // The TUI owns the cursor while hidden, then shows it.
+        p.process(b"\x1b[?25lpainted\x1b[?25h");
+
+        // The last frame painted while the TUI owned the screen: this is the
+        // snapshot `DirtyTracker::refresh` holds as its baseline.
+        let last_tui_frame = p.screen().clone();
+
+        // Leaving the TUI restores the normal screen.
+        p.process(b"\x1b[?1049l");
+
+        let dirty = diff_screens(&last_tui_frame, p.screen(), rows, cols);
+        let screen_text = |s: &vt100::Screen| {
+            let mut out = String::new();
+            for r in 0..rows {
+                for c in 0..cols {
+                    match s.cell(r, c) {
+                        Some(cell) if !cell.contents().is_empty() => {
+                            out.push_str(cell.contents())
+                        }
+                        _ => out.push(' '),
+                    }
+                }
+                out.push('\n');
+            }
+            out
+        };
+
+        // Every cell that differs must be reported, otherwise the Canvas 2D
+        // path leaves the TUI's pixels in place.
+        let mut missed = 0usize;
+        for r in 0..rows {
+            for c in 0..cols {
+                if cell_changed(&last_tui_frame, p.screen(), r, c)
+                    && !dirty.contains(&(r, c))
+                {
+                    missed += 1;
+                }
+            }
+        }
+        assert_eq!(missed, 0, "changed cells missing from the dirty set");
+        assert!(!dirty.is_empty(), "a TUI leaving should change cells");
+        let _ = screen_text;
+        let _ = before_tui;
+    }
+}

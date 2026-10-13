@@ -17,7 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::broadcast;
 
-use crate::replay::replay_image;
+use crate::replay::{alt_align_prelude, replay_image};
 use crate::session::{
     binary_chunks, get_or_create_session, pty_size, pty_write_locked, AppState, History, MirrorArc,
     StreamOffset,
@@ -387,12 +387,26 @@ async fn handle_socket(
     {
         return;
     }
-    for frame in binary_chunks(log.to_vec()) {
+    // The Reset dropped the client's parser, so the replacement always starts
+    // on the normal screen. Point it at whichever screen the mirror currently
+    // owns *before* the retained window is replayed, or a window that rotated
+    // past the `CSI ? 1049 h` that entered it writes the TUI's cells into the
+    // normal grid. The image alone repairs the visible screen; the polluted
+    // normal grid is what surfaced when the TUI later exited.
+    let mut replay: Vec<u8> = Vec::with_capacity(log.len() + 8);
+    if let Some(prelude) = alt_align_prelude(false, mirror_screen.alternate_screen()) {
+        replay.extend_from_slice(prelude);
+    }
+    replay.extend_from_slice(log);
+    for frame in binary_chunks(replay.clone()) {
         if ws_sender.send(frame).await.is_err() {
             return;
         }
     }
-    let image = replay_image(&mirror_screen, log);
+    // The image's baseline must be exactly what the client has consumed —
+    // the prelude above included — or the diff is taken against a parser that
+    // is on the wrong screen and paints the wrong grid.
+    let image = replay_image(&mirror_screen, &replay);
     for frame in binary_chunks(image) {
         if ws_sender.send(frame).await.is_err() {
             return;

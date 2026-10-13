@@ -26,6 +26,25 @@
 // stream is ordinary terminal output — no client or protocol changes.
 use vt100::Parser;
 
+/// The private-mode prelude that moves a parser from the normal screen to the
+/// alternate one, or `None` when no change is needed.
+///
+/// A client that has just been reset (`{"type":"Reset"}`) drops its parser, and
+/// the replacement always starts on the normal screen. Replaying a retained
+/// window that describes the alternate screen onto that normal grid is what
+/// left a TUI's frame painted under the shell's output: the window had rotated
+/// past the `CSI ? 1049 h` that entered it, so nothing in the replayed bytes
+/// switched grids and the TUI's cells were written into the normal screen's
+/// rows. The image fixes the *visible* screen, but the polluted normal grid
+/// becomes visible the moment the TUI exits.
+pub(crate) fn alt_align_prelude(currently_alt: bool, want_alt: bool) -> Option<&'static [u8]> {
+    match (currently_alt, want_alt) {
+        (false, true) => Some(b"\x1b[?1049h"),
+        (true, false) => Some(b"\x1b[?1049l"),
+        _ => None,
+    }
+}
+
 /// Build the ANSI stream that repaints the mirror's current screen.
 ///
 /// `mirror_screen` is a clone of the mirror's screen, taken under the mirror
@@ -42,16 +61,12 @@ pub(crate) fn replay_image(mirror_screen: &vt100::Screen, retained: &[u8]) -> Ve
     let mut img: Vec<u8> = Vec::new();
 
     let want_alt = mirror_screen.alternate_screen();
-    if prev.screen().alternate_screen() != want_alt {
+    if let Some(prelude) = alt_align_prelude(prev.screen().alternate_screen(), want_alt) {
         // Idempotent by vt100 semantics: DECSET 1049 always clears the alt
         // grid before entering, and DECRST 1049 is a no-op while already on
         // the normal screen. Apply the same prelude to `prev` so both sides
         // are diffing the same screen kind.
-        img.extend_from_slice(if want_alt {
-            b"\x1b[?1049h"
-        } else {
-            b"\x1b[?1049l"
-        });
+        img.extend_from_slice(prelude);
         prev.process(&img);
     }
 
@@ -216,5 +231,58 @@ mod tests {
         let mut client = Parser::new(6, 60, 0);
         client.process(&replay_image(mirror.screen(), b""));
         assert_screens_equal(&client, &mirror);
+    }
+
+    /// The regression behind "the screen doesn't clear when exiting the TUI":
+    /// a reset client's parser always starts on the normal screen, so a
+    /// retained window that has rotated past the `CSI ? 1049 h` that entered
+    /// the alternate screen wrote the TUI's cells into the *normal* grid. The
+    /// image repaired the visible (alternate) screen, and the polluted normal
+    /// grid surfaced the moment the TUI exited — the TUI's frame with the
+    /// shell's prompt painted over the top of it.
+    #[test]
+    fn the_window_replay_is_aligned_to_the_mirrors_screen() {
+        let mut mirror = Parser::new(8, 40, 0);
+        mirror.process(b"shell prompt\r\n");
+        mirror.process(b"\x1b[?1049h\x1b[2J\x1b[44mtui frame");
+        assert!(mirror.screen().alternate_screen());
+
+        // A window that starts after the entry marker: TUI painting only.
+        let retained: &[u8] = b"\x1b[44m\x1b[H\x1b[2Jmore tui frame";
+
+        // What the server now sends: Reset, then the alignment prelude, then
+        // the window, then the image (built against exactly those bytes).
+        let mut replayed: Vec<u8> = Vec::new();
+        replayed.extend_from_slice(
+            alt_align_prelude(false, mirror.screen().alternate_screen()).unwrap(),
+        );
+        replayed.extend_from_slice(retained);
+        replayed.extend_from_slice(&replay_image(mirror.screen(), &replayed));
+
+        // A freshly reset client starts on the normal screen, exactly as
+        // `reset_terminal` leaves it.
+        let mut client = Parser::new(8, 40, 0);
+        client.process(&replayed);
+        assert_screens_equal(&client, &mirror);
+
+        // Leaving the TUI must fall back to a clean normal screen: no leftover
+        // TUI content painted into it by the window replay.
+        client.process(b"\x1b[?1049l");
+        assert!(!client.screen().alternate_screen());
+        assert!(
+            !screen_text(&client).contains("tui"),
+            "the retained window leaked the TUI into the normal screen:\n{}",
+            screen_text(&client)
+        );
+    }
+
+    /// The prelude only appears when the grids differ; on the normal screen it
+    /// is absent, so the common case is byte-for-byte unchanged.
+    #[test]
+    fn alignment_prelude_is_only_emitted_when_the_grids_differ() {
+        assert_eq!(alt_align_prelude(false, false), None);
+        assert_eq!(alt_align_prelude(true, true), None);
+        assert_eq!(alt_align_prelude(false, true), Some(b"\x1b[?1049h".as_slice()));
+        assert_eq!(alt_align_prelude(true, false), Some(b"\x1b[?1049l".as_slice()));
     }
 }
