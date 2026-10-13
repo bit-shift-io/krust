@@ -1027,7 +1027,9 @@
             selAnchor = null;
             const text = callStringExport(selected_text);
             if (text) {
-                try { navigator.clipboard.writeText(text); showStatus('copied ' + text.length + ' chars'); } catch (_) {}
+                navigator.clipboard.writeText(text).then(() => {
+                    showStatus('copied ' + text.length + ' chars');
+                });
             }
         });
 
@@ -1075,7 +1077,9 @@
             touchSel = null;
             const text = callStringExport(selected_text);
             if (text) {
-                try { navigator.clipboard.writeText(text); showStatus('copied ' + text.length + ' chars'); } catch (_) {}
+                navigator.clipboard.writeText(text).then(() => {
+                    showStatus('copied ' + text.length + ' chars');
+                });
             }
         });
 
