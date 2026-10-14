@@ -60,6 +60,21 @@ pub(crate) fn cell_is_selected(
     }
 }
 
+/// Whether a grid cell carries a glyph a selection could include.
+///
+/// A never-written cell and a cell holding a space are both blank, but they do
+/// not look the same to `vt100`: a printed space reports contents `" "` while an
+/// unwritten one reports `""`. Testing for emptiness alone would therefore put
+/// the text cursor over every space in a `ls -l` listing, so the contents have
+/// to be trimmed as well.
+///
+/// The trailing half of a wide character reports empty contents but is still
+/// part of a glyph the user can see, so it counts as text too — otherwise the
+/// cursor would vanish over the right half of every CJK cell.
+pub(crate) fn cell_holds_text(cell: &vt100::Cell) -> bool {
+    !cell.contents().trim().is_empty() || cell.is_wide_continuation()
+}
+
 /// Extract the text between two grid coordinates as a line-based (text-flow)
 /// selection.
 ///
@@ -254,5 +269,35 @@ mod tests {
         parser.process(&feed);
         let corner = (DEFAULT_ROWS - 1, DEFAULT_COLS - 1);
         assert_eq!(extract_selection(parser.screen(), corner, corner), "x");
+    }
+
+    // --- Which cells the text cursor belongs over -------------------------------
+
+    #[test]
+    fn cell_holds_text_distinguishes_glyphs_from_blanks_and_spaces() {
+        let mut parser = Parser::new(2, 8, 0);
+        parser.process(b"ab c");
+        let screen = parser.screen();
+        // Glyphs count.
+        assert!(cell_holds_text(screen.cell(0, 0).unwrap()));
+        // A printed space is blank to the user, even though vt100 gives it
+        // contents " ".
+        assert!(!cell_holds_text(screen.cell(0, 2).unwrap()));
+        // A never-written cell is blank.
+        assert!(!cell_holds_text(screen.cell(0, 5).unwrap()));
+        // ...and so is a cell on a row nothing was ever written to.
+        assert!(!cell_holds_text(screen.cell(1, 0).unwrap()));
+    }
+
+    #[test]
+    fn cell_holds_text_covers_both_halves_of_a_wide_glyph() {
+        let mut parser = Parser::new(2, 8, 0);
+        parser.process("中".as_bytes());
+        let screen = parser.screen();
+        // The leading half carries the glyph.
+        assert!(cell_holds_text(screen.cell(0, 0).unwrap()));
+        // The trailing half reports empty contents but is still visible, so the
+        // cursor must not vanish there.
+        assert!(cell_holds_text(screen.cell(0, 1).unwrap()));
     }
 }

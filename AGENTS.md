@@ -154,6 +154,28 @@ Krust is a Rust terminal emulator with a two-crate workspace:
   Grit UI) rejects every write for the same reason, which is why the toast says
   to click the page first — do not "fix" that by writing the clipboard without
   a user gesture.
+- **OSC 52 is how TUIs copy, and it is on by default** (`?clipboard=0` opts
+  out). It used to be opt-in on the reasoning that a hostile program in the PTY
+  could clobber a password you just copied — but krust is a local terminal and
+  that program is the user's own, so gating it only broke the copy path every
+  TUI uses: opencode's yank, vim's `"+y`. Those apps emit the sequence and show
+  their own "copied" toast with no way to learn the terminal discarded the
+  payload, which is exactly the silent-failure class above. When the payload
+  *is* dropped, the page still says so (`app requested clipboard copy - reopen
+  with ?clipboard=1`) rather than letting the app's toast stand unchallenged.
+  The base64 payload is kept encoded on purpose: `atob` and `TextDecoder` in
+  the page know the browser's text conventions, and `from_utf8_lossy` on the
+  Rust side would mangle binary clipboard content.
+- **The text cursor follows glyphs, not the canvas.** `#terminal-canvas` has
+  no blanket `cursor: text`; the `mousemove` handler asks `cell_has_text`
+  instead. Two reasons it cannot be simpler: the grid is centered in a canvas
+  that is usually larger than it, so most of the surface is outside the grid
+  (and `cellFromPoint` *clamps* out-of-range points to the nearest cell, which
+  is right for extending a drag and wrong for a cursor — hence `pointInGrid`),
+  and a printed space reports contents `" "` to `vt100` while an unwritten cell
+  reports `""`, so emptiness alone would put the I-beam over every blank.
+  `cell_holds_text` (`selection.rs`) trims and also counts the trailing half of
+  a wide glyph, which reports empty contents but is part of a visible glyph.
 - **Tests:** Unit tests live alongside code in `#[cfg(test)] mod tests`.
   Server tests use `tower::util::ServiceExt` for one-shot HTTP requests.
 - **CORS:** `tower-http::cors::CorsLayer::permissive()` is enabled on all
@@ -251,6 +273,7 @@ the `krust` FFI registry.
 | `selected_text()` | Extract selected text (boxed pair) |
 | `clear_selection()` | Clear active selection |
 | `handle_click(x, y)` | Clear selection, return clicked cell (boxed pair) |
+| `cell_has_text(row, col)` | `1` when the cell holds a glyph (i32) |
 | `scroll_to*`, `scroll_offset`, `scrollback_len`, `selection_mode` | Scrollback/selection introspection |
 | `is_alt_screen()` | `1` while the parser owns the alternate screen (alt buffer) |
 | `grid_metrics()` | Grid origin, cell box (`cw`/`ch`), and row/col counts as JSON (boxed pair) |

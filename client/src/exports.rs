@@ -11,7 +11,7 @@ use crate::ffi;
 use crate::input::map_key;
 use crate::measure::measure_cell_dimensions;
 use crate::query::collect_query_replies_with_modes;
-use crate::selection::extract_selection;
+use crate::selection::{cell_holds_text, extract_selection};
 use crate::state::{bracketed_paste_bytes, TerminalState, TERM_STATE};
 
 // --- Minimal JSON support -------------------------------------------------
@@ -522,6 +522,27 @@ pub extern "C" fn selected_text() -> *mut u8 {
     });
     let (ptr, len) = write_string_to_wasm(s);
     return_pair(ptr as *mut u8, len)
+}
+
+/// Whether the cell at (`row`, `col`) holds a glyph: `1` yes, `0` no.
+///
+/// The page uses this to decide when to show the text cursor. The grid is
+/// centered in the canvas and is usually narrower than the window, so most of
+/// the surface is not terminal text at all; an always-on I-beam over all of it
+/// (and over every blank cell) looks like the page is broken. A blank *and* a
+/// space-held cell both answer `0` — see [`cell_holds_text`].
+#[no_mangle]
+pub extern "C" fn cell_has_text(row: i32, col: i32) -> i32 {
+    TERM_STATE.with(|cell| {
+        let guard = cell.borrow();
+        let Some(state) = guard.as_ref() else {
+            return 0;
+        };
+        match state.parser_screen().cell(row.max(0) as u16, col.max(0) as u16) {
+            Some(c) => i32::from(cell_holds_text(c)),
+            None => 0,
+        }
+    })
 }
 
 /// Record a text selection between two grid coordinates.

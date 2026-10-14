@@ -14,9 +14,6 @@
         #scrollbar-thumb { position: absolute; left: 1px; right: 1px; border-radius: 4px; background: rgba(255,255,255,0.4); }
         canvas.bell { animation: bell-flash 0.15s ease-out; }
         @keyframes bell-flash { from { filter: brightness(2.2); } to { filter: brightness(1); } }
-        /* The whole surface is text: drag to select. The mousemove handler
-           swaps in a pointer only over an OSC 8 link. */
-        #terminal-canvas { cursor: text; }
     </style>
 </head>
 <body>
@@ -38,6 +35,7 @@
                 webgl_context_lost, reset_terminal, reset_prev_screen,
                 handle_click,
                 key_to_bytes, set_selection, selected_text, clear_selection,
+                cell_has_text,
                 scroll, scroll_to, scroll_to_bottom, scroll_to_top,
                 scroll_offset, scrollback_len, is_alt_screen, grid_metrics, version,
                 mouse_event, mouse_tracking, application_cursor,
@@ -148,10 +146,15 @@
         const params = new URLSearchParams(location.search);
         const sid = params.get('s') || params.get('session') || (Math.random().toString(36).substring(2, 6));
         const startDir = params.get('dir');
-        // OSC 52 lets an application replace the system clipboard, which is a
-        // security-sensitive capability (a hostile program could clobber a
-        // password you just copied). It stays off unless explicitly enabled.
-        const clipboardOptIn = params.get('clipboard') === '1';
+        // OSC 52 lets an application replace the system clipboard. It used to
+        // be opt-in (?clipboard=1) because a hostile program could clobber a
+        // password you just copied — but krust is a local terminal emulator and
+        // the program in the PTY is the user's own, so gating it only broke the
+        // copy path every TUI uses (opencode's yank, vim's "+y): the app emits
+        // the sequence, shows its own "copied" toast, and has no way to know
+        // the terminal threw the payload away. Default on, opt out with
+        // ?clipboard=0 for the paranoid case.
+        const clipboardOptIn = params.get('clipboard') !== '0';
 
         const reflected = params.get('s') || params.get('session');
         if (reflected !== sid) {
@@ -513,6 +516,20 @@
             return { row, col };
         }
 
+        // Whether a point is actually inside the grid rectangle. `cellFromPoint`
+        // deliberately clamps out-of-range points to the nearest cell so a drag
+        // that runs past the edge extends the selection to the last cell; the
+        // grid is also centered in a canvas that is usually wider and taller
+        // than it, so most of the surface is outside the grid entirely. That is
+        // the wrong answer for the cursor, which has to distinguish "over a
+        // text cell" from "over the margin".
+        function pointInGrid(px, py) {
+            const rect = canvas.getBoundingClientRect();
+            const x = px - rect.left - gridX;
+            const y = py - rect.top - gridY;
+            return x >= 0 && y >= 0 && x < gridCols * cellW && y < gridRows * cellH;
+        }
+
         const scrollbarEl = document.getElementById('scrollbar');
         const scrollbarThumb = document.getElementById('scrollbar-thumb');
 
@@ -746,12 +763,25 @@
             // OSC 52: honour an application clipboard request only when the
             // user opted in via ?clipboard=1. Always drain it so a disabled
             // clipboard never accumulates payloads.
+            //
+            // The opt-in is what makes this silent-failure class possible: a
+            // TUI (opencode's yank, vim's "+y under OSC 52, ...) emits the
+            // sequence, shows its own "copied" toast, and has no way to know
+            // the terminal threw the payload away. So the drop has to say so —
+            // otherwise the user is told by the app that a copy worked, pastes
+            // somewhere, and gets whatever was already in the clipboard.
             try {
                 const b64 = callStringExport(take_clipboard);
-                if (b64 && clipboardOptIn) {
-                    const bin = atob(b64);
-                    const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
-                    copyToClipboard(new TextDecoder().decode(bytes));
+                if (b64) {
+                    if (clipboardOptIn) {
+                        const bin = atob(b64);
+                        const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+                        copyToClipboard(new TextDecoder().decode(bytes));
+                    } else {
+                        // Only the payload the app asked us to place is
+                        // dropped, never the app's own notion of a copy.
+                        showStatus('app requested clipboard copy - reopen with ?clipboard=1');
+                    }
                 }
             } catch (_) {
                 // A malformed base64 body, or take_clipboard itself throwing
@@ -1025,16 +1055,19 @@
 
         window.addEventListener('mousemove', (e) => {
             const cell = cellFromPoint(e.clientX, e.clientY);
-            // An I-beam over the grid marks it as selectable text and is what
-            // makes anchoring a drag on the right cell realistic: a word is
-            // only ~6 cells wide, so the default arrow gives no feedback at
-            // all. Only an OSC 8 link under the open modifier takes the
-            // pointer back.
+            // The text cursor belongs over glyphs only. The grid is centered
+            // and normally narrower than the window, so most of the surface is
+            // not terminal text at all (plus every blank and space-held cell):
+            // an I-beam over all of that reads as a broken page rather than as
+            // selectable text. Only an OSC 8 link under the open modifier takes
+            // the pointer back.
             const modLink = isMac ? e.metaKey : e.ctrlKey;
             if (modLink && callStringExport(hyperlink_at, cell.row, cell.col)) {
                 canvas.style.cursor = 'pointer';
-            } else {
+            } else if (pointInGrid(e.clientX, e.clientY) && cell_has_text(cell.row, cell.col) === 1) {
                 canvas.style.cursor = 'text';
+            } else {
+                canvas.style.cursor = '';
             }
             if (mousePhase === 'capture') {
                 // Report motion only while a button is actually held; the
