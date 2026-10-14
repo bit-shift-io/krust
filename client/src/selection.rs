@@ -189,4 +189,70 @@ mod tests {
         assert!(out.starts_with('a'));
         assert!(out.ends_with("hello"));
     }
+
+    // --- Edge-of-grid selection -------------------------------------------------
+    //
+    // A drag to the right or bottom edge of the terminal has an end coordinate
+    // on the last row/column. `contents_between` treats its end column as
+    // exclusive and clamps it to the grid, so the inclusive-to-exclusive `+1`
+    // below must still land on the last cell: a whole row or the entire visible
+    // grid has to come out in full, not empty.
+
+    /// Feed `text` onto the final row of a fresh `DEFAULT_ROWS`-tall screen.
+    fn parser_with_text_on_last_row(text: &[u8]) -> Parser {
+        let mut parser = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
+        let mut feed = Vec::new();
+        for _ in 0..DEFAULT_ROWS - 1 {
+            feed.extend_from_slice(b"\r\n");
+        }
+        feed.extend_from_slice(text);
+        parser.process(&feed);
+        parser
+    }
+
+    #[test]
+    fn extract_selection_to_the_last_column_copies_the_row() {
+        let mut parser = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
+        parser.process(b"abcdefghij");
+        let last_col = DEFAULT_COLS - 1;
+        assert_eq!(
+            extract_selection(parser.screen(), (0, 0), (0, last_col)),
+            "abcdefghij"
+        );
+    }
+
+    #[test]
+    fn extract_selection_of_the_whole_visible_grid_is_not_empty() {
+        let mut parser = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
+        parser.process(b"abcdefghij");
+        let last_col = DEFAULT_COLS - 1;
+        let out = extract_selection(parser.screen(), (0, 0), (DEFAULT_ROWS - 1, last_col));
+        assert!(out.contains("abcdefghij"), "got {out:?}");
+    }
+
+    #[test]
+    fn extract_selection_on_the_last_row_copies_its_text() {
+        let parser = parser_with_text_on_last_row(b"abcdefghij");
+        let out = extract_selection(
+            parser.screen(),
+            (DEFAULT_ROWS - 1, 0),
+            (DEFAULT_ROWS - 1, DEFAULT_COLS - 1),
+        );
+        assert_eq!(out, "abcdefghij");
+    }
+
+    #[test]
+    fn extract_selection_anchored_on_the_last_cell_still_yields_it() {
+        // Fill the final row edge to edge so the bottom-right cell is the last
+        // written glyph, then select that one cell.
+        let mut parser = Parser::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LEN);
+        let mut feed = Vec::new();
+        for _ in 0..DEFAULT_ROWS - 1 {
+            feed.extend_from_slice(b"\r\n");
+        }
+        feed.extend(std::iter::repeat_n(b'x', DEFAULT_COLS as usize));
+        parser.process(&feed);
+        let corner = (DEFAULT_ROWS - 1, DEFAULT_COLS - 1);
+        assert_eq!(extract_selection(parser.screen(), corner, corner), "x");
+    }
 }

@@ -14,6 +14,9 @@
         #scrollbar-thumb { position: absolute; left: 1px; right: 1px; border-radius: 4px; background: rgba(255,255,255,0.4); }
         canvas.bell { animation: bell-flash 0.15s ease-out; }
         @keyframes bell-flash { from { filter: brightness(2.2); } to { filter: brightness(1); } }
+        /* The whole surface is text: drag to select. The mousemove handler
+           swaps in a pointer only over an OSC 8 link. */
+        #terminal-canvas { cursor: text; }
     </style>
 </head>
 <body>
@@ -360,6 +363,40 @@
             }, 4000);
         }
 
+        // Write text to the system clipboard and say what happened.
+        //
+        // `navigator.clipboard.writeText` returns a promise that REJECTS rather
+        // than throwing, so calling it bare inside a try/catch swallows the
+        // failure entirely: the "copied" toast fired, the clipboard still held
+        // whatever was there before, and the paste produced text from some
+        // other source. Every copy path routes through here so a rejection is
+        // reported instead of looked like a working copy.
+        //
+        // Rejections are the normal case in a real deployment and they are
+        // never the user's fault: the document must be focused for the
+        // clipboard to be writable, and krust is embedded in an iframe by the
+        // Grit UI, so a background tab or an unfocused iframe rejects every
+        // write. The reason is logged so it is diagnosable from the console.
+        function copyToClipboard(text) {
+            if (!text) return;
+            // The Clipboard API is secure-context only, so reaching krust over
+            // plain http on a LAN IP leaves `navigator.clipboard` undefined.
+            // Without this guard every write throws a TypeError that the old
+            // bare try/catch swallowed.
+            if (!navigator.clipboard || !navigator.clipboard.writeText) {
+                showStatus('copy unavailable - open krust over https or localhost');
+                return;
+            }
+            navigator.clipboard.writeText(text).then(
+                () => showStatus('copied ' + text.length + ' chars'),
+                (err) => {
+                    console.warn('krust: clipboard write rejected', err);
+                    showStatus('copy failed: ' + ((err && err.name) || 'not permitted') +
+                        ' - click the page first, then Ctrl+C');
+                }
+            );
+        }
+
         let cellW = 8;
         let cellH = 18;
         let gridCols = 80;
@@ -444,8 +481,13 @@
             syncGrid();
         }
 
-        // Pull the fitted grid size and centered origin back from the wasm
-        // module, which owns the fit so the renderers and the PTY agree.
+        // Pull the fitted grid size, centered origin, and cell pitch back from
+        // the wasm module, which owns the fit so the renderers and the PTY
+        // agree. The cell pitch is pulled here too, on every fit, instead of
+        // being cached from `init()`: `handle_resize` re-measures and re-snaps
+        // it to whole device pixels, so a stale cache maps clicks to the wrong
+        // column/row as soon as the font resolves, the window resizes, or the
+        // dpr changes.
         function syncGrid() {
             const raw = callStringExport(grid_metrics);
             if (!raw) return;
@@ -454,6 +496,8 @@
             gridCols = m.cols;
             gridX = m.x;
             gridY = m.y;
+            if (m.cw > 0) cellW = m.cw;
+            if (m.ch > 0) cellH = m.ch;
         }
 
         function sendResize() {
@@ -707,11 +751,13 @@
                 if (b64 && clipboardOptIn) {
                     const bin = atob(b64);
                     const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
-                    navigator.clipboard
-                        .writeText(new TextDecoder().decode(bytes))
-                        .then(() => showStatus('clipboard set'), () => {});
+                    copyToClipboard(new TextDecoder().decode(bytes));
                 }
-            } catch (_) {}
+            } catch (_) {
+                // A malformed base64 body, or take_clipboard itself throwing
+                // while the state is borrowed elsewhere. Either way there is
+                // nothing actionable to report on this hot path.
+            }
             // OSC 7 shell integration: remember the cwd so the tab title can
             // fall back to it when the app sets no OSC 2 title. OSC 133 prompt
             // marks are drained here for future jump-to-prompt support.
@@ -805,9 +851,7 @@
                 const text = callStringExport(selected_text);
                 if (text) {
                     e.preventDefault();
-                    navigator.clipboard.writeText(text).then(() => {
-                        showStatus('copied ' + text.length + ' chars');
-                    });
+                    copyToClipboard(text);
                     return;
                 }
             }
@@ -981,10 +1025,17 @@
 
         window.addEventListener('mousemove', (e) => {
             const cell = cellFromPoint(e.clientX, e.clientY);
-            // Show a pointer over OSC 8 links while the open modifier is held.
+            // An I-beam over the grid marks it as selectable text and is what
+            // makes anchoring a drag on the right cell realistic: a word is
+            // only ~6 cells wide, so the default arrow gives no feedback at
+            // all. Only an OSC 8 link under the open modifier takes the
+            // pointer back.
             const modLink = isMac ? e.metaKey : e.ctrlKey;
-            canvas.style.cursor =
-                modLink && callStringExport(hyperlink_at, cell.row, cell.col) ? 'pointer' : '';
+            if (modLink && callStringExport(hyperlink_at, cell.row, cell.col)) {
+                canvas.style.cursor = 'pointer';
+            } else {
+                canvas.style.cursor = 'text';
+            }
             if (mousePhase === 'capture') {
                 // Report motion only while a button is actually held; the
                 // protocol filter in wasm drops it if the app did not ask
@@ -1026,11 +1077,7 @@
             repaint();
             selAnchor = null;
             const text = callStringExport(selected_text);
-            if (text) {
-                navigator.clipboard.writeText(text).then(() => {
-                    showStatus('copied ' + text.length + ' chars');
-                });
-            }
+            copyToClipboard(text);
         });
 
         // A right-click is reported to the app while a protocol is active, so
@@ -1076,11 +1123,7 @@
             if (!touchSel) return;
             touchSel = null;
             const text = callStringExport(selected_text);
-            if (text) {
-                navigator.clipboard.writeText(text).then(() => {
-                    showStatus('copied ' + text.length + ' chars');
-                });
-            }
+            copyToClipboard(text);
         });
 
         // Wheel deltas are not one-event-per-notch everywhere: clicky mice send a

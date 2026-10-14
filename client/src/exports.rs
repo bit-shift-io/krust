@@ -450,10 +450,17 @@ pub extern "C" fn reset_prev_screen() {
     });
 }
 
-/// Grid geometry after the last fit: `{"rows":R,"cols":C,"x":X,"y":Y}`.
+/// Grid geometry after the last fit:
+/// `{"rows":R,"cols":C,"x":X,"y":Y,"cw":W,"ch":H}`.
 ///
 /// `x`/`y` are the CSS-pixel origin of the centered grid, which the page needs
-/// to map mouse coordinates onto cells.
+/// to map mouse coordinates onto cells. `cw`/`ch` are the CSS-pixel cell dims
+/// the module actually draws at, and they are the same numbers the page must
+/// hit-test with: `handle_resize` re-measures and re-snaps them (whole device
+/// pixels, derived back through dpr), so a cached snapshot drifts away from the
+/// grid the moment the font resolves, the window resizes, or the dpr changes —
+/// every cell then maps to the wrong column/row and a selection copies the
+/// wrong text.
 #[no_mangle]
 pub extern "C" fn grid_metrics() -> *mut u8 {
     let json = TERM_STATE.with(|cell| {
@@ -463,8 +470,13 @@ pub extern "C" fn grid_metrics() -> *mut u8 {
                 let dpr = ffi::window_dpr(ffi::window()).max(1.0);
                 let (x, y) = s.origin_css(dpr);
                 format!(
-                    "{{\"rows\":{},\"cols\":{},\"x\":{},\"y\":{}}}",
-                    s.rows, s.cols, x, y
+                    "{{\"rows\":{},\"cols\":{},\"x\":{},\"y\":{},\"cw\":{},\"ch\":{}}}",
+                    s.rows,
+                    s.cols,
+                    x,
+                    y,
+                    json_f64(s.cell_width),
+                    json_f64(s.cell_height),
                 )
             })
             .unwrap_or_else(|| "{\"rows\":0,\"cols\":0,\"x\":0,\"y\":0}".to_string())

@@ -92,7 +92,12 @@ Krust is a Rust terminal emulator with a two-crate workspace:
   the CSS pitch is derived back as `device_pitch / dpr`, so browser zoom
   produces slightly fractional CSS cell sizes on purpose — never re-round those,
   or the grid drifts off the pixel grid. `grid_metrics` exports the grid origin
-  and cell box so the page can center the grid inside the canvas at that pitch.
+  *and* the cell box (`cw`/`ch`) so the page can center the grid inside the
+  canvas and hit-test against the same pitch it was fitted at; `syncGrid()`
+  must refresh `cellW`/`cellH` from it on every fit. Caching them from `init()`
+  drifts the moment `handle_resize` re-measures and re-snaps them, which makes
+  `cellFromPoint` map clicks to the wrong column/row — every cell off by a few
+  CSS pixels is enough to select the wrong word.
   `window_dpr` only floors at 1.0; the page must not clamp DPR independently
   (a `Math.min(3, ...)` once made the JS cell size and the Rust buffer size
   disagree above 3x).
@@ -134,6 +139,21 @@ Krust is a Rust terminal emulator with a two-crate workspace:
   (`DCS + q … ST`, answered as `DCS 0 + r … ST`). `TERM_NAME`/`TERM_VERSION`
   in `query.rs` are the single source for those. An unterminated or
   non-hex XTGETTCAP body is deliberately not answered, rather than guessed at.
+- **Copying to the clipboard is the browser's, not ours.** `copyToClipboard`
+  in `server.html` is the single writer for every copy path (selection drag,
+  touchend, Ctrl+C, and OSC 52), and it is deliberately not `try`/`catch`:
+  `navigator.clipboard.writeText` returns a *promise that rejects* instead of
+  throwing, so the old bare `try { writeText(); showStatus(...) }` fired the
+  "copied N chars" toast while the write was still pending (or had already
+  failed) and the paste produced whatever was in the clipboard before. The
+  rejection handler is the guard against that class of silent failure, and the
+  secure-context check below it is the second one: the Clipboard API only
+  exists on https/localhost, so reaching krust by IP over plain http leaves
+  `navigator.clipboard` undefined and a raw `TypeError` where the toast used
+  to appear. A background tab or an unfocused iframe (krust is embedded by the
+  Grit UI) rejects every write for the same reason, which is why the toast says
+  to click the page first — do not "fix" that by writing the clipboard without
+  a user gesture.
 - **Tests:** Unit tests live alongside code in `#[cfg(test)] mod tests`.
   Server tests use `tower::util::ServiceExt` for one-shot HTTP requests.
 - **CORS:** `tower-http::cors::CorsLayer::permissive()` is enabled on all
@@ -233,7 +253,7 @@ the `krust` FFI registry.
 | `handle_click(x, y)` | Clear selection, return clicked cell (boxed pair) |
 | `scroll_to*`, `scroll_offset`, `scrollback_len`, `selection_mode` | Scrollback/selection introspection |
 | `is_alt_screen()` | `1` while the parser owns the alternate screen (alt buffer) |
-| `grid_metrics()` | Grid origin, cell box, and row/col counts as JSON (boxed pair) |
+| `grid_metrics()` | Grid origin, cell box (`cw`/`ch`), and row/col counts as JSON (boxed pair) |
 | `version()` | Module version string (boxed pair) |
 
 Memory: `alloc`/`dealloc` (caller buffers), `free_memory`, `free_string`,
