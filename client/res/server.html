@@ -420,6 +420,10 @@
         let curScroll = 0;
         let scrollbarVisible = false;
         let bytesIn = 0;
+        // Throttle for the parent-activity ping (see pingParentActivity):
+        // PTY output arrives in bursts, and one ping per 250ms is enough for
+        // an embedding page that only shows a "there is new output" mark.
+        let lastActivityPing = 0;
         let benchGoal = parseInt(params.get('bench') || '0', 10);
         let benchMax = 0;
         let benchSum = 0;
@@ -815,6 +819,25 @@
                 lastTitle = title + ' | terminal';
                 document.title = lastTitle;
             }
+            pingParentActivity();
+        }
+
+        // Tell an embedding page that this session produced output. Used by
+        // Grit's tab bar to mark a terminal with unseen output; the throttle
+        // keeps a busy session (build logs, `top`) from flooding the parent,
+        // and the ping carries no payload the parent must trust — it is a
+        // "something happened since you last looked" hint, nothing more.
+        // No-op when the page is not framed (standalone krust usage).
+        function pingParentActivity() {
+            if (window.parent === window) return;
+            const now = performance.now();
+            if (now - lastActivityPing < 250) return;
+            lastActivityPing = now;
+            let origin = '*';
+            try { origin = new URL(document.referrer).origin; } catch (_) {}
+            try {
+                parent.postMessage({ type: 'krust:activity', bytes: bytesIn }, origin);
+            } catch (_) {}
         }
 
         function connectPrimary(url) {
