@@ -37,6 +37,33 @@ Open http://localhost:3000 in your browser.
 
 ---
 
+## Configuration
+
+krust reads `$XDG_CONFIG_HOME/bitshift/krust/config.json` (falling back to
+`~/.config/bitshift/krust/config.json`):
+
+```json
+{
+  "host": "127.0.0.1",
+  "port": 3000,
+  "allowed_origins": ["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:5000"]
+}
+```
+
+All three fields are optional and default to the values above. **This file is
+the only source of `host` and `port`** — the `HOST` and `PORT` environment
+variables are deliberately not consulted, because `HOST` is set by default in
+some shells and would silently override a file the settings UI had just
+written. Grit's settings page maintains `host` for you.
+
+`host` is the security boundary: `127.0.0.1` restricts krust to this machine,
+while `0.0.0.0` makes the terminal — a shell — reachable by anything on the
+network. With a non-loopback `host`, `allowed_origins` is ignored and every
+WebSocket origin is accepted, since there is no meaningful same-origin check
+left to make; on loopback the list above is enforced.
+
+---
+
 ## Architecture
 
 ```

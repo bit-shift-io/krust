@@ -240,7 +240,7 @@ cargo run
   └─ server::main()
        ├─ AppState { sessions: Arc<RwLock<HashMap>> }
        ├─ Axum Router: "/" | "/ws" | "/pkg/*" (+ CorsLayer::permissive)
-       └─ bind 0.0.0.0:${PORT:-3000} → axum::serve
+       └─ bind <config host>:<config port> (default 127.0.0.1:3000) → axum::serve
 ```
 
 ### One PTY Session
